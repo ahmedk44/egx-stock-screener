@@ -166,7 +166,7 @@ STOCK_NAMES_AR: Dict[str, str] = {
     "FWRY.CA": "فوري لتكنولوجيا البنوك والمدفوعات",
     "HELI.CA": "مصر الجديدة للإسكان والتعمير",
     "ISPH.CA": "ابن سينا فارما",
-    "JUFO.CA": "جودة للصناعات الغذائية",
+    "JUFO.CA": "جهينة للصناعات الغذائية",
     "OLFI.CA": "أوبر لاند للصناعات الغذائية",
     "ORAS.CA": "أوراسكوم للإنشاءات",
     "ORWE.CA": "الشرقية للسجاد",
@@ -389,8 +389,8 @@ def crossed_above_ema20(df: pd.DataFrame) -> bool:
 # --------------------------------------------------------------------------
 
 
-def fetch_arabic_stock_news(stock_name_ar: str, ticker: str) -> str:
-    """Fetch live Arabic financial news for a stock and summarize sentiment via Gemini."""
+def fetch_arabic_headlines(stock_name_ar: str, ticker: str) -> List[str]:
+    """Fetch the top Arabic Google News headlines (with publish dates) for a stock."""
     query = quote_plus(f"{stock_name_ar} البورصة المصرية")
     headlines: List[str] = []
     try:
@@ -406,7 +406,25 @@ def fetch_arabic_stock_news(stock_name_ar: str, ticker: str) -> str:
                 headlines.append(title)
     except Exception as exc:
         logger.warning("News fetch failed for %s: %s", ticker, exc)
-        return GEMINI_FALLBACK_PROMPT
+    return headlines
+
+
+def build_news_prompt(headlines: List[str]) -> str:
+    """Build the Gemini prompt classifying market sentiment from Arabic headlines."""
+    headlines_block = "\n".join(f"- {h}" for h in headlines)
+    return (
+        "اقرأ العناوين التالية الخاصة بشركات البورصة المصرية، ثم أخرج:\n"
+        "1) ملخصًا من جملتين باللغة العربية يلخّص اتجاه الأخبار.\n"
+        "2) تصنيف المعنويات بإحدى الكلمات فقط: إيجابي / سلبي / محايد.\n"
+        "ملاحظة: إذا أشارت الأخبار إلى نتائج مالية قوية أو قفزات في الأرباح "
+        "(أرباح تتجاوز 10 مليار جنيه مصري)، صنّف المعنويات 'إيجابي' قدر الإمكان.\n\n"
+        f"العناوين:\n{headlines_block}"
+    )
+
+
+def fetch_arabic_stock_news(stock_name_ar: str, ticker: str) -> str:
+    """Fetch live Arabic financial news for a stock and summarize sentiment via Gemini."""
+    headlines = fetch_arabic_headlines(stock_name_ar, ticker)
     if not headlines:
         logger.info(
             "[%s] No recent Arabic news for %s; passing fallback prompt.",
@@ -414,14 +432,7 @@ def fetch_arabic_stock_news(stock_name_ar: str, ticker: str) -> str:
             stock_name_ar,
         )
         return _summarize_with_gemini(GEMINI_FALLBACK_PROMPT, ticker)
-    headlines_block = "\n".join(f"- {h}" for h in headlines)
-    prompt = (
-        "اقرأ العناوين التالية الخاصة بشركات البورصة المصرية، ثم أخرج:\n"
-        "1) ملخصًا من جملتين باللغة العربية يلخّص اتجاه الأخبار.\n"
-        "2) تصنيف المعنويات بإحدى الكلمات فقط: إيجابي / سلبي / محايد.\n\n"
-        f"العناوين:\n{headlines_block}"
-    )
-    return _summarize_with_gemini(prompt, ticker)
+    return _summarize_with_gemini(build_news_prompt(headlines), ticker)
 
 
 def _summarize_with_gemini(content: str, ticker: str) -> str:
@@ -492,14 +503,26 @@ def classify_sentiment(text: str) -> Optional[str]:
 
 
 def extract_news_body(text: str) -> str:
-    """Return the compact summary body without Gemini's 1)/2) scaffolding."""
+    """Return the compact summary body with all Gemini scaffolding stripped."""
     body = text.strip()
-    classification = classify_sentiment(body)
-    if classification:
+    if classify_sentiment(body):
         marker = re.search(r"2\)", body)
         if marker:
             body = body[: marker.start()].rstrip().rstrip("*").rstrip()
-        body = re.sub(r"^.*1\).*\n?", "", body, flags=re.MULTILINE)
+    marker_patterns = [
+        r"^\s*(?:1\)|2\))\s*",
+        r"^\s*[.**\s]*\d+\)\s*[^\n]*:?\s*$",
+        r"(?:^|\n)\s*\**\s*\d+\)[^\n]*\s*\**\s*:?\s*",
+        r"(?:الملخص|ملخص اتجاه الأخبار|ملخص المعنويات)\s*:?\s*",
+        r"(?:تصنيف المعنويات)\s*:?\s*",
+    ]
+    for pattern in marker_patterns:
+        body = re.sub(pattern, "", body, flags=re.MULTILINE)
+    body = body.replace("**", "")
+    for word in ("إيجابي", "سلبي", "محايد"):
+        body = re.sub(rf"^\s*{word}\s*$", "", body, flags=re.MULTILINE)
+        body = body.replace(f": {word}", "").replace(f" :{word}", "").strip()
+    body = re.sub(r"\n+", "\n", body).strip()
     body = re.sub(r"[ \t]+", " ", body).strip()
     return body
 
@@ -686,14 +709,20 @@ def run_news_watchlist(mode: str) -> int:
     """Scan all tickers for Arabic news and send a unified off-hours watchlist."""
     title = PRE_MARKET_TITLE if mode == PRE_MARKET else POST_MARKET_TITLE
     entries: List[str] = []
+    no_news: List[str] = []
     for ticker in TICKERS:
         stock_name_ar = STOCK_NAMES_AR.get(ticker, ticker)
         clean_ticker = ticker.replace(".CA", "")
         try:
-            summary = fetch_arabic_stock_news(stock_name_ar, ticker)
+            headlines = fetch_arabic_headlines(stock_name_ar, ticker)
         except Exception as exc:
             logger.warning("News scan failed for %s: %s", ticker, exc)
+            no_news.append(clean_ticker)
             continue
+        if not headlines:
+            no_news.append(clean_ticker)
+            continue
+        summary = _summarize_with_gemini(build_news_prompt(headlines), ticker)
         classification = classify_sentiment(summary)
         body = extract_news_body(summary)
         badge = SENTIMENT_BADGES.get(classification or "", "⚪")
@@ -702,8 +731,11 @@ def run_news_watchlist(mode: str) -> int:
                 entries.append(f"🟢 {stock_name_ar} ({clean_ticker}): {body}")
         else:
             entries.append(f"{badge} {stock_name_ar} ({clean_ticker}): {body}")
-    if entries:
-        message = f"{title}\n\n" + "\n".join(entries)
+    lines: List[str] = list(entries)
+    if no_news:
+        lines.append(f"ℹ️ أسهم بدون أخبار جديدة: {' | '.join(no_news)}")
+    if lines:
+        message = f"{title}\n\n" + "\n".join(lines)
     else:
         message = f"{title}\n\n{NO_NEWS_WATCHLIST}"
     bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
