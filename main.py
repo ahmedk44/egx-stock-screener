@@ -19,6 +19,7 @@ the same stock + strategy within a 12-hour window.
 
 from __future__ import annotations
 
+import argparse
 import json
 import logging
 import os
@@ -124,6 +125,20 @@ SENTIMENT_BADGES: Dict[str, str] = {
     "سلبي": "🔴",
     "محايد": "⚪",
 }
+
+INTRADAY: str = "intraday"
+PRE_MARKET: str = "pre_market"
+POST_MARKET: str = "post_market"
+MODES: List[str] = [INTRADAY, PRE_MARKET, POST_MARKET]
+
+PRE_MARKET_TITLE: str = (
+    "☀️ **قائمة المتابعة المسبقة لمزادات الافتتاح (Pre-Market Catalyst Watchlist)**"
+)
+POST_MARKET_TITLE: str = (
+    "🌙 **ملخص أخبار ما بعد الإغلاق (Post-Market News Summary)**"
+)
+
+NO_NEWS_WATCHLIST: str = "لا توجد أسهم بأخبار إيجابية بارزة في هذه الجولة."
 
 SCALPING: str = "scalping"
 SWING: str = "swing"
@@ -468,22 +483,33 @@ def get_sharia_status_tag(ticker: str) -> str:
     return "⚠️ **يحتاج مراجعة شرعية** (خارج مؤشر EGX33)"
 
 
-def build_news_block(sentiment: str) -> str:
-    """Return a compact, badge-labeled Arabic news summary block."""
-    body = sentiment.strip()
-    classification = ""
+def classify_sentiment(text: str) -> Optional[str]:
+    """Return the sentiment word (إيجابي/سلبي/محايد) found in a Gemini summary, if any."""
     for word in ("إيجابي", "سلبي", "محايد"):
-        if word in body:
-            classification = word
-            break
-    badge = SENTIMENT_BADGES.get(classification, "⚪")
+        if word in text:
+            return word
+    return None
+
+
+def extract_news_body(text: str) -> str:
+    """Return the compact summary body without Gemini's 1)/2) scaffolding."""
+    body = text.strip()
+    classification = classify_sentiment(body)
     if classification:
         marker = re.search(r"2\)", body)
         if marker:
             body = body[: marker.start()].rstrip().rstrip("*").rstrip()
         body = re.sub(r"^.*1\).*\n?", "", body, flags=re.MULTILINE)
     body = re.sub(r"[ \t]+", " ", body).strip()
+    return body
+
+
+def build_news_block(sentiment: str) -> str:
+    """Return a compact, badge-labeled Arabic news summary block."""
+    classification = classify_sentiment(sentiment) or ""
+    badge = SENTIMENT_BADGES.get(classification, "⚪")
     header = f"🤖 ملخص الأخبار (Gemini AI): {badge} {classification}".strip()
+    body = extract_news_body(sentiment)
     return f"{header}\n{body}".strip()
 
 
@@ -643,9 +669,59 @@ def process_ticker(ticker: str, state: Dict[str, Any]) -> None:
 # --------------------------------------------------------------------------
 
 
+def parse_mode(argv: Optional[List[str]] = None) -> str:
+    """Parse the --mode CLI argument (intraday/pre_market/post_market)."""
+    parser = argparse.ArgumentParser(description="EGX stock screener & news scanner.")
+    parser.add_argument(
+        "--mode",
+        choices=MODES,
+        default=INTRADAY,
+        help="Execution mode (default: intraday).",
+    )
+    args, _ = parser.parse_known_args(argv)
+    return args.mode
+
+
+def run_news_watchlist(mode: str) -> int:
+    """Scan all tickers for Arabic news and send a unified off-hours watchlist."""
+    title = PRE_MARKET_TITLE if mode == PRE_MARKET else POST_MARKET_TITLE
+    entries: List[str] = []
+    for ticker in TICKERS:
+        stock_name_ar = STOCK_NAMES_AR.get(ticker, ticker)
+        clean_ticker = ticker.replace(".CA", "")
+        try:
+            summary = fetch_arabic_stock_news(stock_name_ar, ticker)
+        except Exception as exc:
+            logger.warning("News scan failed for %s: %s", ticker, exc)
+            continue
+        classification = classify_sentiment(summary)
+        body = extract_news_body(summary)
+        badge = SENTIMENT_BADGES.get(classification or "", "⚪")
+        if mode == PRE_MARKET:
+            if classification == "إيجابي":
+                entries.append(f"🟢 {stock_name_ar} ({clean_ticker}): {body}")
+        else:
+            entries.append(f"{badge} {stock_name_ar} ({clean_ticker}): {body}")
+    if entries:
+        message = f"{title}\n\n" + "\n".join(entries)
+    else:
+        message = f"{title}\n\n{NO_NEWS_WATCHLIST}"
+    bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    chat_id = os.environ.get(CHANNEL_ENV[SCALPING], "")
+    if send_telegram(chat_id, message, bot_token):
+        logger.info("News watchlist (%s) delivered to channel %s.", mode, chat_id)
+        return 0
+    logger.error("Failed to deliver news watchlist (%s).", mode)
+    return 1
+
+
 def main() -> int:
-    """Run the full screening pass over every configured ticker."""
+    """Run the chosen execution mode (intraday scan or off-hours news watchlist)."""
     check_required_env()
+    mode = parse_mode()
+    if mode in (PRE_MARKET, POST_MARKET):
+        logger.info("Running off-hours news scan in %s mode.", mode)
+        return run_news_watchlist(mode)
     logger.info("EGX screener started — monitoring %d tickers.", len(TICKERS))
     state = load_state()
 

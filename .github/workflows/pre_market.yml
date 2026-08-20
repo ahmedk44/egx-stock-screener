@@ -1,0 +1,42 @@
+name: Pre-Market News Scan
+
+on:
+  schedule:
+    # Every day, Sun-Thu (0-4), 06:30 UTC = 08:30 Cairo time
+    - cron: "30 6 * * 0-4"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: egx-pre-market
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    name: Pre-market catalyst watchlist
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run pre-market scanner
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          CHANNEL_SCALPING: ${{ secrets.CHANNEL_SCALPING }}
+          CHANNEL_SWING: ${{ secrets.CHANNEL_SWING }}
+          CHANNEL_INVESTMENT: ${{ secrets.CHANNEL_INVESTMENT }}
+        run: python main.py --mode=pre_market

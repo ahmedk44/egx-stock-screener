@@ -1,0 +1,42 @@
+name: Post-Market News Scan
+
+on:
+  schedule:
+    # Every day, Sun-Thu (0-4), 13:00 UTC = 15:00 Cairo time
+    - cron: "0 15 * * 0-4"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: egx-post-market
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    name: Post-market news summary
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run post-market scanner
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          CHANNEL_SCALPING: ${{ secrets.CHANNEL_SCALPING }}
+          CHANNEL_SWING: ${{ secrets.CHANNEL_SWING }}
+          CHANNEL_INVESTMENT: ${{ secrets.CHANNEL_INVESTMENT }}
+        run: python main.py --mode=post_market
