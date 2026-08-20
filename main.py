@@ -681,7 +681,7 @@ def process_ticker(ticker: str, state: Dict[str, Any]) -> None:
             )
             continue
         message = build_message(strategy, ticker, ctx, sentiment)
-        chat_id = os.environ.get(CHANNEL_ENV[strategy], "")
+        chat_id = os.environ.get(CHANNEL_ENV[strategy]) or os.getenv("TELEGRAM_CHAT_ID", "")
         if send_telegram(chat_id, message, bot_token):
             mark_sent(state, ticker, strategy)
             logger.info("[%s] %s alert sent to channel %s.", ticker, strategy, chat_id)
@@ -705,6 +705,14 @@ def parse_mode(argv: Optional[List[str]] = None) -> str:
     return args.mode
 
 
+NONEWS_FALLBACK_PHRASES: List[str] = ["لا توجد أخبار", "المؤشرات الفنية فقط"]
+
+
+def has_recent_news(summary: str) -> bool:
+    """Return True only when a Gemini summary contains actual news content."""
+    return not any(phrase in summary for phrase in NONEWS_FALLBACK_PHRASES)
+
+
 def run_news_watchlist(mode: str) -> int:
     """Scan all tickers for Arabic news and send a unified off-hours watchlist."""
     title = PRE_MARKET_TITLE if mode == PRE_MARKET else POST_MARKET_TITLE
@@ -723,6 +731,10 @@ def run_news_watchlist(mode: str) -> int:
             no_news.append(clean_ticker)
             continue
         summary = _summarize_with_gemini(build_news_prompt(headlines), ticker)
+        if not has_recent_news(summary):
+            logger.info("[%s] only fallback news text; treating as no news.", ticker)
+            no_news.append(clean_ticker)
+            continue
         classification = classify_sentiment(summary)
         body = extract_news_body(summary)
         badge = SENTIMENT_BADGES.get(classification or "", "⚪")
@@ -739,7 +751,11 @@ def run_news_watchlist(mode: str) -> int:
     else:
         message = f"{title}\n\n{NO_NEWS_WATCHLIST}"
     bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-    chat_id = os.environ.get(CHANNEL_ENV[SCALPING], "")
+    chat_id = (
+        os.getenv("TELEGRAM_CHAT_ID_NEWS")
+        or os.getenv("TELEGRAM_CHAT_ID")
+        or os.environ.get(CHANNEL_ENV[SCALPING], "")
+    )
     if send_telegram(chat_id, message, bot_token):
         logger.info("News watchlist (%s) delivered to channel %s.", mode, chat_id)
         return 0

@@ -36,6 +36,7 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TELEGRAM_CHAT_ID_NEWS: ${{ secrets.TELEGRAM_CHAT_ID_NEWS }}
           CHANNEL_SCALPING: ${{ secrets.CHANNEL_SCALPING }}
           CHANNEL_SWING: ${{ secrets.CHANNEL_SWING }}
           CHANNEL_INVESTMENT: ${{ secrets.CHANNEL_INVESTMENT }}
