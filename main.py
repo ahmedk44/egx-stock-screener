@@ -51,27 +51,29 @@ logger = logging.getLogger("egx-screener")
 # --------------------------------------------------------------------------
 
 TICKERS: List[str] = [
-    "COMI.CA",
     "ABUK.CA",
-    "HELI.CA",
-    "EAST.CA",
-    "SWDY.CA",
-    "EFIH.CA",
-    "TMGH.CA",
-    "AMOC.CA",
-    "ORAS.CA",
     "ADIB.CA",
-    "FAIT.CA",
-    "ETEL.CA",
-    "FWRY.CA",
-    "JUFO.CA",
+    "AMOC.CA",
+    "COMI.CA",
+    "EAST.CA",
     "EFID.CA",
+    "EFIH.CA",
+    "ETEL.CA",
+    "FAIT.CA",
+    "FWRY.CA",
+    "HELI.CA",
     "ISPH.CA",
+    "JUFO.CA",
+    "OLFI.CA",
+    "ORAS.CA",
+    "ORWE.CA",
+    "SAUD.CA",
+    "SKPC.CA",
+    "SWDY.CA",
+    "TMGH.CA",
 ]
 
-SHARIA_FILTER_ENABLED: bool = True
-
-SHARIA_COMPLIANT_TICKERS: Set[str] = {
+EGX33_SHARIAH_TICKERS: Set[str] = {
     "ABUK.CA",
     "AMOC.CA",
     "SWDY.CA",
@@ -81,11 +83,20 @@ SHARIA_COMPLIANT_TICKERS: Set[str] = {
     "EFIH.CA",
     "ADIB.CA",
     "FAIT.CA",
+    "SAUD.CA",
     "ETEL.CA",
     "FWRY.CA",
     "JUFO.CA",
     "EFID.CA",
     "ISPH.CA",
+    "SKPC.CA",
+    "OLFI.CA",
+    "ORWE.CA",
+}
+
+NON_COMPLIANT_TICKERS: Set[str] = {
+    "COMI.CA",
+    "EAST.CA",
 }
 
 STATE_FILE: str = "state.json"
@@ -366,8 +377,18 @@ def fmt(value: Optional[float], digits: int = 2) -> str:
     return f"{value:.{digits}f}" if value is not None else "غير متاح"
 
 
+def get_sharia_status_tag(ticker: str) -> str:
+    """Return a Sharia compliance status tag for a ticker."""
+    if ticker in EGX33_SHARIAH_TICKERS:
+        return "🕌 **متوافق مع الشريعة 100%** (مؤشر EGX33)"
+    if ticker in NON_COMPLIANT_TICKERS:
+        return "❌ **غير متوافق شرعاً** (نشاط/بنوك تقليدية)"
+    return "⚠️ **يحتاج مراجعة شرعية** (خارج مؤشر EGX33)"
+
+
 def build_message(strategy: str, ticker: str, ctx: Dict[str, Any], sentiment: str) -> str:
     """Compose an Arabic Markdown alert for a strategy."""
+    sharia_tag = get_sharia_status_tag(ticker)
     price = ctx.get("price")
     rsi = ctx.get("rsi")
     ema20 = ctx.get("ema20")
@@ -378,6 +399,7 @@ def build_message(strategy: str, ticker: str, ctx: Dict[str, Any], sentiment: st
     if strategy == SCALPING:
         return (
             f"*إشارة سكالبنج | {ticker}*\n"
+            f"{sharia_tag}\n"
             f"السعر: {fmt(price)} ج.م\n"
             f"RSI(14): {fmt(rsi, 1)}\n"
             f"EMA20: {fmt(ema20)} ج.م\n"
@@ -387,6 +409,7 @@ def build_message(strategy: str, ticker: str, ctx: Dict[str, Any], sentiment: st
     if strategy == SWING:
         return (
             f"*إشارة سوينغ | {ticker}*\n"
+            f"{sharia_tag}\n"
             "السعر اخترق EMA20 لأعلى\n"
             f"السعر: {fmt(price)} ج.م\n"
             f"RSI(14): {fmt(rsi, 1)}\n"
@@ -395,6 +418,7 @@ def build_message(strategy: str, ticker: str, ctx: Dict[str, Any], sentiment: st
     if strategy == INVESTMENT:
         return (
             f"*إشارة استثمار | {ticker}*\n"
+            f"{sharia_tag}\n"
             f"المضاعف الربحي (P/E): {fmt(pe, 1)}\n"
             f"السعر: {fmt(price)} ج.م (أقل من SMA50 = {fmt(sma50)} ج.م)\n"
             f"RSI(14): {fmt(rsi, 1)}\n"
@@ -463,9 +487,6 @@ def evaluate_strategies(ticker: str, df: pd.DataFrame) -> List[str]:
 
 def process_ticker(ticker: str, state: Dict[str, Any]) -> None:
     """Fetch data for a ticker, evaluate signals and send alerts."""
-    if SHARIA_FILTER_ENABLED and ticker not in SHARIA_COMPLIANT_TICKERS:
-        logger.info(f"[SHARIA FILTER] Skipping {ticker}: Not Sharia compliant")
-        return
     df = fetch_price_history(ticker)
     if df is None:
         logger.info("[%s] skipped (no data).", ticker)
