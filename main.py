@@ -25,6 +25,7 @@ import os
 import sys
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Set
+from urllib.parse import quote_plus
 
 import feedparser
 import pandas as pd
@@ -110,9 +111,12 @@ VOLUME_SPIKE_MULTIPLIER: float = 1.8
 
 GEMINI_MODEL: str = "gemini-3.6-flash"
 NEWS_RSS_URL: str = (
-    "https://news.google.com/rss/search?q={ticker}+بورصة+مصر&hl=ar&gl=EG&ceid=EG:ar"
+    "https://news.google.com/rss/search?q={query}&hl=ar&gl=EG&ceid=EG:ar"
 )
 NEWS_HEADLINES_COUNT: int = 3
+GEMINI_FALLBACK_PROMPT: str = (
+    "لا توجد أخبار جوهرية حديثة عن السهم، التحليل يعتمد على المؤشرات الفنية فقط."
+)
 
 SCALPING: str = "scalping"
 SWING: str = "swing"
@@ -363,44 +367,55 @@ def crossed_above_ema20(df: pd.DataFrame) -> bool:
 # --------------------------------------------------------------------------
 
 
-def fetch_news_headlines(ticker: str) -> List[str]:
-    """Fetch the top Arabic headlines for a ticker from Google News RSS."""
+def fetch_arabic_stock_news(stock_name_ar: str, ticker: str) -> str:
+    """Fetch live Arabic financial news for a stock and summarize sentiment via Gemini."""
+    query = quote_plus(f"{stock_name_ar} البورصة المصرية")
     try:
-        feed = feedparser.parse(NEWS_RSS_URL.format(ticker=ticker))
-        headlines: List[str] = []
-        for entry in feed.entries[:NEWS_HEADLINES_COUNT]:
-            title = (entry.get("title") or "").strip()
-            if title:
-                headlines.append(title)
-        return headlines
+        resp = requests.get(NEWS_RSS_URL.format(query=query), timeout=15)
+        resp.raise_for_status()
+        feed = feedparser.parse(resp.content)
     except Exception as exc:
-        logger.warning("[%s] news fetch failed: %s", ticker, exc)
-        return []
-
-
-def analyze_sentiment(headlines: List[str]) -> str:
-    """Ask Gemini for a 2-sentence Arabic sentiment summary."""
+        logger.warning("[%s] Arabic news feed fetch failed: %s", ticker, exc)
+        return GEMINI_FALLBACK_PROMPT
+    headlines: List[str] = []
+    for entry in feed.entries[:NEWS_HEADLINES_COUNT]:
+        title = (entry.get("title") or "").strip()
+        published = entry.get("published") or entry.get("updated") or ""
+        if title:
+            if published:
+                title = f"{title} ({published})"
+            headlines.append(title)
     if not headlines:
-        return "لا توجد أخبار كافية لتحليل المعنويات."
+        logger.info(
+            "[%s] No recent Arabic news for %s; passing fallback prompt.",
+            ticker,
+            stock_name_ar,
+        )
+        return _summarize_with_gemini(GEMINI_FALLBACK_PROMPT, ticker)
+    headlines_block = "\n".join(f"- {h}" for h in headlines)
+    prompt = (
+        "اقرأ العناوين التالية الخاصة بشركات البورصة المصرية، ثم أخرج:\n"
+        "1) ملخصًا من جملتين باللغة العربية يلخّص اتجاه الأخبار.\n"
+        "2) تصنيف المعنويات بإحدى الكلمات فقط: إيجابي / سلبي / محايد.\n\n"
+        f"العناوين:\n{headlines_block}"
+    )
+    return _summarize_with_gemini(prompt, ticker)
+
+
+def _summarize_with_gemini(content: str, ticker: str) -> str:
+    """Send an Arabic prompt to Gemini 3.6 Flash and return its summary."""
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         logger.warning("GEMINI_API_KEY not set; skipping sentiment analysis.")
-        return "تحليل المعنويات غير متاح حاليًا."
+        return GEMINI_FALLBACK_PROMPT
     try:
         client = genai.Client(api_key=api_key)
-        headlines_block = "\n".join(f"- {h}" for h in headlines)
-        prompt = (
-            "اقرأ العناوين التالية الخاصة بأسهم البورصة المصرية، ثم أخرج:\n"
-            "1) ملخصًا من جملتين باللغة العربية يلخّص اتجاه الأخبار.\n"
-            "2) تصنيف المعنويات بإحدى الكلمات فقط: إيجابي / سلبي / محايد.\n\n"
-            f"العناوين:\n{headlines_block}"
-        )
-        response = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
+        response = client.models.generate_content(model=GEMINI_MODEL, contents=content)
         text = (response.text or "").strip()
-        return text if text else "تحليل المعنويات غير متاح حاليًا."
+        return text if text else GEMINI_FALLBACK_PROMPT
     except Exception as exc:
-        logger.warning("Gemini sentiment analysis failed: %s", exc)
-        return "تحليل المعنويات غير متاح حاليًا."
+        logger.warning("[%s] Gemini sentiment analysis failed: %s", ticker, exc)
+        return GEMINI_FALLBACK_PROMPT
 
 
 # --------------------------------------------------------------------------
@@ -556,7 +571,8 @@ def process_ticker(ticker: str, state: Dict[str, Any]) -> None:
 
     logger.info("[%s] signals detected: %s", ticker, ", ".join(signals))
 
-    sentiment = analyze_sentiment(fetch_news_headlines(ticker))
+    stock_name_ar = STOCK_NAMES_AR.get(ticker, ticker)
+    sentiment = fetch_arabic_stock_news(stock_name_ar, ticker)
 
     ind = compute_indicators(df)
     ctx: Dict[str, Any] = {
