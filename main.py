@@ -138,7 +138,9 @@ POST_MARKET_TITLE: str = (
     "🌙 **ملخص أخبار ما بعد الإغلاق (Post-Market News Summary)**"
 )
 
-NO_NEWS_WATCHLIST: str = "لا توجد أسهم بأخبار إيجابية بارزة في هذه الجولة."
+NO_NEWS_WATCHLIST: str = (
+    "لا توجد إفصاحات أو أخبار جوهرية مستجدة للأسهم المتابعة في هذه الجولة."
+)
 
 SCALPING: str = "scalping"
 SWING: str = "swing"
@@ -751,13 +753,13 @@ def run_news_watchlist(mode: str) -> int:
                 entries.append(f"🟢 {stock_name_ar} ({clean_ticker}): {body}")
         else:
             entries.append(f"{badge} {stock_name_ar} ({clean_ticker}): {body}")
-    lines: List[str] = list(entries)
-    if no_news:
-        lines.append(f"ℹ️ أسهم بدون أخبار جديدة: {' | '.join(no_news)}")
-    if lines:
-        message = f"{title}\n\n" + "\n".join(lines)
+    if entries:
+        body = "\n".join(entries)
     else:
-        message = f"{title}\n\n{NO_NEWS_WATCHLIST}"
+        body = NO_NEWS_WATCHLIST
+    if no_news:
+        body = body + "\n\n" + f"ℹ️ أسهم بدون أخبار جديدة: {' | '.join(no_news)}"
+    message = f"{title}\n\n{body}"
     bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
     chat_id = (
         os.getenv("TELEGRAM_CHAT_ID_NEWS")
