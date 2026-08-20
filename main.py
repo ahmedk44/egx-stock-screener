@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
@@ -33,7 +34,10 @@ import yfinance as yf
 from dotenv import load_dotenv
 from google import genai
 
-load_dotenv()
+try:
+    load_dotenv()
+except Exception:
+    pass
 
 logging.basicConfig(
     level=logging.INFO,
@@ -85,6 +89,29 @@ CHANNEL_ENV: Dict[str, str] = {
 }
 
 TELEGRAM_API: str = "https://api.telegram.org/bot{token}/sendMessage"
+
+REQUIRED_ENV_VARS: List[str] = [
+    "TELEGRAM_BOT_TOKEN",
+    "GEMINI_API_KEY",
+    "CHANNEL_SCALPING",
+    "CHANNEL_SWING",
+    "CHANNEL_INVESTMENT",
+]
+
+
+def check_required_env() -> None:
+    """Exit with a clear message if any required environment variable is missing."""
+    missing = [var for var in REQUIRED_ENV_VARS if not os.environ.get(var)]
+    if missing:
+        for var in missing:
+            print(f"ERROR: Required environment variable '{var}' is not set.")
+        print(
+            "Missing {} of {} required variables. "
+            "Set them in GitHub Actions secrets or a local .env file.".format(
+                len(missing), len(REQUIRED_ENV_VARS)
+            )
+        )
+        sys.exit(1)
 
 # --------------------------------------------------------------------------
 # Helpers: time & state
@@ -465,6 +492,7 @@ def process_ticker(ticker: str, state: Dict[str, Any]) -> None:
 
 def main() -> int:
     """Run the full screening pass over every configured ticker."""
+    check_required_env()
     logger.info("EGX screener started — monitoring %d tickers.", len(TICKERS))
     state = load_state()
 
