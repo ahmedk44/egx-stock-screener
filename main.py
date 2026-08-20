@@ -501,7 +501,6 @@ def build_message(strategy: str, ticker: str, ctx: Dict[str, Any], sentiment: st
     target_3 = entry_price * (1 + p3)
     stop_loss = entry_price * (1 + sl_pct)
     rr = abs(p3 / sl_pct)
-    tv_url = f"https://ar.tradingview.com/symbols/EGX-{clean_ticker}/"
     news_block = build_news_block(sentiment)
     return (
         f"اسم السهم : {stock_name_ar} {clean_ticker}\n"
@@ -520,9 +519,9 @@ def build_message(strategy: str, ticker: str, ctx: Dict[str, Any], sentiment: st
         f"\n"
         f"نسبة الدخول من المحفظه : {plan['allocation_ar']} 💵\n"
         f"نوع الصفقة و مدتها : {plan['duration_ar']} ⏳️\n"
-        f"معدل العائد إلى المخاطر (R:R) : {rr:.2f} ⚖️\n"
+        f"معدل العائد إلى المخاطر (R:R) : 1 : {rr:.2f} ⚖️\n"
         f"\n"
-        f"📊 الرسم البياني: [EGX-{clean_ticker}]({tv_url})\n"
+        f"📈 [عرض الشارت المباشر على TradingView](https://ar.tradingview.com/symbols/EGX-{clean_ticker}/)\n"
         f"\n"
         f"{news_block}\n"
         f"\n"
