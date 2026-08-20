@@ -126,6 +126,66 @@ CHANNEL_ENV: Dict[str, str] = {
 
 TELEGRAM_API: str = "https://api.telegram.org/bot{token}/sendMessage"
 
+STOCK_NAMES_AR: Dict[str, str] = {
+    "ABUK.CA": "أبو قير للأسمدة",
+    "ADIB.CA": "مصرف أبوظبي الإسلامي",
+    "AMOC.CA": "الإسكندرية للزيوت المعدنية",
+    "CLHO.CA": "مستشفى كليوباترا",
+    "COMI.CA": "البنك التجاري الدولي",
+    "EAST.CA": "الشرقية للدخان",
+    "EFID.CA": "إيديتا للصناعات الغذائية",
+    "EFIH.CA": "إي فاينانس للاستثمارات المالية والرقمنة",
+    "ETEL.CA": "المصرية للاتصالات",
+    "FAIT.CA": "بنك فيصل الإسلامي",
+    "FWRY.CA": "فوري لتكنولوجيا البنوك والمدفوعات",
+    "HELI.CA": "مصر الجديدة للإسكان والتعمير",
+    "ISPH.CA": "ابن سينا فارما",
+    "JUFO.CA": "جودة للصناعات الغذائية",
+    "OLFI.CA": "أوبر لاند للصناعات الغذائية",
+    "ORAS.CA": "أوراسكوم للإنشاءات",
+    "ORWE.CA": "الشرقية للسجاد",
+    "SAUD.CA": "بنك البركة مصر",
+    "SKPC.CA": "سيدي كرير للبتروكيماويات",
+    "SWDY.CA": "السويدي إلكتريك",
+    "TMGH.CA": "طلعت مصطفى",
+}
+
+STRATEGY_PLAN: Dict[str, Dict[str, Any]] = {
+    SCALPING: {
+        "targets_pct": (0.03, 0.05, 0.08),
+        "sl_pct": -0.03,
+        "sl_condition_ar": "إغلاق شمعة أسفل الدعم",
+        "allocation_ar": "5% - 10% من رأس المال",
+        "duration_ar": "مضاربة لحظية / سريعة (داخل اليوم)",
+        "technical_reason_ar": (
+            "اختراق لحظي لمستوى مقاومة مع تضخم واضح في حجم التداول "
+            "وكسر السعر لأعلى المتوسط المتحرك EMA20"
+        ),
+    },
+    SWING: {
+        "targets_pct": (0.05, 0.10, 0.17),
+        "sl_pct": -0.06,
+        "sl_condition_ar": "إغلاق يوم أسفل الدعم",
+        "allocation_ar": "10% من رأس المال",
+        "duration_ar": "مضاربة متوسطة المدى (أيام إلى أسابيع)",
+        "technical_reason_ar": (
+            "كسر السعر لأعلى المتوسط المتحرك EMA20 مع زخم إيجابي "
+            "وارتفاع مؤشر القوة النسبية فوق مستوى 50"
+        ),
+    },
+    INVESTMENT: {
+        "targets_pct": (0.10, 0.20, 0.35),
+        "sl_pct": -0.08,
+        "sl_condition_ar": "إغلاق يومين أسفل الدعم",
+        "allocation_ar": "10% - 15% من رأس المال",
+        "duration_ar": "استثمار قصير إلى متوسط المدى (شهور)",
+        "technical_reason_ar": (
+            "السعر دون المتوسط المتحرك SMA50 مع تسارع في التراكم "
+            "ومضاعف ربحية جذاب وأسعار عند مستويات دعم قوية"
+        ),
+    },
+}
+
 REQUIRED_ENV_VARS: List[str] = [
     "TELEGRAM_BOT_TOKEN",
     "GEMINI_API_KEY",
@@ -387,44 +447,41 @@ def get_sharia_status_tag(ticker: str) -> str:
 
 
 def build_message(strategy: str, ticker: str, ctx: Dict[str, Any], sentiment: str) -> str:
-    """Compose an Arabic Markdown alert for a strategy."""
+    """Compose a professional Arabic Markdown alert with dynamic targets & risk plan."""
+    plan = STRATEGY_PLAN[strategy]
     sharia_tag = get_sharia_status_tag(ticker)
-    price = ctx.get("price")
-    rsi = ctx.get("rsi")
-    ema20 = ctx.get("ema20")
-    sma50 = ctx.get("sma50")
-    volume_ratio = ctx.get("volume_ratio")
-    pe = ctx.get("pe")
-
-    if strategy == SCALPING:
-        return (
-            f"*إشارة سكالبنج | {ticker}*\n"
-            f"{sharia_tag}\n"
-            f"السعر: {fmt(price)} ج.م\n"
-            f"RSI(14): {fmt(rsi, 1)}\n"
-            f"EMA20: {fmt(ema20)} ج.م\n"
-            f"الحجم: تضخم بنسبة {fmt(volume_ratio, 1)}x عن متوسط 20 يوم\n"
-            f"المعنويات: {sentiment}"
-        )
-    if strategy == SWING:
-        return (
-            f"*إشارة سوينغ | {ticker}*\n"
-            f"{sharia_tag}\n"
-            "السعر اخترق EMA20 لأعلى\n"
-            f"السعر: {fmt(price)} ج.م\n"
-            f"RSI(14): {fmt(rsi, 1)}\n"
-            f"المعنويات: {sentiment}"
-        )
-    if strategy == INVESTMENT:
-        return (
-            f"*إشارة استثمار | {ticker}*\n"
-            f"{sharia_tag}\n"
-            f"المضاعف الربحي (P/E): {fmt(pe, 1)}\n"
-            f"السعر: {fmt(price)} ج.م (أقل من SMA50 = {fmt(sma50)} ج.م)\n"
-            f"RSI(14): {fmt(rsi, 1)}\n"
-            f"المعنويات: {sentiment}"
-        )
-    raise ValueError(f"Unknown strategy: {strategy}")
+    stock_name_ar = STOCK_NAMES_AR.get(ticker, ticker)
+    entry_price = float(ctx.get("price") or 0.0)
+    p1, p2, p3 = plan["targets_pct"]
+    sl_pct = plan["sl_pct"]
+    target_1 = entry_price * (1 + p1)
+    target_2 = entry_price * (1 + p2)
+    target_3 = entry_price * (1 + p3)
+    stop_loss = entry_price * (1 + sl_pct)
+    return (
+        f"اسم السهم : {stock_name_ar} {ticker}\n"
+        f"\n"
+        f"سبب دخول الصفقه فنيا : {plan['technical_reason_ar']}\n"
+        f"\n"
+        f"{sharia_tag}\n"
+        f"\n"
+        f"سعر الدخول : {entry_price:.2f} 🏷\n"
+        f"\n"
+        f"الهدف الاول: {target_1:.2f} ({p1 * 100:.1f}%) 🎯\n"
+        f"الهدف الثاني : {target_2:.2f} ({p2 * 100:.1f}%) 🎯\n"
+        f"الهدف الثالث: {target_3:.2f} ({p3 * 100:.1f}%) 🎯\n"
+        f"\n"
+        f"وقف الخسارة : {plan['sl_condition_ar']} {stop_loss:.2f} ({sl_pct * 100:.1f}%) ⛔️\n"
+        f"\n"
+        f"نسبة الدخول من المحفظه : {plan['allocation_ar']} 💵\n"
+        f"نوع الصفقة و مدتها : {plan['duration_ar']} ⏳️\n"
+        f"\n"
+        f"🤖 ملخص الأخبار (Gemini AI):\n"
+        f"{sentiment}\n"
+        f"\n"
+        f"تذكير ⚠️ التحليل قد يصيب او يخطئ ولكن يجب عليك الالتزام ب إدارة المخاطر "
+        f"وعدم التهاون ب إدارة رأس مالك 🔒 .. بالتوفيق للجميع 👏"
+    )
 
 
 # --------------------------------------------------------------------------
