@@ -56,7 +56,7 @@ TICKERS: List[str] = [
     "HELI.CA",
     "EAST.CA",
     "SWDY.CA",
-    "EFIN.CA",
+    "EFIH.CA",
     "HRHO.CA",
     "TMGH.CA",
     "AMOC.CA",
