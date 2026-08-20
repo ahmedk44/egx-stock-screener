@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sys
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Set
@@ -117,6 +118,12 @@ NEWS_HEADLINES_COUNT: int = 3
 GEMINI_FALLBACK_PROMPT: str = (
     "لا توجد أخبار جوهرية حديثة عن السهم، التحليل يعتمد على المؤشرات الفنية فقط."
 )
+
+SENTIMENT_BADGES: Dict[str, str] = {
+    "إيجابي": "🟢",
+    "سلبي": "🔴",
+    "محايد": "⚪",
+}
 
 SCALPING: str = "scalping"
 SWING: str = "swing"
@@ -461,11 +468,31 @@ def get_sharia_status_tag(ticker: str) -> str:
     return "⚠️ **يحتاج مراجعة شرعية** (خارج مؤشر EGX33)"
 
 
+def build_news_block(sentiment: str) -> str:
+    """Return a compact, badge-labeled Arabic news summary block."""
+    body = sentiment.strip()
+    classification = ""
+    for word in ("إيجابي", "سلبي", "محايد"):
+        if word in body:
+            classification = word
+            break
+    badge = SENTIMENT_BADGES.get(classification, "⚪")
+    if classification:
+        marker = re.search(r"2\)", body)
+        if marker:
+            body = body[: marker.start()].rstrip().rstrip("*").rstrip()
+        body = re.sub(r"^.*1\).*\n?", "", body, flags=re.MULTILINE)
+    body = re.sub(r"[ \t]+", " ", body).strip()
+    header = f"🤖 ملخص الأخبار (Gemini AI): {badge} {classification}".strip()
+    return f"{header}\n{body}".strip()
+
+
 def build_message(strategy: str, ticker: str, ctx: Dict[str, Any], sentiment: str) -> str:
     """Compose a professional Arabic Markdown alert with dynamic targets & risk plan."""
     plan = STRATEGY_PLAN[strategy]
     sharia_tag = get_sharia_status_tag(ticker)
     stock_name_ar = STOCK_NAMES_AR.get(ticker, ticker)
+    clean_ticker = ticker.replace(".CA", "")
     entry_price = float(ctx.get("price") or 0.0)
     p1, p2, p3 = plan["targets_pct"]
     sl_pct = plan["sl_pct"]
@@ -473,8 +500,11 @@ def build_message(strategy: str, ticker: str, ctx: Dict[str, Any], sentiment: st
     target_2 = entry_price * (1 + p2)
     target_3 = entry_price * (1 + p3)
     stop_loss = entry_price * (1 + sl_pct)
+    rr = abs(p3 / sl_pct)
+    tv_url = f"https://ar.tradingview.com/symbols/EGX-{clean_ticker}/"
+    news_block = build_news_block(sentiment)
     return (
-        f"اسم السهم : {stock_name_ar} {ticker}\n"
+        f"اسم السهم : {stock_name_ar} {clean_ticker}\n"
         f"\n"
         f"سبب دخول الصفقه فنيا : {plan['technical_reason_ar']}\n"
         f"\n"
@@ -490,9 +520,11 @@ def build_message(strategy: str, ticker: str, ctx: Dict[str, Any], sentiment: st
         f"\n"
         f"نسبة الدخول من المحفظه : {plan['allocation_ar']} 💵\n"
         f"نوع الصفقة و مدتها : {plan['duration_ar']} ⏳️\n"
+        f"معدل العائد إلى المخاطر (R:R) : {rr:.2f} ⚖️\n"
         f"\n"
-        f"🤖 ملخص الأخبار (Gemini AI):\n"
-        f"{sentiment}\n"
+        f"📊 الرسم البياني: [EGX-{clean_ticker}]({tv_url})\n"
+        f"\n"
+        f"{news_block}\n"
         f"\n"
         f"تذكير ⚠️ التحليل قد يصيب او يخطئ ولكن يجب عليك الالتزام ب إدارة المخاطر "
         f"وعدم التهاون ب إدارة رأس مالك 🔒 .. بالتوفيق للجميع 👏"
