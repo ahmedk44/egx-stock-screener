@@ -370,21 +370,21 @@ def crossed_above_ema20(df: pd.DataFrame) -> bool:
 def fetch_arabic_stock_news(stock_name_ar: str, ticker: str) -> str:
     """Fetch live Arabic financial news for a stock and summarize sentiment via Gemini."""
     query = quote_plus(f"{stock_name_ar} البورصة المصرية")
+    headlines: List[str] = []
     try:
         resp = requests.get(NEWS_RSS_URL.format(query=query), timeout=15)
         resp.raise_for_status()
         feed = feedparser.parse(resp.content)
+        for entry in feed.entries[:NEWS_HEADLINES_COUNT]:
+            title = (entry.get("title") or "").strip()
+            published = entry.get("published") or entry.get("updated") or ""
+            if title:
+                if published:
+                    title = f"{title} ({published})"
+                headlines.append(title)
     except Exception as exc:
-        logger.warning("[%s] Arabic news feed fetch failed: %s", ticker, exc)
+        logger.warning("News fetch failed for %s: %s", ticker, exc)
         return GEMINI_FALLBACK_PROMPT
-    headlines: List[str] = []
-    for entry in feed.entries[:NEWS_HEADLINES_COUNT]:
-        title = (entry.get("title") or "").strip()
-        published = entry.get("published") or entry.get("updated") or ""
-        if title:
-            if published:
-                title = f"{title} ({published})"
-            headlines.append(title)
     if not headlines:
         logger.info(
             "[%s] No recent Arabic news for %s; passing fallback prompt.",
