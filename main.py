@@ -456,13 +456,13 @@ def _summarize_with_gemini(content: str, ticker: str) -> str:
 # --------------------------------------------------------------------------
 
 
-def send_telegram(chat_id: str, message: str, bot_token: str) -> bool:
+def send_telegram(chat_id: Optional[str], message: str, bot_token: Optional[str]) -> bool:
     """Send a Markdown-formatted message to a Telegram chat/channel."""
     if not bot_token:
         logger.error("TELEGRAM_BOT_TOKEN is not set; cannot send alerts.")
         return False
     if not chat_id:
-        logger.error("Channel ID is empty; cannot send alert.")
+        logger.error("Channel ID is empty/missing; cannot send alert.")
         return False
     payload: Dict[str, Any] = {
         "chat_id": chat_id,
@@ -475,6 +475,14 @@ def send_telegram(chat_id: str, message: str, bot_token: str) -> bool:
         )
         resp.raise_for_status()
         return True
+    except requests.exceptions.HTTPError as exc:
+        resp = exc.response
+        status = resp.status_code if resp is not None else "N/A"
+        text = resp.text if resp is not None else str(exc)
+        detail = f"[ERROR] Telegram API failed ({status}): {text}"
+        print(detail)
+        logger.warning("Telegram send failed (chat=%s): %s", chat_id, detail)
+        return False
     except Exception as exc:
         logger.warning("Telegram send failed (chat=%s): %s", chat_id, exc)
         return False
