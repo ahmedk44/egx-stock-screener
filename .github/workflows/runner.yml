@@ -1,0 +1,50 @@
+name: EGX Stock Screener
+
+on:
+  schedule:
+    # Every 15 min, Sun-Thu (0-4), 08:00-13:00 UTC (10:00-15:00 Cairo time)
+    - cron: "*/15 8-13 * * 0-4"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: egx-screener
+  cancel-in-progress: false
+
+jobs:
+  screen:
+    name: Scan EGX & send alerts
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run EGX screener
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHANNEL_SCALPING: ${{ secrets.CHANNEL_SCALPING }}
+          CHANNEL_SWING: ${{ secrets.CHANNEL_SWING }}
+          CHANNEL_INVESTMENT: ${{ secrets.CHANNEL_INVESTMENT }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: python main.py
+
+      - name: Commit updated state back to repo
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state.json
+          git diff --cached --quiet || git commit -m "chore: update screener state [skip ci]"
+          git push

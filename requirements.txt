@@ -1,0 +1,6 @@
+yfinance>=0.2.40
+pandas-ta>=0.3.14b0
+requests>=2.31.0
+feedparser>=6.0.10
+google-genai>=1.0.0
+python-dotenv>=1.0.0
