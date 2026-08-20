@@ -24,7 +24,7 @@ import logging
 import os
 import sys
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 import feedparser
 import pandas as pd
@@ -57,11 +57,36 @@ TICKERS: List[str] = [
     "EAST.CA",
     "SWDY.CA",
     "EFIH.CA",
-    "HRHO.CA",
     "TMGH.CA",
     "AMOC.CA",
     "ORAS.CA",
+    "ADIB.CA",
+    "FAIT.CA",
+    "ETEL.CA",
+    "FWRY.CA",
+    "JUFO.CA",
+    "EFID.CA",
+    "ISPH.CA",
 ]
+
+SHARIA_FILTER_ENABLED: bool = True
+
+SHARIA_COMPLIANT_TICKERS: Set[str] = {
+    "ABUK.CA",
+    "AMOC.CA",
+    "SWDY.CA",
+    "TMGH.CA",
+    "HELI.CA",
+    "ORAS.CA",
+    "EFIH.CA",
+    "ADIB.CA",
+    "FAIT.CA",
+    "ETEL.CA",
+    "FWRY.CA",
+    "JUFO.CA",
+    "EFID.CA",
+    "ISPH.CA",
+}
 
 STATE_FILE: str = "state.json"
 DUPLICATE_WINDOW_HOURS: int = 12
@@ -438,6 +463,9 @@ def evaluate_strategies(ticker: str, df: pd.DataFrame) -> List[str]:
 
 def process_ticker(ticker: str, state: Dict[str, Any]) -> None:
     """Fetch data for a ticker, evaluate signals and send alerts."""
+    if SHARIA_FILTER_ENABLED and ticker not in SHARIA_COMPLIANT_TICKERS:
+        logger.info(f"[SHARIA FILTER] Skipping {ticker}: Not Sharia compliant")
+        return
     df = fetch_price_history(ticker)
     if df is None:
         logger.info("[%s] skipped (no data).", ticker)
