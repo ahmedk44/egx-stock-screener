@@ -103,6 +103,7 @@ NON_COMPLIANT_TICKERS: Set[str] = {
 }
 
 STATE_FILE: str = "state.json"
+ACTIVE_POSITIONS_FILE: str = "active_positions.json"
 DUPLICATE_WINDOW_HOURS: int = 12
 
 RSI_LENGTH: int = 14
@@ -306,6 +307,255 @@ def mark_sent(state: Dict[str, Any], ticker: str, strategy: str) -> None:
     state.setdefault("last_alerts", {}).setdefault(ticker, {})[strategy] = (
         now_utc().isoformat()
     )
+
+
+# --------------------------------------------------------------------------
+# Active Position Tracker — JSON state persistence
+# --------------------------------------------------------------------------
+
+
+def load_active_positions(path: str = ACTIVE_POSITIONS_FILE) -> List[Dict[str, Any]]:
+    """Load active positions from JSON file; return empty list on failure.
+
+    Handles missing file, invalid JSON, and non-list payloads gracefully
+    without throwing unhandled exceptions.
+    """
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        # Support both list and dict wrapper {"positions": [...]}
+        if isinstance(data, dict):
+            # If stored as {"positions": [...]} or similar, extract list
+            for key in ("positions", "active_positions", "data"):
+                if key in data and isinstance(data[key], list):
+                    return data[key]
+            # If dict contains positions as values, fallback to empty
+            return []
+        if isinstance(data, list):
+            return data
+        logger.warning("Invalid active_positions format in %s; expected list, got %s", path, type(data).__name__)
+        return []
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        logger.warning("Failed to read %s (%s); starting with empty active positions.", path, exc)
+        return []
+    except Exception as exc:
+        logger.warning("Unexpected error loading %s (%s); returning empty.", path, exc)
+        return []
+
+
+def save_active_positions(positions: List[Dict[str, Any]], path: str = ACTIVE_POSITIONS_FILE) -> None:
+    """Persist active positions to JSON file without throwing unhandled exceptions."""
+    try:
+        # Ensure directory exists (for nested paths)
+        dir_name = os.path.dirname(os.path.abspath(path))
+        if dir_name and not os.path.exists(dir_name):
+            try:
+                os.makedirs(dir_name, exist_ok=True)
+            except Exception:
+                pass
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(positions, fh, ensure_ascii=False, indent=2)
+    except OSError as exc:
+        logger.warning("Failed to write %s: %s", path, exc)
+    except Exception as exc:
+        logger.warning("Unexpected error saving %s: %s", path, exc)
+
+
+def _resolve_chat_id_for_track(trade_track: Any) -> Optional[str]:
+    """Resolve Telegram chat_id for a given trade_track label."""
+    try:
+        track_str = str(trade_track) if trade_track is not None else ""
+        if "Scalp" in track_str or "مضاربة لحظية" in track_str:
+            return os.environ.get(CHANNEL_ENV.get(SCALPING, ""), "") or os.getenv("TELEGRAM_CHAT_ID", "")
+        if "Swing" in track_str or "سوينغ" in track_str:
+            return os.environ.get(CHANNEL_ENV.get(SWING, ""), "") or os.getenv("TELEGRAM_CHAT_ID", "")
+        if "Invest" in track_str or "استثمار طويل" in track_str:
+            return os.environ.get(CHANNEL_ENV.get(INVESTMENT, ""), "") or os.getenv("TELEGRAM_CHAT_ID", "")
+    except Exception:
+        pass
+    return os.getenv("TELEGRAM_CHAT_ID", "") or os.environ.get(CHANNEL_ENV.get(SCALPING, ""), "")
+
+
+def _fetch_current_price(ticker: str) -> Optional[float]:
+    """Fetch current price for a ticker; returns None on failure without raising."""
+    try:
+        df = fetch_price_history(ticker)
+        if df is None or df.empty:
+            return None
+        # Ensure indicators computed is not needed; just need latest Close
+        price = latest(df, "Close")
+        if price is not None:
+            return float(price)
+    except Exception as exc:
+        logger.warning("[%s] failed to fetch current price for trailing check: %s", ticker, exc)
+    return None
+
+
+def add_active_position(
+    ticker: str,
+    entry_price: float,
+    target_1: float,
+    target_2: float,
+    target_3: float,
+    current_stop_loss: float,
+    trade_track: str,
+    timestamp: Optional[str] = None,
+    status: str = "ACTIVE",
+    path: str = ACTIVE_POSITIONS_FILE,
+) -> bool:
+    """Create and persist a new active position. Returns True if added."""
+    try:
+        if not ticker or entry_price is None:
+            logger.warning("add_active_position called with invalid ticker/price; skipping")
+            return False
+        positions = load_active_positions(path)
+        # Deduplicate: skip if ACTIVE entry for same ticker+track already exists
+        for pos in positions:
+            try:
+                if pos.get("status") == "ACTIVE" and pos.get("ticker") == ticker and pos.get("trade_track") == trade_track:
+                    logger.info("[%s] active position already exists for track %s; skipping creation", ticker, trade_track)
+                    return False
+            except Exception:
+                continue
+        entry: Dict[str, Any] = {
+            "ticker": str(ticker),
+            "entry_price": float(entry_price),
+            "current_stop_loss": float(current_stop_loss) if current_stop_loss is not None else float(entry_price),
+            "target_1": float(target_1) if target_1 is not None else float(entry_price),
+            "target_2": float(target_2) if target_2 is not None else float(entry_price),
+            "target_3": float(target_3) if target_3 is not None else float(entry_price),
+            "trade_track": str(trade_track) if trade_track is not None else "",
+            "timestamp": timestamp or now_utc().isoformat(),
+            "status": str(status) if status else "ACTIVE",
+        }
+        positions.append(entry)
+        save_active_positions(positions, path)
+        logger.info("[%s] active position created: %s", ticker, entry)
+        return True
+    except Exception as exc:
+        logger.warning("Failed to add active position for %s: %s", ticker, exc)
+        return False
+
+
+def manage_active_positions(path: str = ACTIVE_POSITIONS_FILE) -> int:
+    """Compare current prices against active positions and apply trailing stop logic.
+
+    Called on each pre-market/post-market run. Handles:
+      - Break-even promotion when price >= target_1
+      - Trailing to target_1 when price >= target_2
+      - Exit when price <= current_stop_loss
+
+    Returns number of positions updated/closed. Never raises unhandled exceptions.
+    """
+    try:
+        positions = load_active_positions(path)
+        if not positions:
+            logger.info("No active positions to manage.")
+            return 0
+
+        bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+        updated_count = 0
+        dirty = False
+
+        for pos in positions:
+            try:
+                if not isinstance(pos, dict):
+                    continue
+                if pos.get("status") != "ACTIVE":
+                    continue
+
+                ticker = pos.get("ticker")
+                if not ticker or not isinstance(ticker, str):
+                    continue
+
+                # Safely extract numeric fields
+                try:
+                    entry_price = float(pos.get("entry_price"))
+                except (TypeError, ValueError):
+                    logger.warning("[%s] invalid entry_price in position; skipping", ticker)
+                    continue
+                try:
+                    current_stop_loss = float(pos.get("current_stop_loss", entry_price))
+                except (TypeError, ValueError):
+                    current_stop_loss = float(entry_price)
+                try:
+                    target_1 = float(pos.get("target_1", entry_price))
+                    target_2 = float(pos.get("target_2", entry_price))
+                except (TypeError, ValueError):
+                    logger.warning("[%s] invalid targets in position; skipping", ticker)
+                    continue
+
+                trade_track = pos.get("trade_track", "")
+
+                current_price = _fetch_current_price(ticker)
+                if current_price is None:
+                    logger.info("[%s] no current price available for trailing check; skipping", ticker)
+                    continue
+
+                # Exit check first? Spec says trailing updates then exit. We'll apply trailing promotions before exit,
+                # but if price already below stop, we should exit regardless.
+                # 1) Break-even promotion: price >= target_1 and stop < entry
+                if current_price >= target_1 and current_stop_loss < entry_price:
+                    pos["current_stop_loss"] = float(entry_price)
+                    dirty = True
+                    updated_count += 1
+                    # Dispatch break-even alert
+                    alert_msg = f"🛡️ رفع وقف الخسارة لسهم {ticker} إلى سعر الدخول ({entry_price:.2f})."
+                    chat_id = _resolve_chat_id_for_track(trade_track)
+                    if bot_token and chat_id:
+                        try:
+                            send_telegram(chat_id, alert_msg, bot_token)
+                            logger.info("[%s] break-even stop promoted to %.2f", ticker, entry_price)
+                        except Exception as exc:
+                            logger.warning("[%s] failed to send break-even alert: %s", ticker, exc)
+                    else:
+                        logger.info("[TRAIL] %s", alert_msg)
+                    # Update local var for next checks
+                    current_stop_loss = float(entry_price)
+
+                # 2) Trail to target_1 when price >= target_2 and stop < target_1
+                if current_price >= target_2 and current_stop_loss < target_1:
+                    # Only promote if not already at/above target_1
+                    pos["current_stop_loss"] = float(target_1)
+                    dirty = True
+                    updated_count += 1
+                    logger.info("[%s] trailing stop promoted to target_1 %.2f (price %.2f >= target_2 %.2f)", ticker, target_1, current_price, target_2)
+                    # No Telegram alert required per spec for this step (silent update)
+                    current_stop_loss = float(target_1)
+
+                # 3) Exit when price <= current_stop_loss
+                if current_price <= current_stop_loss:
+                    exit_msg = f"🚨 إغلاق صفقة {ticker} - تم ضرب وقف الخسارة عند {current_stop_loss:.2f}"
+                    chat_id = _resolve_chat_id_for_track(trade_track)
+                    pos["status"] = "CLOSED"
+                    dirty = True
+                    updated_count += 1
+                    if bot_token and chat_id:
+                        try:
+                            send_telegram(chat_id, exit_msg, bot_token)
+                            logger.info("[%s] exit alert sent: %s", ticker, exit_msg)
+                        except Exception as exc:
+                            logger.warning("[%s] failed to send exit alert: %s", ticker, exc)
+                    else:
+                        logger.info("[EXIT] %s", exit_msg)
+
+            except Exception as exc:
+                logger.warning("Error managing position %s: %s", pos.get("ticker", "unknown"), exc)
+                continue
+
+        if dirty:
+            save_active_positions(positions, path)
+            logger.info("Active positions updated; %d positions affected", updated_count)
+        else:
+            logger.info("Active positions checked; no trailing updates required")
+
+        return updated_count
+
+    except Exception as exc:
+        logger.warning("manage_active_positions failed unexpectedly: %s", exc)
+        return 0
 
 
 # --------------------------------------------------------------------------
@@ -1215,10 +1465,11 @@ def process_ticker(ticker: str, state: Dict[str, Any]) -> None:
             continue
         # TQI threshold filter — EGX liquidity adapted: skip only if TQI < 5.0
         try:
-            tqi_for_filter, _, _ = resolve_tqi(ctx, strategy, sentiment)
+            tqi_for_filter, track_for_filter, _ = resolve_tqi(ctx, strategy, sentiment)
         except Exception as exc:
             logger.warning("[%s] TQI filter check failed (%s); allowing dispatch", ticker, exc)
             tqi_for_filter = TQI_MIN_THRESHOLD
+            track_for_filter = TQI_TRACK_LABELS.get(strategy, str(strategy))
         if tqi_for_filter < TQI_MIN_THRESHOLD:
             logger.info("[FILTERED] Signal for %s skipped (TQI: %.1f/10 < 5.0)", ticker, tqi_for_filter)
             continue
@@ -1227,6 +1478,32 @@ def process_ticker(ticker: str, state: Dict[str, Any]) -> None:
         if send_telegram(chat_id, message, bot_token):
             mark_sent(state, ticker, strategy)
             logger.info("[%s] %s alert sent to channel %s.", ticker, strategy, chat_id)
+            # Persist active position for trailing stop tracking
+            try:
+                plan_for_pos = STRATEGY_PLAN.get(strategy, {})
+                entry_price_pos = float(ctx.get("price") or 0.0) if isinstance(ctx, dict) else 0.0
+                targets_pos = plan_for_pos.get("targets_pct", (0.03, 0.05, 0.08))
+                if not isinstance(targets_pos, (list, tuple)) or len(targets_pos) < 3:
+                    targets_pos = (0.03, 0.05, 0.08)
+                p1_pos, p2_pos, p3_pos = float(targets_pos[0]), float(targets_pos[1]), float(targets_pos[2])
+                sl_pct_pos = float(plan_for_pos.get("sl_pct", -0.03)) if plan_for_pos.get("sl_pct") is not None else -0.03
+                t1_pos = entry_price_pos * (1 + p1_pos)
+                t2_pos = entry_price_pos * (1 + p2_pos)
+                t3_pos = entry_price_pos * (1 + p3_pos)
+                sl_price_pos = entry_price_pos * (1 + sl_pct_pos)
+                # Use resolved track if available, else mapping
+                trade_track_pos = track_for_filter if isinstance(track_for_filter, str) and track_for_filter else TQI_TRACK_LABELS.get(strategy, str(strategy))
+                add_active_position(
+                    ticker=ticker,
+                    entry_price=entry_price_pos,
+                    target_1=t1_pos,
+                    target_2=t2_pos,
+                    target_3=t3_pos,
+                    current_stop_loss=sl_price_pos,
+                    trade_track=trade_track_pos,
+                )
+            except Exception as exc:
+                logger.warning("[%s] failed to persist active position: %s", ticker, exc)
 
 
 # --------------------------------------------------------------------------
@@ -1256,7 +1533,17 @@ def has_recent_news(summary: str) -> bool:
 
 
 def run_news_watchlist(mode: str) -> int:
-    """Scan all tickers for Arabic news and send a unified off-hours watchlist."""
+    """Scan all tickers for Arabic news and send a unified off-hours watchlist.
+
+    Also manages active positions trailing stops on each post/pre-market run.
+    """
+    # Trailing stop & exit logic for active positions
+    try:
+        logger.info("Checking active positions for trailing stop updates (mode=%s)...", mode)
+        manage_active_positions()
+    except Exception as exc:
+        logger.warning("Active position trailing check failed (%s); continuing watchlist", exc)
+
     title = PRE_MARKET_TITLE if mode == PRE_MARKET else POST_MARKET_TITLE
     entries: List[str] = []
     no_news: List[str] = []
