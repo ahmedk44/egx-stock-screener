@@ -1661,12 +1661,35 @@ def extract_news_body(text: Any) -> str:
 
 
 def build_news_block(sentiment: Any) -> str:
-    """Return a compact, badge-labeled Arabic news summary block."""
+    """Return a compact, badge-labeled Arabic news summary block.
+
+    Ensures macro reasoning block is NOT included here to avoid duplication —
+    macro will be appended separately via build_macro_block in build_message.
+    """
     try:
         classification = classify_sentiment(sentiment) or ""
         badge = SENTIMENT_BADGES.get(classification, "⚪")
         header = f"🤖 ملخص الأخبار (Gemini AI): {badge} {classification}".strip()
         body = extract_news_body(sentiment)
+        # Strip macro reasoning block from news body to prevent duplicate header
+        try:
+            if isinstance(sentiment, str) and sentiment:
+                # Remove exact macro block if present in body
+                macro_exact = extract_macro_analysis(sentiment)
+                if macro_exact and macro_exact in body:
+                    body = body.replace(macro_exact, "").strip()
+                # Fallback: remove any remaining macro header/bullets by pattern
+                # This handles cases where body contains raw macro with different whitespace
+                body = re.sub(r"🧠\s*التحليل\s*الكلي\s*والأثر\s*غير\s*المباشر\s*:?.*", "", body, flags=re.DOTALL).strip()
+                body = re.sub(r"التحليل\s*الكلي\s*والأثر\s*غير\s*المباشر\s*:?.*", "", body, flags=re.DOTALL).strip()
+                # Remove stray macro bullets if any remain (only if they were part of macro)
+                # Keep body clean without leaving double newlines
+                body = re.sub(r"\n\s*•\s*السبب\s*:.*", "", body).strip()
+                body = re.sub(r"\n\s*•\s*القطاع\s*(المتأثر|التأثر)?\s*:.*", "", body).strip()
+                body = re.sub(r"\n\s*•\s*الأسهم\s*المستفيدة.*", "", body).strip()
+                body = re.sub(r"\n{3,}", "\n\n", body).strip()
+        except Exception:
+            pass
         return f"{header}\n{body}".strip()
     except Exception:
         # Never crash message formatting
