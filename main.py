@@ -180,6 +180,8 @@ TQI_TRACK_LABELS: Dict[str, str] = {
 }
 
 TELEGRAM_API: str = "https://api.telegram.org/bot{token}/sendMessage"
+TELEGRAM_ANSWER_API: str = "https://api.telegram.org/bot{token}/answerCallbackQuery"
+SUPABASE_TABLE: str = "active_positions"
 
 STOCK_NAMES_AR: Dict[str, str] = {
     "ABUK.CA": "أبو قير للأسمدة",
@@ -320,28 +322,91 @@ def mark_sent(state: Dict[str, Any], ticker: str, strategy: str) -> None:
 
 
 # --------------------------------------------------------------------------
-# Active Position Tracker — JSON state persistence
+# Active Position Tracker — JSON state persistence + Supabase REST
 # --------------------------------------------------------------------------
 
 
-def load_active_positions(path: str = ACTIVE_POSITIONS_FILE) -> List[Dict[str, Any]]:
-    """Load active positions from JSON file; return empty list on failure.
+def _is_supabase_configured() -> bool:
+    """Check if Supabase env vars are present (dynamic, not cached)."""
+    try:
+        url = (os.environ.get("SUPABASE_URL") or "").strip()
+        key = (os.environ.get("SUPABASE_KEY") or "").strip()
+        return bool(url and key)
+    except Exception:
+        return False
 
-    Handles missing file, invalid JSON, and non-list payloads gracefully
-    without throwing unhandled exceptions.
+
+def _supabase_headers() -> Dict[str, str]:
+    """Build headers for Supabase REST API."""
+    try:
+        key = (os.environ.get("SUPABASE_KEY") or "").strip()
+        return {
+            "apikey": key,
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+            "Prefer": "return=representation",
+        }
+    except Exception:
+        return {}
+
+
+def _supabase_base_url() -> str:
+    """Return Supabase base URL without trailing slash."""
+    try:
+        url = (os.environ.get("SUPABASE_URL") or "").strip().rstrip("/")
+        return url
+    except Exception:
+        return ""
+
+
+def _supabase_table_url() -> str:
+    """Return full Supabase table URL for active_positions."""
+    base = _supabase_base_url()
+    if not base:
+        return ""
+    return f"{base}/rest/v1/{SUPABASE_TABLE}"
+
+
+def load_active_positions(path: str = ACTIVE_POSITIONS_FILE) -> List[Dict[str, Any]]:
+    """Load active positions from Supabase or JSON file; fallback cleanly.
+
+    If SUPABASE_URL and SUPABASE_KEY are set, queries Supabase REST API
+    for active_positions table. On any error or missing env, falls back to
+    local JSON file without raising. Handles missing file, invalid JSON, etc.
     """
+    # Try Supabase first if configured
+    if _is_supabase_configured():
+        try:
+            url = _supabase_table_url()
+            if url:
+                headers = _supabase_headers()
+                # Query all positions; Supabase uses PostgREST
+                resp = requests.get(f"{url}?select=*", headers=headers, timeout=15)
+                resp.raise_for_status()
+                data = resp.json()
+                if isinstance(data, list):
+                    return data
+                if isinstance(data, dict) and "data" in data:
+                    val = data["data"]
+                    if isinstance(val, list):
+                        return val
+                logger.warning("Supabase load returned unexpected format: %s", type(data).__name__)
+                # Fall through to file fallback
+        except requests.exceptions.RequestException as exc:
+            logger.warning("Supabase load failed (%s); falling back to local JSON", exc)
+        except Exception as exc:
+            logger.warning("Unexpected Supabase load error (%s); falling back to JSON", exc)
+
+    # Local JSON fallback
     if not os.path.exists(path):
         return []
     try:
         with open(path, "r", encoding="utf-8") as fh:
             data = json.load(fh)
-        # Support both list and dict wrapper {"positions": [...]}
         if isinstance(data, dict):
-            # If stored as {"positions": [...]} or similar, extract list
             for key in ("positions", "active_positions", "data"):
                 if key in data and isinstance(data[key], list):
                     return data[key]
-            # If dict contains positions as values, fallback to empty
             return []
         if isinstance(data, list):
             return data
@@ -356,9 +421,40 @@ def load_active_positions(path: str = ACTIVE_POSITIONS_FILE) -> List[Dict[str, A
 
 
 def save_active_positions(positions: List[Dict[str, Any]], path: str = ACTIVE_POSITIONS_FILE) -> None:
-    """Persist active positions to JSON file without throwing unhandled exceptions."""
+    """Persist active positions to Supabase (if configured) and JSON fallback.
+
+    Tries Supabase REST upsert when SUPABASE_URL/KEY are set; on any failure
+    or when not configured, falls back to local JSON file. Never raises.
+    """
+    # Attempt Supabase persistence if configured
+    if _is_supabase_configured():
+        try:
+            url = _supabase_table_url()
+            if url:
+                headers = _supabase_headers()
+                # Use merge-duplicates for upsert; on_conflict on ticker
+                # Bulk upsert via POST
+                headers_with_merge = dict(headers)
+                headers_with_merge["Prefer"] = "resolution=merge-duplicates, return=representation"
+                # Only attempt Supabase bulk if positions is not too large; otherwise fallback
+                if isinstance(positions, list):
+                    # For empty list, we still want to ensure table is cleared – skip bulk delete for safety
+                    if len(positions) > 0:
+                        resp = requests.post(f"{url}?on_conflict=ticker,trade_track", json=positions, headers=headers_with_merge, timeout=15)
+                        if resp.status_code in (200, 201, 204):
+                            logger.info("Saved %d positions to Supabase", len(positions))
+                        else:
+                            logger.warning("Supabase bulk save failed (%s %s); will also save to JSON", resp.status_code, resp.text[:300] if resp.text else "")
+                    else:
+                        # Empty list: optionally truncate? For now just log
+                        logger.info("No positions to save to Supabase (empty list)")
+        except requests.exceptions.RequestException as exc:
+            logger.warning("Supabase save request failed (%s); falling back to JSON", exc)
+        except Exception as exc:
+            logger.warning("Supabase save failed (%s); falling back to JSON", exc)
+
+    # Local JSON fallback / cache (always attempt to keep local file for dry-runs)
     try:
-        # Ensure directory exists (for nested paths)
         dir_name = os.path.dirname(os.path.abspath(path))
         if dir_name and not os.path.exists(dir_name):
             try:
@@ -371,6 +467,188 @@ def save_active_positions(positions: List[Dict[str, Any]], path: str = ACTIVE_PO
         logger.warning("Failed to write %s: %s", path, exc)
     except Exception as exc:
         logger.warning("Unexpected error saving %s: %s", path, exc)
+
+
+def update_position_status(ticker: str, status: str, path: str = ACTIVE_POSITIONS_FILE) -> bool:
+    """Update status for a ticker in Supabase or local JSON fallback.
+
+    Args:
+        ticker: Stock symbol (e.g., COMI.CA)
+        status: New status (ACTIVE, CLOSED, DISMISSED, PENDING)
+        path: Local JSON path for fallback
+
+    Returns True if updated, False otherwise. Never raises.
+    """
+    status = str(status).strip().upper() if status else ""
+    ticker = str(ticker).strip() if ticker else ""
+    if not ticker or not status:
+        logger.warning("update_position_status called with invalid ticker/status")
+        return False
+
+    # Try Supabase if configured
+    if _is_supabase_configured():
+        try:
+            url = _supabase_table_url()
+            headers = _supabase_headers()
+            # Patch by ticker (PostgREST filter)
+            # Supabase uses eq. filter; need to URL encode ticker
+            # Use requests params for safety
+            resp = requests.patch(
+                url,
+                params={"ticker": f"eq.{ticker}"},
+                json={"status": status},
+                headers=headers,
+                timeout=15,
+            )
+            if resp.status_code in (200, 204):
+                logger.info("[Supabase] Updated %s status to %s", ticker, status)
+                # Also update local cache for backward compatibility
+                try:
+                    positions = load_active_positions(path)
+                    # If Supabase succeeded, also reflect in local file if it exists
+                    for pos in positions:
+                        if str(pos.get("ticker", "")).strip() == ticker:
+                            pos["status"] = status
+                    save_active_positions(positions, path)
+                except Exception:
+                    pass
+                return True
+            elif resp.status_code == 404:
+                logger.warning("Supabase update status: ticker %s not found (%s)", ticker, resp.text[:200])
+            else:
+                logger.warning("Supabase update status failed for %s (%s %s)", ticker, resp.status_code, resp.text[:300] if resp.text else "")
+                # Fall through to local fallback
+        except requests.exceptions.RequestException as exc:
+            logger.warning("Supabase update_status request failed for %s (%s); falling back to JSON", ticker, exc)
+        except Exception as exc:
+            logger.warning("Supabase update_status failed for %s (%s); falling back", ticker, exc)
+
+    # Local JSON fallback
+    try:
+        positions = load_active_positions(path)
+        # If Supabase was not configured, load will have returned file data; if Supabase was configured but failed, we already attempted Supabase, now try file
+        # Need to handle case where load used Supabase and returned Supabase data, but update failed – we still want to update file
+        # For fallback, re-load from file directly bypassing Supabase check
+        if _is_supabase_configured():
+            # Force file load without Supabase
+            try:
+                if os.path.exists(path):
+                    with open(path, "r", encoding="utf-8") as fh:
+                        file_data = json.load(fh)
+                        if isinstance(file_data, list):
+                            positions = file_data
+                        elif isinstance(file_data, dict):
+                            for k in ("positions", "active_positions", "data"):
+                                if k in file_data and isinstance(file_data[k], list):
+                                    positions = file_data[k]
+                                    break
+            except Exception:
+                pass
+
+        updated = False
+        for pos in positions:
+            try:
+                if str(pos.get("ticker", "")).strip() == ticker:
+                    pos["status"] = status
+                    updated = True
+            except Exception:
+                continue
+        if updated:
+            save_active_positions(positions, path)
+            logger.info("[JSON] Updated %s status to %s", ticker, status)
+            return True
+        logger.warning("No position found for %s to update status to %s", ticker, status)
+        return False
+    except Exception as exc:
+        logger.warning("Local update_position_status failed for %s: %s", ticker, exc)
+        return False
+
+
+def update_position_stop(ticker: str, new_stop: float, path: str = ACTIVE_POSITIONS_FILE) -> bool:
+    """Update dynamic stop loss for a ticker in Supabase or local JSON fallback.
+
+    Args:
+        ticker: Stock symbol
+        new_stop: New stop loss price
+        path: Local JSON path
+
+    Returns True if updated. Never raises.
+    """
+    ticker = str(ticker).strip() if ticker else ""
+    try:
+        new_stop_f = float(new_stop)
+    except (TypeError, ValueError):
+        logger.warning("update_position_stop called with invalid stop %s for %s", new_stop, ticker)
+        return False
+    if not ticker:
+        return False
+
+    # Try Supabase
+    if _is_supabase_configured():
+        try:
+            url = _supabase_table_url()
+            headers = _supabase_headers()
+            resp = requests.patch(
+                url,
+                params={"ticker": f"eq.{ticker}"},
+                json={"current_stop_loss": new_stop_f},
+                headers=headers,
+                timeout=15,
+            )
+            if resp.status_code in (200, 204):
+                logger.info("[Supabase] Updated %s stop to %.2f", ticker, new_stop_f)
+                try:
+                    positions = load_active_positions(path)
+                    for pos in positions:
+                        if str(pos.get("ticker", "")).strip() == ticker:
+                            pos["current_stop_loss"] = float(new_stop_f)
+                    save_active_positions(positions, path)
+                except Exception:
+                    pass
+                return True
+            else:
+                logger.warning("Supabase update stop failed for %s (%s)", ticker, resp.text[:300] if resp.text else "")
+        except requests.exceptions.RequestException as exc:
+            logger.warning("Supabase update_stop request failed for %s (%s); falling back", ticker, exc)
+        except Exception as exc:
+            logger.warning("Supabase update_stop failed for %s (%s)", ticker, exc)
+
+    # Local fallback
+    try:
+        # Force file read
+        positions = []
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    data = json.load(fh)
+                    if isinstance(data, list):
+                        positions = data
+                    elif isinstance(data, dict):
+                        for k in ("positions", "active_positions", "data"):
+                            if k in data and isinstance(data[k], list):
+                                positions = data[k]
+                                break
+            except Exception:
+                positions = load_active_positions(path)
+        else:
+            positions = []
+        updated = False
+        for pos in positions:
+            try:
+                if str(pos.get("ticker", "")).strip() == ticker:
+                    pos["current_stop_loss"] = float(new_stop_f)
+                    updated = True
+            except Exception:
+                continue
+        if updated:
+            save_active_positions(positions, path)
+            logger.info("[JSON] Updated %s stop to %.2f", ticker, new_stop_f)
+            return True
+        logger.warning("No position found for %s to update stop", ticker)
+        return False
+    except Exception as exc:
+        logger.warning("Local update_position_stop failed for %s: %s", ticker, exc)
+        return False
 
 
 def _resolve_chat_id_for_track(trade_track: Any) -> Optional[str]:
@@ -412,16 +690,93 @@ def add_active_position(
     current_stop_loss: float,
     trade_track: str,
     timestamp: Optional[str] = None,
-    status: str = "ACTIVE",
+    status: str = "PENDING",
     path: str = ACTIVE_POSITIONS_FILE,
 ) -> bool:
-    """Create and persist a new active position. Returns True if added."""
+    """Create and persist a new active position. Returns True if added.
+
+    If Supabase is configured, upserts into Supabase table with status PENDING;
+    otherwise falls back to local JSON file. Never raises.
+    """
+    # Normalize status to PENDING by default per requirements
+    try:
+        norm_status = str(status).strip().upper() if status else "PENDING"
+        if norm_status not in ("PENDING", "ACTIVE", "CLOSED", "DISMISSED"):
+            norm_status = "PENDING"
+    except Exception:
+        norm_status = "PENDING"
+
+    # Try Supabase if configured
+    if _is_supabase_configured():
+        try:
+            url = _supabase_table_url()
+            headers = _supabase_headers()
+            if url and headers:
+                entry: Dict[str, Any] = {
+                    "ticker": str(ticker),
+                    "entry_price": float(entry_price),
+                    "current_stop_loss": float(current_stop_loss) if current_stop_loss is not None else float(entry_price),
+                    "target_1": float(target_1) if target_1 is not None else float(entry_price),
+                    "target_2": float(target_2) if target_2 is not None else float(entry_price),
+                    "target_3": float(target_3) if target_3 is not None else float(entry_price),
+                    "trade_track": str(trade_track) if trade_track is not None else "",
+                    "timestamp": timestamp or now_utc().isoformat(),
+                    "status": norm_status,
+                }
+                # Use upsert with Prefer resolution merge-duplicates
+                headers_upsert = dict(headers)
+                headers_upsert["Prefer"] = "resolution=merge-duplicates, return=representation"
+                # Check existing via GET to avoid duplicate? Let Supabase handle via on_conflict
+                resp = requests.post(f"{url}?on_conflict=ticker,trade_track", json=entry, headers=headers_upsert, timeout=15)
+                if resp.status_code in (200, 201, 204):
+                    logger.info("[Supabase] active position upserted for %s (%s)", ticker, norm_status)
+                    # Also update local cache for fallback
+                    try:
+                        positions = load_active_positions(path)
+                        # If local file also has Supabase data, keep in sync - append if not exists
+                        exists = any(
+                            p.get("ticker") == ticker and p.get("trade_track") == trade_track and p.get("status") in ("ACTIVE", "PENDING")
+                            for p in positions
+                        )
+                        if not exists:
+                            positions.append(entry)
+                            save_active_positions(positions, path)
+                    except Exception:
+                        pass
+                    return True
+                elif resp.status_code == 409:
+                    logger.info("[Supabase] position already exists for %s with track %s; skipping", ticker, trade_track)
+                    return False
+                else:
+                    logger.warning("Supabase add_active_position failed (%s %s); falling back to JSON", resp.status_code, resp.text[:300] if resp.text else "")
+        except requests.exceptions.RequestException as exc:
+            logger.warning("Supabase add_active_position request failed (%s); falling back to JSON", exc)
+        except Exception as exc:
+            logger.warning("Supabase add_active_position failed (%s); falling back", exc)
+
+    # Local JSON fallback
     try:
         if not ticker or entry_price is None:
             logger.warning("add_active_position called with invalid ticker/price; skipping")
             return False
         positions = load_active_positions(path)
-        # Deduplicate: skip if ACTIVE/PENDING entry for same ticker+track already exists (CLOSED is allowed)
+        # If Supabase was configured, load_active_positions already returned Supabase data; for fallback we need to ensure we are checking file data
+        # If Supabase is configured but we fell through, force file load to check duplicates correctly
+        if _is_supabase_configured():
+            try:
+                if os.path.exists(path):
+                    with open(path, "r", encoding="utf-8") as fh:
+                        file_data = json.load(fh)
+                        if isinstance(file_data, list):
+                            positions = file_data
+                        elif isinstance(file_data, dict):
+                            for k in ("positions", "active_positions", "data"):
+                                if k in file_data and isinstance(file_data[k], list):
+                                    positions = file_data[k]
+                                    break
+            except Exception:
+                pass
+
         for pos in positions:
             try:
                 if pos.get("status") in ("ACTIVE", "PENDING") and pos.get("ticker") == ticker and pos.get("trade_track") == trade_track:
@@ -438,11 +793,11 @@ def add_active_position(
             "target_3": float(target_3) if target_3 is not None else float(entry_price),
             "trade_track": str(trade_track) if trade_track is not None else "",
             "timestamp": timestamp or now_utc().isoformat(),
-            "status": str(status) if status else "ACTIVE",
+            "status": norm_status,
         }
         positions.append(entry)
         save_active_positions(positions, path)
-        logger.info("[%s] active position created: %s", ticker, entry)
+        logger.info("[%s] active position created (JSON): %s", ticker, entry)
         return True
     except Exception as exc:
         logger.warning("Failed to add active position for %s: %s", ticker, exc)
@@ -613,127 +968,246 @@ def manage_active_positions(path: str = ACTIVE_POSITIONS_FILE) -> int:
         return 0
 
 
-def handle_telegram_callback(callback_data: Any, path: str = ACTIVE_POSITIONS_FILE) -> str:
-    """Lightweight callback handler for inline keyboard actions.
+def handle_telegram_callback(
+    callback_data: Any,
+    path: str = ACTIVE_POSITIONS_FILE,
+    callback_query_id: Optional[str] = None,
+    bot_token: Optional[str] = None,
+) -> str:
+    """Lightweight callback handler for inline keyboard actions with Supabase support.
 
-    Parses callback_data and updates active_positions.json:
-      - act_{ticker}: PENDING -> ACTIVE
-      - dis_{ticker}: remove position
-      - cls_{ticker}: set status to CLOSED
+    Parses callback_data and updates active_positions (Supabase or JSON fallback):
+      - act_{ticker}: PENDING -> ACTIVE (Supabase: update status ACTIVE) + popup ✅
+      - dis_{ticker}: remove or DISMISSED (Supabase: status DISMISSED) + popup ❌
+      - cls_{ticker}: set status to CLOSED (Supabase) + popup 🏁
 
-    Returns a short status string for webhook response. Never raises.
+    Also answers Telegram callback query with popup notification when
+    callback_query_id and bot_token are provided. Never raises.
     """
+    # Helper to answer callback query with popup
+    def _do_answer(text: str) -> None:
+        try:
+            cqid = callback_query_id
+            # Also try to get bot token from env if not provided
+            token = bot_token or os.environ.get("TELEGRAM_BOT_TOKEN", "")
+            if cqid and token and isinstance(cqid, str):
+                _answer_callback_query(cqid, text, token, show_alert=False)
+        except Exception:
+            pass
+
     try:
         if not isinstance(callback_data, str) or not callback_data:
             return "invalid callback_data"
         callback_data = callback_data.strip()
         if "_" not in callback_data:
             return "invalid format"
-        # Split only on first underscore to preserve ticker like COMI.CA
         action, ticker = callback_data.split("_", 1)
         action = action.strip()
         ticker = ticker.strip()
         if not ticker:
             return "invalid ticker"
-        # Normalize ticker: ensure it contains .CA if missing and matches stored format
-        # We will match both exact ticker and ticker with/without .CA
         ticker_variants = {ticker}
         if "." not in ticker:
             ticker_variants.add(f"{ticker}.CA")
         else:
-            # Also add without suffix for flexibility
             base = ticker.replace(".CA", "")
             ticker_variants.add(base)
             ticker_variants.add(f"{base}.CA")
 
-        positions = load_active_positions(path)
-        if not positions:
-            return f"no positions found for {ticker}"
-
-        original_len = len(positions)
-        matched = False
-        response_msg = ""
+        # Try Supabase first if configured
+        supabase_used = _is_supabase_configured()
 
         if action == "act":
-            # Activate PENDING -> ACTIVE
-            for pos in positions:
+            popup_text = "✅ تم تفعيل المراقبة بنجاح!"
+            # Supabase path: update status to ACTIVE
+            if supabase_used:
                 try:
-                    pos_ticker = str(pos.get("ticker", "")).strip()
-                    if pos_ticker in ticker_variants and pos.get("status") == "PENDING":
-                        pos["status"] = "ACTIVE"
-                        # Optionally update timestamp to activation time
-                        try:
-                            pos["activated_at"] = now_utc().isoformat()
-                        except Exception:
-                            pass
-                        matched = True
-                        response_msg = f"Activated {pos_ticker}"
-                        break
-                except Exception:
-                    continue
-            if not matched:
-                # Fallback: if no PENDING found, try to activate first matching ticker regardless of status
+                    # Try Supabase update; fallback to file if fails
+                    success = update_position_status(ticker, "ACTIVE", path=path)
+                    # update_position_status already handles fallback, but we check result
+                    if success:
+                        _do_answer(popup_text)
+                        return f"Activated {ticker} (Supabase)"
+                except Exception as exc:
+                    logger.warning("Supabase act failed for %s: %s; falling back to JSON", ticker, exc)
+            # Local JSON fallback: PENDING -> ACTIVE
+            try:
+                positions = load_active_positions(path)
+                if not positions and not supabase_used:
+                    return f"no positions found for {ticker}"
+                # If Supabase was used, load may have returned Supabase data; for fallback we ensure file data
+                if supabase_used and not positions:
+                    # Try file directly
+                    try:
+                        if os.path.exists(path):
+                            with open(path, "r", encoding="utf-8") as fh:
+                                file_data = json.load(fh)
+                                if isinstance(file_data, list):
+                                    positions = file_data
+                    except Exception:
+                        pass
+                matched = False
+                response_msg = ""
                 for pos in positions:
                     try:
-                        if str(pos.get("ticker", "")).strip() in ticker_variants:
-                            if pos.get("status") != "ACTIVE":
+                        pos_ticker = str(pos.get("ticker", "")).strip()
+                        if pos_ticker in ticker_variants and pos.get("status") == "PENDING":
+                            pos["status"] = "ACTIVE"
+                            try:
+                                pos["activated_at"] = now_utc().isoformat()
+                            except Exception:
+                                pass
+                            matched = True
+                            response_msg = f"Activated {pos_ticker}"
+                            break
+                    except Exception:
+                        continue
+                if not matched:
+                    for pos in positions:
+                        try:
+                            if str(pos.get("ticker", "")).strip() in ticker_variants and pos.get("status") != "ACTIVE":
                                 pos["status"] = "ACTIVE"
                                 matched = True
                                 response_msg = f"Activated {pos.get('ticker')}"
                                 break
-                    except Exception:
-                        continue
-            if matched:
-                save_active_positions(positions, path)
-                logger.info("[CALLBACK] %s", response_msg)
-                return response_msg
-            return f"no PENDING position found for {ticker}"
+                        except Exception:
+                            continue
+                if matched:
+                    save_active_positions(positions, path)
+                    logger.info("[CALLBACK] %s", response_msg)
+                    _do_answer(popup_text)
+                    return response_msg
+                # If no PENDING found and Supabase not used, Try Supabase update as last resort
+                if supabase_used:
+                    # Already tried Supabase via update_position_status, but try again with raw
+                    pass
+                return f"no PENDING position found for {ticker}"
+            except Exception as exc:
+                logger.warning("Local act fallback failed for %s: %s", ticker, exc)
+                return f"error: {exc}"
 
         elif action == "dis":
-            # Dismiss: remove position(s) with matching ticker
-            new_positions = []
-            removed = 0
-            for pos in positions:
+            popup_text = "❌ تم إلغاء متابعة الصفقة."
+            if supabase_used:
                 try:
-                    if str(pos.get("ticker", "")).strip() in ticker_variants:
-                        removed += 1
-                        continue
-                    new_positions.append(pos)
-                except Exception:
-                    new_positions.append(pos)
-            if removed > 0:
-                save_active_positions(new_positions, path)
-                logger.info("[CALLBACK] Dismissed %d position(s) for %s", removed, ticker)
-                return f"Dismissed {ticker} ({removed})"
-            return f"no position found to dismiss for {ticker}"
-
-        elif action == "cls":
-            # Close manually: set ACTIVE/PENDING -> CLOSED
-            for pos in positions:
-                try:
-                    pos_ticker = str(pos.get("ticker", "")).strip()
-                    if pos_ticker in ticker_variants and pos.get("status") in ("ACTIVE", "PENDING"):
-                        pos["status"] = "CLOSED"
+                    # Prefer update to DISMISSED in Supabase
+                    success = update_position_status(ticker, "DISMISSED", path=path)
+                    if success:
+                        # Also try to delete from Supabase for clean removal (optional)
                         try:
-                            pos["closed_at"] = now_utc().isoformat()
-                            pos["close_reason"] = "manual"
+                            url = _supabase_table_url()
+                            headers = _supabase_headers()
+                            if url and headers:
+                                # Delete via Supabase REST: DELETE with ticker filter
+                                # Use DISMISSED status already set, but also try delete
+                                # We'll keep DISMISSED status; delete is optional
+                                pass
                         except Exception:
                             pass
-                        matched = True
-                    elif pos_ticker in ticker_variants and pos.get("status") == "ACTIVE":
-                        pos["status"] = "CLOSED"
-                        matched = True
-                except Exception:
-                    continue
-            if matched:
-                save_active_positions(positions, path)
-                logger.info("[CALLBACK] Manually closed %s", ticker)
-                return f"Closed {ticker}"
-            # Also handle if already CLOSED
-            for pos in positions:
-                if str(pos.get("ticker", "")).strip() in ticker_variants:
-                    return f"already closed {ticker}"
-            return f"no position found to close for {ticker}"
+                        _do_answer(popup_text)
+                        return f"Dismissed {ticker} (Supabase DISMISSED)"
+                    else:
+                        # Fallback to try delete directly
+                        try:
+                            url = _supabase_table_url()
+                            headers = _supabase_headers()
+                            if url and headers:
+                                resp = requests.delete(url, params={"ticker": f"eq.{ticker}"}, headers=headers, timeout=15)
+                                if resp.status_code in (200, 204):
+                                    _do_answer(popup_text)
+                                    return f"Dismissed {ticker} (Supabase deleted)"
+                        except Exception:
+                            pass
+                except Exception as exc:
+                    logger.warning("Supabase dis failed for %s: %s; falling back to JSON", ticker, exc)
+            # Local JSON fallback: remove position(s)
+            try:
+                positions = load_active_positions(path)
+                # Force file load if Supabase was used but failed
+                if supabase_used and not positions:
+                    try:
+                        if os.path.exists(path):
+                            with open(path, "r", encoding="utf-8") as fh:
+                                file_data = json.load(fh)
+                                if isinstance(file_data, list):
+                                    positions = file_data
+                    except Exception:
+                        pass
+                if not positions:
+                    return f"no positions found for {ticker}"
+                new_positions = []
+                removed = 0
+                for pos in positions:
+                    try:
+                        if str(pos.get("ticker", "")).strip() in ticker_variants:
+                            removed += 1
+                            continue
+                        new_positions.append(pos)
+                    except Exception:
+                        new_positions.append(pos)
+                if removed > 0:
+                    save_active_positions(new_positions, path)
+                    logger.info("[CALLBACK] Dismissed %d position(s) for %s", removed, ticker)
+                    _do_answer(popup_text)
+                    return f"Dismissed {ticker} ({removed})"
+                return f"no position found to dismiss for {ticker}"
+            except Exception as exc:
+                logger.warning("Local dis fallback failed for %s: %s", ticker, exc)
+                return f"error: {exc}"
+
+        elif action == "cls":
+            popup_text = "🏁 تم إغلاق الصفقة يدوياً."
+            if supabase_used:
+                try:
+                    success = update_position_status(ticker, "CLOSED", path=path)
+                    if success:
+                        _do_answer(popup_text)
+                        return f"Closed {ticker} (Supabase)"
+                except Exception as exc:
+                    logger.warning("Supabase cls failed for %s: %s; falling back", ticker, exc)
+            # Local JSON fallback
+            try:
+                positions = load_active_positions(path)
+                if supabase_used and not positions:
+                    try:
+                        if os.path.exists(path):
+                            with open(path, "r", encoding="utf-8") as fh:
+                                file_data = json.load(fh)
+                                if isinstance(file_data, list):
+                                    positions = file_data
+                    except Exception:
+                        pass
+                if not positions:
+                    return f"no positions found for {ticker}"
+                matched = False
+                for pos in positions:
+                    try:
+                        pos_ticker = str(pos.get("ticker", "")).strip()
+                        if pos_ticker in ticker_variants and pos.get("status") in ("ACTIVE", "PENDING"):
+                            pos["status"] = "CLOSED"
+                            try:
+                                pos["closed_at"] = now_utc().isoformat()
+                                pos["close_reason"] = "manual"
+                            except Exception:
+                                pass
+                            matched = True
+                        elif pos_ticker in ticker_variants and pos.get("status") == "ACTIVE":
+                            pos["status"] = "CLOSED"
+                            matched = True
+                    except Exception:
+                        continue
+                if matched:
+                    save_active_positions(positions, path)
+                    logger.info("[CALLBACK] Manually closed %s", ticker)
+                    _do_answer(popup_text)
+                    return f"Closed {ticker}"
+                for pos in positions:
+                    if str(pos.get("ticker", "")).strip() in ticker_variants:
+                        return f"already closed {ticker}"
+                return f"no position found to close for {ticker}"
+            except Exception as exc:
+                logger.warning("Local cls fallback failed for %s: %s", ticker, exc)
+                return f"error: {exc}"
 
         else:
             return f"unknown action {action}"
@@ -1080,6 +1554,43 @@ def send_telegram(chat_id: Optional[str], message: str, bot_token: Optional[str]
         return False
     except Exception as exc:
         logger.warning("Telegram send failed (chat=%s): %s", chat_id, exc)
+        return False
+
+
+def _answer_callback_query(callback_query_id: str, text: str, bot_token: Optional[str] = None, show_alert: bool = False) -> bool:
+    """Answer Telegram callback query with popup notification.
+
+    Args:
+        callback_query_id: ID from Telegram callback query
+        text: Text to show in popup (Arabic)
+        bot_token: Telegram bot token (falls back to env)
+        show_alert: Whether to show as alert popup
+    Returns True if sent, False otherwise. Never raises.
+    """
+    try:
+        if not callback_query_id or not isinstance(callback_query_id, str):
+            return False
+        token = bot_token or os.environ.get("TELEGRAM_BOT_TOKEN", "")
+        if not token:
+            logger.warning("Cannot answer callback query: TELEGRAM_BOT_TOKEN missing")
+            return False
+        payload: Dict[str, Any] = {
+            "callback_query_id": callback_query_id,
+            "text": str(text)[:200],  # Telegram limit
+            "show_alert": bool(show_alert),
+        }
+        resp = requests.post(
+            TELEGRAM_ANSWER_API.format(token=token),
+            json=payload,
+            timeout=15,
+        )
+        resp.raise_for_status()
+        return True
+    except requests.exceptions.RequestException as exc:
+        logger.warning("Failed to answer callback query %s: %s", callback_query_id, exc)
+        return False
+    except Exception as exc:
+        logger.warning("Unexpected error answering callback query %s: %s", callback_query_id, exc)
         return False
 
 
