@@ -426,14 +426,22 @@ def fetch_arabic_headlines(stock_name_ar: str, ticker: str) -> List[str]:
     return headlines
 
 
-def build_news_prompt(headlines: List[str]) -> str:
+def build_news_prompt(headlines: Any) -> str:
     """Build Gemini prompt: sentiment + Trade Quality Index (TQI) evaluation.
 
     Instructs Gemini to evaluate each stock signal using TQI 0.0-10.0 across
     5 weighted parameters, assign Trade Track and Conviction Tier, and emit
     machine-parsable lines for Telegram formatting.
+    Handles None / non-list inputs gracefully.
     """
-    headlines_block = "\n".join(f"- {h}" for h in headlines)
+    try:
+        if not isinstance(headlines, (list, tuple)):
+            headlines = []
+        # Filter out non-string / empty headlines
+        safe_headlines = [str(h).strip() for h in headlines if h is not None and str(h).strip()]
+        headlines_block = "\n".join(f"- {h}" for h in safe_headlines) if safe_headlines else "- لا توجد عناوين متاحة"
+    except Exception:
+        headlines_block = "- لا توجد عناوين متاحة"
     return (
         "أنت محلل مالي متخصص في البورصة المصرية (EGX). اقرأ العناوين التالية ثم أخرج:\n"
         "1) ملخصًا من جملتين باللغة العربية يلخّص اتجاه الأخبار.\n"
@@ -467,37 +475,65 @@ def build_news_prompt(headlines: List[str]) -> str:
     )
 
 
-def build_tqi_prompt(strategy: str, ctx: Dict[str, Any], sentiment: str) -> str:
+def build_tqi_prompt(strategy: Any, ctx: Any, sentiment: Any) -> str:
     """Build a dedicated Gemini prompt for TQI scoring of a specific signal.
 
     Provides technical context (RSI, EMA, volume surge, R:R) so Gemini can
-    score the 5 TQI parameters accurately.
+    score the 5 TQI parameters accurately. Handles None/missing keys gracefully.
     """
-    plan = STRATEGY_PLAN.get(strategy, {})
-    price = ctx.get("price")
-    rsi = ctx.get("rsi")
-    volume_ratio = ctx.get("volume_ratio")
-    rr_targets = plan.get("targets_pct", (0.03, 0.05, 0.08))
-    sl_pct = plan.get("sl_pct", -0.03)
-    rr = abs(rr_targets[2] / sl_pct) if sl_pct else 0
-    return (
-        "أنت خبير تداول كمي للبورصة المصرية. قيّم جودة الإشارة التالية عبر Trade Quality Index (TQI) من 0.0 إلى 10.0:\n"
-        f"الاستراتيجية: {strategy} | السعر: {fmt(price)} | RSI: {fmt(rsi, 1)} | "
-        f"نسبة الحجم: {fmt(volume_ratio, 2) if volume_ratio else 'غير متاح'} | "
-        f"R:R المتوقع: 1:{rr:.2f}\n"
-        f"ملخص الأخبار/المعنويات: {extract_news_body(sentiment)[:300]}\n\n"
-        "المعايير المرجحة (المجموع 10.0):\n"
-        "1) Technical Confluence (3 pts) — التقاء RSI/EMA/SMA/اختراق\n"
-        "2) Risk/Reward Ratio (2.5 pts) — جودة R:R\n"
-        "3) Relative Volume Surge (2 pts) — قوة الحجم النسبي\n"
-        "4) Sector Alignment (1.5 pts) — توافق القطاع\n"
-        "5) News/Catalyst Strength (1 pt) — قوة المحفز الخبري\n\n"
-        "أخرج حتمًا:\n"
-        "🎯 تقييم الجودة (TQI): X.X/10\n"
-        "🏷️ المسار: [⚡ مضاربة لحظية (Scalp) / 📈 تداول سوينغ (Swing) / 🏛️ استثمار طويل (Invest)]\n"
-        "⭐ التصنيف: [🟢 فرصة استثنائية (A+ Setup) / 🟡 فرصة جيدة (B+ Setup) / ⚪ فرصة ضعيفة (Low Conviction)]\n"
-        "حسب القواعد: TQI >=9.0 → 🟢 A+ | 7.5-8.9 → 🟡 B+ | <7.5 → ⚪ Low Conviction\n"
-    )
+    try:
+        plan = STRATEGY_PLAN.get(strategy, {}) if isinstance(strategy, str) else {}
+        if not isinstance(plan, dict):
+            plan = {}
+        if not isinstance(ctx, dict):
+            ctx = {}
+        price = ctx.get("price") if isinstance(ctx, dict) else None
+        rsi = ctx.get("rsi") if isinstance(ctx, dict) else None
+        volume_ratio = ctx.get("volume_ratio") if isinstance(ctx, dict) else None
+        rr_targets = plan.get("targets_pct", (0.03, 0.05, 0.08))
+        if not isinstance(rr_targets, (list, tuple)) or len(rr_targets) < 3:
+            rr_targets = (0.03, 0.05, 0.08)
+        sl_pct = plan.get("sl_pct", -0.03)
+        try:
+            sl_pct_f = float(sl_pct) if sl_pct is not None else -0.03
+        except (TypeError, ValueError):
+            sl_pct_f = -0.03
+        try:
+            rr = abs(float(rr_targets[2]) / sl_pct_f) if sl_pct_f else 0
+        except Exception:
+            rr = 0
+        # Defensive formatting
+        try:
+            sentiment_body = extract_news_body(sentiment)[:300] if isinstance(sentiment, str) else ""
+        except Exception:
+            sentiment_body = ""
+        strat_label = str(strategy) if strategy is not None else "unknown"
+        return (
+            "أنت خبير تداول كمي للبورصة المصرية. قيّم جودة الإشارة التالية عبر Trade Quality Index (TQI) من 0.0 إلى 10.0:\n"
+            f"الاستراتيجية: {strat_label} | السعر: {fmt(price)} | RSI: {fmt(rsi, 1)} | "
+            f"نسبة الحجم: {fmt(volume_ratio, 2) if isinstance(volume_ratio, (int, float)) else 'غير متاح'} | "
+            f"R:R المتوقع: 1:{rr:.2f}\n"
+            f"ملخص الأخبار/المعنويات: {sentiment_body}\n\n"
+            "المعايير المرجحة (المجموع 10.0):\n"
+            "1) Technical Confluence (3 pts) — التقاء RSI/EMA/SMA/اختراق\n"
+            "2) Risk/Reward Ratio (2.5 pts) — جودة R:R\n"
+            "3) Relative Volume Surge (2 pts) — قوة الحجم النسبي\n"
+            "4) Sector Alignment (1.5 pts) — توافق القطاع\n"
+            "5) News/Catalyst Strength (1 pt) — قوة المحفز الخبري\n\n"
+            "أخرج حتمًا:\n"
+            "🎯 تقييم الجودة (TQI): X.X/10\n"
+            "🏷️ المسار: [⚡ مضاربة لحظية (Scalp) / 📈 تداول سوينغ (Swing) / 🏛️ استثمار طويل (Invest)]\n"
+            "⭐ التصنيف: [🟢 فرصة استثنائية (A+ Setup) / 🟡 فرصة جيدة (B+ Setup) / ⚪ فرصة ضعيفة (Low Conviction)]\n"
+            "حسب القواعد: TQI >=9.0 → 🟢 A+ | 7.5-8.9 → 🟡 B+ | <7.5 → ⚪ Low Conviction\n"
+        )
+    except Exception as exc:
+        logger.warning("build_tqi_prompt failed (%s); returning fallback prompt", exc)
+        return (
+            "أنت خبير تداول كمي للبورصة المصرية. قيّم جودة الإشارة عبر Trade Quality Index (TQI) من 0.0 إلى 10.0:\n"
+            "🎯 تقييم الجودة (TQI): X.X/10\n"
+            "🏷️ المسار: [⚡ مضاربة لحظية (Scalp) / 📈 تداول سوينغ (Swing) / 🏛️ استثمار طويل (Invest)]\n"
+            "⭐ التصنيف: [🟢 فرصة استثنائية (A+ Setup) / 🟡 فرصة جيدة (B+ Setup) / ⚪ فرصة ضعيفة (Low Conviction)]\n"
+        )
 
 
 def fetch_arabic_stock_news(stock_name_ar: str, ticker: str) -> str:
@@ -580,46 +616,69 @@ def get_sharia_status_tag(ticker: str) -> str:
     return "⚠️ **يحتاج مراجعة شرعية** (خارج مؤشر EGX33)"
 
 
-def classify_sentiment(text: str) -> Optional[str]:
+def classify_sentiment(text: Any) -> Optional[str]:
     """Return the sentiment word (إيجابي/سلبي/محايد) found in a Gemini summary, if any."""
+    if not isinstance(text, str) or not text:
+        return None
     for word in ("إيجابي", "سلبي", "محايد"):
-        if word in text:
-            return word
+        try:
+            if word in text:
+                return word
+        except Exception:
+            continue
     return None
 
 
-def extract_news_body(text: str) -> str:
+def extract_news_body(text: Any) -> str:
     """Return the compact summary body with all Gemini scaffolding stripped."""
+    if not isinstance(text, str):
+        return ""
     body = text.strip()
-    if classify_sentiment(body):
-        marker = re.search(r"2\)", body)
-        if marker:
-            body = body[: marker.start()].rstrip().rstrip("*").rstrip()
-    marker_patterns = [
-        r"^\s*(?:1\)|2\))\s*",
-        r"^\s*[.**\s]*\d+\)\s*[^\n]*:?\s*$",
-        r"(?:^|\n)\s*\**\s*\d+\)[^\n]*\s*\**\s*:?\s*",
-        r"(?:الملخص|ملخص اتجاه الأخبار|ملخص المعنويات)\s*:?\s*",
-        r"(?:تصنيف المعنويات)\s*:?\s*",
-    ]
-    for pattern in marker_patterns:
-        body = re.sub(pattern, "", body, flags=re.MULTILINE)
-    body = body.replace("**", "")
-    for word in ("إيجابي", "سلبي", "محايد"):
-        body = re.sub(rf"^\s*{word}\s*$", "", body, flags=re.MULTILINE)
-        body = body.replace(f": {word}", "").replace(f" :{word}", "").strip()
-    body = re.sub(r"\n+", "\n", body).strip()
-    body = re.sub(r"[ \t]+", " ", body).strip()
+    if not body:
+        return ""
+    try:
+        if classify_sentiment(body):
+            marker = re.search(r"2\)", body)
+            if marker:
+                body = body[: marker.start()].rstrip().rstrip("*").rstrip()
+        marker_patterns = [
+            r"^\s*(?:1\)|2\))\s*",
+            r"^\s*[.**\s]*\d+\)\s*[^\n]*:?\s*$",
+            r"(?:^|\n)\s*\**\s*\d+\)[^\n]*\s*\**\s*:?\s*",
+            r"(?:الملخص|ملخص اتجاه الأخبار|ملخص المعنويات)\s*:?\s*",
+            r"(?:تصنيف المعنويات)\s*:?\s*",
+        ]
+        for pattern in marker_patterns:
+            try:
+                body = re.sub(pattern, "", body, flags=re.MULTILINE)
+            except Exception:
+                continue
+        body = body.replace("**", "")
+        for word in ("إيجابي", "سلبي", "محايد"):
+            try:
+                body = re.sub(rf"^\s*{word}\s*$", "", body, flags=re.MULTILINE)
+            except Exception:
+                continue
+            body = body.replace(f": {word}", "").replace(f" :{word}", "").strip()
+        body = re.sub(r"\n+", "\n", body).strip()
+        body = re.sub(r"[ \t]+", " ", body).strip()
+    except Exception:
+        # Fallback: return raw stripped text on any regex failure
+        return text.strip() if isinstance(text, str) else ""
     return body
 
 
-def build_news_block(sentiment: str) -> str:
+def build_news_block(sentiment: Any) -> str:
     """Return a compact, badge-labeled Arabic news summary block."""
-    classification = classify_sentiment(sentiment) or ""
-    badge = SENTIMENT_BADGES.get(classification, "⚪")
-    header = f"🤖 ملخص الأخبار (Gemini AI): {badge} {classification}".strip()
-    body = extract_news_body(sentiment)
-    return f"{header}\n{body}".strip()
+    try:
+        classification = classify_sentiment(sentiment) or ""
+        badge = SENTIMENT_BADGES.get(classification, "⚪")
+        header = f"🤖 ملخص الأخبار (Gemini AI): {badge} {classification}".strip()
+        body = extract_news_body(sentiment)
+        return f"{header}\n{body}".strip()
+    except Exception:
+        # Never crash message formatting
+        return f"🤖 ملخص الأخبار (Gemini AI): ⚪\n{extract_news_body(sentiment) if isinstance(sentiment, str) else ''}".strip()
 
 
 # --------------------------------------------------------------------------
@@ -627,77 +686,92 @@ def build_news_block(sentiment: str) -> str:
 # --------------------------------------------------------------------------
 
 
-def get_conviction_tier(tqi: float) -> str:
+def get_conviction_tier(tqi: Any) -> str:
     """Return Conviction Tier label for a TQI score."""
-    if tqi >= 9.0:
+    try:
+        score = float(tqi) if tqi is not None else 0.0
+    except (TypeError, ValueError):
+        score = 0.0
+    if score >= 9.0:
         return "🟢 فرصة استثنائية (A+ Setup)"
-    if tqi >= 7.5:
+    if score >= 7.5:
         return "🟡 فرصة جيدة (B+ Setup)"
     return "⚪ فرصة ضعيفة (Low Conviction)"
 
 
-def get_trade_track_label(strategy: str) -> str:
+def get_trade_track_label(strategy: Any) -> str:
     """Return Trade Track label for a strategy key."""
-    return TQI_TRACK_LABELS.get(strategy, "⚪ فرصة ضعيفة (Low Conviction)")
+    try:
+        if isinstance(strategy, str) and strategy in TQI_TRACK_LABELS:
+            return TQI_TRACK_LABELS[strategy]
+    except Exception:
+        pass
+    # Graceful fallback for unknown/None strategy
+    return TQI_TRACK_LABELS.get(SCALPING, "⚡ مضاربة لحظية (Scalp)")
 
 
-def extract_tqi_score(text: str) -> Optional[float]:
+def extract_tqi_score(text: Any) -> Optional[float]:
     """Extract TQI score X.X/10 from Gemini text if present."""
-    if not text:
+    if not isinstance(text, str) or not text:
         return None
-    # Match patterns like "TQI: 8.5/10" or "تقييم الجودة (TQI): 8.5/10"
-    pattern = re.compile(r"TQI[^0-9]*([0-9]+(?:\.[0-9]+)?)\s*/\s*10", re.IGNORECASE)
-    match = pattern.search(text)
-    if match:
-        try:
-            val = float(match.group(1))
-            # Clamp to 0.0-10.0
-            return max(0.0, min(10.0, round(val, 1)))
-        except ValueError:
-            return None
+    try:
+        pattern = re.compile(r"TQI[^0-9]*([0-9]+(?:\.[0-9]+)?)\s*/\s*10", re.IGNORECASE)
+        match = pattern.search(text)
+        if match:
+            try:
+                val = float(match.group(1))
+                return max(0.0, min(10.0, round(val, 1)))
+            except (ValueError, TypeError, IndexError):
+                return None
+    except Exception:
+        return None
     return None
 
 
-def extract_trade_track_from_text(text: str) -> Optional[str]:
+def extract_trade_track_from_text(text: Any) -> Optional[str]:
     """Extract Trade Track label from Gemini text if present."""
-    if not text:
+    if not isinstance(text, str) or not text:
         return None
-    for label in TQI_TRACK_LABELS.values():
-        if label in text:
-            return label
-    # Fallback: detect keywords
-    if "Scalp" in text or "مضاربة لحظية" in text:
-        return TQI_TRACK_LABELS[SCALPING]
-    if "Swing" in text or "سوينغ" in text:
-        return TQI_TRACK_LABELS[SWING]
-    if "Invest" in text or "استثمار طويل" in text:
-        return TQI_TRACK_LABELS[INVESTMENT]
+    try:
+        for label in TQI_TRACK_LABELS.values():
+            if label in text:
+                return label
+        if "Scalp" in text or "مضاربة لحظية" in text:
+            return TQI_TRACK_LABELS.get(SCALPING)
+        if "Swing" in text or "سوينغ" in text:
+            return TQI_TRACK_LABELS.get(SWING)
+        if "Invest" in text or "استثمار طويل" in text:
+            return TQI_TRACK_LABELS.get(INVESTMENT)
+    except Exception:
+        return None
     return None
 
 
-def extract_conviction_from_text(text: str) -> Optional[str]:
+def extract_conviction_from_text(text: Any) -> Optional[str]:
     """Extract Conviction Tier label from Gemini text if present."""
-    if not text:
+    if not isinstance(text, str) or not text:
         return None
-    candidates = [
-        "🟢 فرصة استثنائية (A+ Setup)",
-        "🟡 فرصة جيدة (B+ Setup)",
-        "⚪ فرصة ضعيفة (Low Conviction)",
-    ]
-    for cand in candidates:
-        if cand in text:
-            return cand
-    # Fallback keyword match
-    if "A+ Setup" in text or "استثنائية" in text:
-        return candidates[0]
-    if "B+ Setup" in text or "فرصة جيدة" in text:
-        return candidates[1]
-    if "Low Conviction" in text or "فرصة ضعيفة" in text:
-        return candidates[2]
+    try:
+        candidates = [
+            "🟢 فرصة استثنائية (A+ Setup)",
+            "🟡 فرصة جيدة (B+ Setup)",
+            "⚪ فرصة ضعيفة (Low Conviction)",
+        ]
+        for cand in candidates:
+            if cand in text:
+                return cand
+        if "A+ Setup" in text or "استثنائية" in text:
+            return candidates[0]
+        if "B+ Setup" in text or "فرصة جيدة" in text:
+            return candidates[1]
+        if "Low Conviction" in text or "فرصة ضعيفة" in text:
+            return candidates[2]
+    except Exception:
+        return None
     return None
 
 
-def compute_fallback_tqi(ctx: Dict[str, Any], strategy: str, sentiment: str) -> float:
+def compute_fallback_tqi(ctx: Any, strategy: Any, sentiment: Any) -> float:
     """Deterministically compute TQI 0.0-10.0 from available context.
 
     Scoring (mirrors Gemini prompt weights):
@@ -706,161 +780,326 @@ def compute_fallback_tqi(ctx: Dict[str, Any], strategy: str, sentiment: str) -> 
       - Relative Volume Surge 2.0 pts
       - Sector Alignment 1.5 pts
       - News/Catalyst Strength 1.0 pt
+    Gracefully handles None / missing keys to avoid runtime crashes.
     """
-    # Technical Confluence (3 pts)
-    tech_score = 0.0
-    rsi = ctx.get("rsi")
-    price = ctx.get("price")
-    ema20 = ctx.get("ema20")
-    sma50 = ctx.get("sma50")
-    if rsi is not None:
-        if strategy == SCALPING and rsi > 55:
-            tech_score += 1.5
-        elif strategy == SWING and rsi > 50:
-            tech_score += 1.5
-        elif strategy == INVESTMENT and rsi < 40:
-            tech_score += 1.5
-        elif 40 <= rsi <= 70:
+    try:
+        # Defensive ctx handling
+        if not isinstance(ctx, dict):
+            ctx = {}
+        tech_score = 0.0
+        rsi = ctx.get("rsi") if isinstance(ctx, dict) else None
+        price = ctx.get("price") if isinstance(ctx, dict) else None
+        ema20 = ctx.get("ema20") if isinstance(ctx, dict) else None
+        sma50 = ctx.get("sma50") if isinstance(ctx, dict) else None
+        # Ensure numeric types
+        try:
+            rsi_val = float(rsi) if rsi is not None else None
+        except (TypeError, ValueError):
+            rsi_val = None
+        try:
+            price_val = float(price) if price is not None else None
+        except (TypeError, ValueError):
+            price_val = None
+        try:
+            ema20_val = float(ema20) if ema20 is not None else None
+        except (TypeError, ValueError):
+            ema20_val = None
+        try:
+            sma50_val = float(sma50) if sma50 is not None else None
+        except (TypeError, ValueError):
+            sma50_val = None
+
+        if rsi_val is not None:
+            if strategy == SCALPING and rsi_val > 55:
+                tech_score += 1.5
+            elif strategy == SWING and rsi_val > 50:
+                tech_score += 1.5
+            elif strategy == INVESTMENT and rsi_val < 40:
+                tech_score += 1.5
+            elif 40 <= rsi_val <= 70:
+                tech_score += 0.8
+        if price_val is not None and ema20_val is not None and price_val > ema20_val:
             tech_score += 0.8
-    if price is not None and ema20 is not None and price > ema20:
-        tech_score += 0.8
-    if price is not None and sma50 is not None:
-        if strategy == INVESTMENT and price < sma50:
-            tech_score += 0.7
-        elif price > sma50:
-            tech_score += 0.5
-    tech_score = min(tech_score, TQI_TECHNICAL_CONFLUENCE_MAX)
+        if price_val is not None and sma50_val is not None:
+            if strategy == INVESTMENT and price_val < sma50_val:
+                tech_score += 0.7
+            elif price_val > sma50_val:
+                tech_score += 0.5
+        tech_score = min(tech_score, TQI_TECHNICAL_CONFLUENCE_MAX)
 
-    # Risk/Reward Ratio (2.5 pts)
-    plan = STRATEGY_PLAN.get(strategy, {})
-    sl_pct = abs(plan.get("sl_pct", 0.03))
-    targets = plan.get("targets_pct", (0.03, 0.05, 0.08))
-    rr_ratio = abs(targets[2] / sl_pct) if sl_pct else 0
-    if rr_ratio >= 2.5:
-        rr_score = TQI_RISK_REWARD_MAX
-    elif rr_ratio >= 1.5:
-        rr_score = 1.8
-    elif rr_ratio >= 1.0:
-        rr_score = 1.0
-    else:
-        rr_score = 0.5
+        # Risk/Reward Ratio (2.5 pts)
+        try:
+            plan = STRATEGY_PLAN.get(strategy, {}) if isinstance(strategy, str) else {}
+            if not isinstance(plan, dict):
+                plan = {}
+            sl_pct = abs(float(plan.get("sl_pct", -0.03))) if plan.get("sl_pct") is not None else 0.03
+        except Exception:
+            sl_pct = 0.03
+            plan = {}
+        try:
+            targets = plan.get("targets_pct", (0.03, 0.05, 0.08))
+            if not isinstance(targets, (list, tuple)) or len(targets) < 3:
+                targets = (0.03, 0.05, 0.08)
+            rr_ratio = abs(float(targets[2]) / sl_pct) if sl_pct else 0
+        except Exception:
+            rr_ratio = 0
+        if rr_ratio >= 2.5:
+            rr_score = TQI_RISK_REWARD_MAX
+        elif rr_ratio >= 1.5:
+            rr_score = 1.8
+        elif rr_ratio >= 1.0:
+            rr_score = 1.0
+        else:
+            rr_score = 0.5
 
-    # Relative Volume Surge (2 pts)
-    vol_ratio = ctx.get("volume_ratio")
-    if vol_ratio is None:
-        vol_score = 0.5
-    elif vol_ratio >= 1.8:
-        vol_score = TQI_VOLUME_SURGE_MAX
-    elif vol_ratio >= 1.3:
-        vol_score = 1.2
-    elif vol_ratio >= 1.0:
-        vol_score = 0.7
-    else:
-        vol_score = 0.3
+        # Relative Volume Surge (2 pts)
+        try:
+            vol_ratio_raw = ctx.get("volume_ratio") if isinstance(ctx, dict) else None
+            vol_ratio = float(vol_ratio_raw) if vol_ratio_raw is not None else None
+        except (TypeError, ValueError):
+            vol_ratio = None
+        if vol_ratio is None:
+            vol_score = 0.5
+        elif vol_ratio >= 1.8:
+            vol_score = TQI_VOLUME_SURGE_MAX
+        elif vol_ratio >= 1.3:
+            vol_score = 1.2
+        elif vol_ratio >= 1.0:
+            vol_score = 0.7
+        else:
+            vol_score = 0.3
 
-    # Sector Alignment (1.5 pts) — no sector feed, use conservative default with slight bump for known liquid tickers
-    sector_score = 1.0
-    if strategy == SWING and vol_ratio and vol_ratio > 1.5:
-        sector_score = 1.2
+        # Sector Alignment (1.5 pts) — no sector feed, use conservative default
+        sector_score = 1.0
+        try:
+            if strategy == SWING and vol_ratio is not None and vol_ratio > 1.5:
+                sector_score = 1.2
+        except Exception:
+            sector_score = 1.0
 
-    # News/Catalyst Strength (1 pt)
-    classification = classify_sentiment(sentiment) or ""
-    if classification == "إيجابي":
-        news_score = TQI_NEWS_CATALYST_MAX
-    elif classification == "سلبي":
-        news_score = 0.2
-    elif classification == "محايد":
-        news_score = 0.5
-    else:
-        # Fallback: check headlines presence via sentiment length
-        body = extract_news_body(sentiment)
-        news_score = 0.6 if len(body) > 30 else 0.3
+        # News/Catalyst Strength (1 pt)
+        try:
+            classification = classify_sentiment(sentiment) or ""
+        except Exception:
+            classification = ""
+        if classification == "إيجابي":
+            news_score = TQI_NEWS_CATALYST_MAX
+        elif classification == "سلبي":
+            news_score = 0.2
+        elif classification == "محايد":
+            news_score = 0.5
+        else:
+            try:
+                body = extract_news_body(sentiment)
+                news_score = 0.6 if len(body) > 30 else 0.3
+            except Exception:
+                news_score = 0.3
 
-    total = tech_score + rr_score + vol_score + sector_score + news_score
-    return max(0.0, min(10.0, round(total, 1)))
+        total = tech_score + rr_score + vol_score + sector_score + news_score
+        return max(0.0, min(10.0, round(float(total), 1)))
+    except Exception as exc:
+        logger.warning("compute_fallback_tqi failed (%s); returning default 5.0", exc)
+        return 5.0
 
 
-def resolve_tqi(ctx: Dict[str, Any], strategy: str, sentiment: str) -> tuple[float, str, str]:
+def resolve_tqi(ctx: Any, strategy: Any, sentiment: Any) -> tuple[float, str, str]:
     """Resolve TQI, Trade Track and Conviction Tier for a message.
 
     Priority: parse from Gemini text → fallback to deterministic computation.
-    Returns (tqi_score, track_label, conviction_label).
+    Returns (tqi_score, track_label, conviction_label). Never raises.
     """
-    tqi = extract_tqi_score(sentiment)
-    track = extract_trade_track_from_text(sentiment)
-    conviction = extract_conviction_from_text(sentiment)
+    try:
+        tqi = extract_tqi_score(sentiment)
+    except Exception:
+        tqi = None
+    try:
+        track = extract_trade_track_from_text(sentiment)
+    except Exception:
+        track = None
+    try:
+        conviction = extract_conviction_from_text(sentiment)
+    except Exception:
+        conviction = None
 
     if tqi is None:
-        tqi = compute_fallback_tqi(ctx, strategy, sentiment)
+        try:
+            tqi = compute_fallback_tqi(ctx, strategy, sentiment)
+        except Exception as exc:
+            logger.warning("resolve_tqi fallback failed (%s); using default 5.0", exc)
+            tqi = 5.0
+    # Clamp and normalize tqi
+    try:
+        tqi = max(0.0, min(10.0, round(float(tqi), 1)))
+    except Exception:
+        tqi = 5.0
 
     if track is None:
-        track = get_trade_track_label(strategy)
+        try:
+            track = get_trade_track_label(strategy)
+        except Exception:
+            track = TQI_TRACK_LABELS.get(SCALPING, "⚡ مضاربة لحظية (Scalp)")
 
     if conviction is None:
-        conviction = get_conviction_tier(tqi)
+        try:
+            conviction = get_conviction_tier(tqi)
+        except Exception:
+            conviction = "⚪ فرصة ضعيفة (Low Conviction)"
     else:
-        # Ensure conviction matches tqi if Gemini provided inconsistent tier
-        expected = get_conviction_tier(tqi)
-        # Keep Gemini conviction but prefer deterministic if mismatch is large
-        # For consistency, trust expected tier when tqi far from tier threshold
-        if conviction != expected:
-            # Re-derive to keep parser deterministic; Gemini tier is preserved only if tqi close to boundary
-            conviction = expected
+        try:
+            expected = get_conviction_tier(tqi)
+            if conviction != expected:
+                conviction = expected
+        except Exception:
+            pass
+
+    # Final guard: ensure strings
+    if not isinstance(track, str) or not track:
+        track = TQI_TRACK_LABELS.get(SCALPING, "⚡ مضاربة لحظية (Scalp)")
+    if not isinstance(conviction, str) or not conviction:
+        conviction = get_conviction_tier(tqi)
 
     return tqi, track, conviction
 
 
-def build_message(strategy: str, ticker: str, ctx: Dict[str, Any], sentiment: str) -> str:
+def build_message(strategy: Any, ticker: Any, ctx: Any, sentiment: Any) -> str:
     """Compose a professional Arabic Markdown alert with dynamic targets & risk plan.
 
     Includes Trade Quality Index (TQI), Trade Track and Conviction Tier while
     preserving all existing target prices and news summary fields for parser compatibility.
+    Gracefully handles None / missing keys to prevent runtime crashes.
     """
-    plan = STRATEGY_PLAN[strategy]
-    sharia_tag = get_sharia_status_tag(ticker)
-    stock_name_ar = STOCK_NAMES_AR.get(ticker, ticker)
-    clean_ticker = ticker.replace(".CA", "")
-    entry_price = float(ctx.get("price") or 0.0)
-    p1, p2, p3 = plan["targets_pct"]
-    sl_pct = plan["sl_pct"]
-    target_1 = entry_price * (1 + p1)
-    target_2 = entry_price * (1 + p2)
-    target_3 = entry_price * (1 + p3)
-    stop_loss = entry_price * (1 + sl_pct)
-    rr = abs(p3 / sl_pct)
-    news_block = build_news_block(sentiment)
-    # Resolve Trade Quality Index (TQI) — parsed from Gemini or fallback computed
-    tqi_score, track_label, conviction_label = resolve_tqi(ctx, strategy, sentiment)
-    return (
-        f"اسم السهم : {stock_name_ar} {clean_ticker}\n"
-        f"\n"
-        f"سبب دخول الصفقه فنيا : {plan['technical_reason_ar']}\n"
-        f"\n"
-        f"{sharia_tag}\n"
-        f"\n"
-        f"🎯 تقييم الجودة (TQI): {tqi_score:.1f}/10\n"
-        f"🏷️ المسار: {track_label}\n"
-        f"⭐ التصنيف: {conviction_label}\n"
-        f"\n"
-        f"سعر الدخول : {entry_price:.2f} 🏷\n"
-        f"\n"
-        f"الهدف الاول: {target_1:.2f} ({p1 * 100:.1f}%) 🎯\n"
-        f"الهدف الثاني : {target_2:.2f} ({p2 * 100:.1f}%) 🎯\n"
-        f"الهدف الثالث: {target_3:.2f} ({p3 * 100:.1f}%) 🎯\n"
-        f"\n"
-        f"وقف الخسارة : {plan['sl_condition_ar']} {stop_loss:.2f} ({sl_pct * 100:.1f}%) ⛔️\n"
-        f"\n"
-        f"نسبة الدخول من المحفظه : {plan['allocation_ar']} 💵\n"
-        f"نوع الصفقة و مدتها : {plan['duration_ar']} ⏳️\n"
-        f"معدل العائد إلى المخاطر (R:R) : 1 : {rr:.2f} ⚖️\n"
-        f"\n"
-        f"📈 [عرض الشارت المباشر على TradingView](https://ar.tradingview.com/symbols/EGX-{clean_ticker}/)\n"
-        f"\n"
-        f"{news_block}\n"
-        f"\n"
-        f"تذكير ⚠️ التحليل قد يصيب او يخطئ ولكن يجب عليك الالتزام ب إدارة المخاطر "
-        f"وعدم التهاون ب إدارة رأس مالك 🔒 .. بالتوفيق للجميع 👏"
-    )
+    try:
+        # Defensive defaults
+        if not isinstance(ctx, dict):
+            ctx = {}
+        if not isinstance(strategy, str) or strategy not in STRATEGY_PLAN:
+            # Fallback to scalping plan for unknown strategy
+            strategy = SCALPING if SCALPING in STRATEGY_PLAN else next(iter(STRATEGY_PLAN), SCALPING)
+        plan = STRATEGY_PLAN.get(strategy, {})
+        if not isinstance(plan, dict):
+            plan = STRATEGY_PLAN.get(SCALPING, {})
+
+        # Safe ticker handling
+        ticker_str = str(ticker) if ticker is not None else "UNKNOWN.CA"
+        sharia_tag = get_sharia_status_tag(ticker_str) if isinstance(ticker_str, str) else "⚠️ **يحتاج مراجعة شرعية**"
+        stock_name_ar = STOCK_NAMES_AR.get(ticker_str, str(ticker_str))
+        clean_ticker = ticker_str.replace(".CA", "") if isinstance(ticker_str, str) else str(ticker_str)
+
+        # Safe price handling
+        try:
+            entry_price = float(ctx.get("price") or 0.0) if isinstance(ctx, dict) else 0.0
+        except (TypeError, ValueError):
+            entry_price = 0.0
+
+        # Safe plan targets
+        try:
+            targets = plan.get("targets_pct", (0.03, 0.05, 0.08))
+            if not isinstance(targets, (list, tuple)) or len(targets) < 3:
+                targets = (0.03, 0.05, 0.08)
+            p1, p2, p3 = float(targets[0]), float(targets[1]), float(targets[2])
+        except Exception:
+            p1, p2, p3 = 0.03, 0.05, 0.08
+
+        try:
+            sl_pct = float(plan.get("sl_pct", -0.03)) if plan.get("sl_pct") is not None else -0.03
+        except (TypeError, ValueError):
+            sl_pct = -0.03
+
+        try:
+            target_1 = entry_price * (1 + p1)
+            target_2 = entry_price * (1 + p2)
+            target_3 = entry_price * (1 + p3)
+            stop_loss = entry_price * (1 + sl_pct)
+        except Exception:
+            target_1 = target_2 = target_3 = stop_loss = entry_price
+
+        try:
+            rr = abs(p3 / sl_pct) if sl_pct else 0
+            rr = float(rr)
+        except Exception:
+            rr = 0.0
+
+        # Safe news block
+        try:
+            news_block = build_news_block(sentiment)
+        except Exception:
+            news_block = "🤖 ملخص الأخبار (Gemini AI): ⚪"
+
+        # Resolve TQI safely
+        try:
+            tqi_score, track_label, conviction_label = resolve_tqi(ctx, strategy, sentiment)
+        except Exception as exc:
+            logger.warning("build_message resolve_tqi failed (%s); using defaults", exc)
+            tqi_score, track_label, conviction_label = 5.0, get_trade_track_label(strategy), get_conviction_tier(5.0)
+
+        # Ensure numeric formatting won't crash
+        try:
+            tqi_score_f = float(tqi_score)
+        except (TypeError, ValueError):
+            tqi_score_f = 5.0
+        tqi_score_f = max(0.0, min(10.0, tqi_score_f))
+
+        if not isinstance(track_label, str) or not track_label:
+            track_label = get_trade_track_label(strategy)
+        if not isinstance(conviction_label, str) or not conviction_label:
+            conviction_label = get_conviction_tier(tqi_score_f)
+
+        # Safe plan text fields
+        technical_reason = plan.get("technical_reason_ar", "تحليل فني") if isinstance(plan, dict) else "تحليل فني"
+        sl_condition = plan.get("sl_condition_ar", "إغلاق شمعة أسفل الدعم") if isinstance(plan, dict) else "إغلاق شمعة أسفل الدعم"
+        allocation = plan.get("allocation_ar", "5% من رأس المال") if isinstance(plan, dict) else "5% من رأس المال"
+        duration = plan.get("duration_ar", "مضاربة") if isinstance(plan, dict) else "مضاربة"
+
+        return (
+            f"اسم السهم : {stock_name_ar} {clean_ticker}\n"
+            f"\n"
+            f"سبب دخول الصفقه فنيا : {technical_reason}\n"
+            f"\n"
+            f"{sharia_tag}\n"
+            f"\n"
+            f"🎯 تقييم الجودة (TQI): {tqi_score_f:.1f}/10\n"
+            f"🏷️ المسار: {track_label}\n"
+            f"⭐ التصنيف: {conviction_label}\n"
+            f"\n"
+            f"سعر الدخول : {entry_price:.2f} 🏷\n"
+            f"\n"
+            f"الهدف الاول: {target_1:.2f} ({p1 * 100:.1f}%) 🎯\n"
+            f"الهدف الثاني : {target_2:.2f} ({p2 * 100:.1f}%) 🎯\n"
+            f"الهدف الثالث: {target_3:.2f} ({p3 * 100:.1f}%) 🎯\n"
+            f"\n"
+            f"وقف الخسارة : {sl_condition} {stop_loss:.2f} ({sl_pct * 100:.1f}%) ⛔️\n"
+            f"\n"
+            f"نسبة الدخول من المحفظه : {allocation} 💵\n"
+            f"نوع الصفقة و مدتها : {duration} ⏳️\n"
+            f"معدل العائد إلى المخاطر (R:R) : 1 : {rr:.2f} ⚖️\n"
+            f"\n"
+            f"📈 [عرض الشارت المباشر على TradingView](https://ar.tradingview.com/symbols/EGX-{clean_ticker}/)\n"
+            f"\n"
+            f"{news_block}\n"
+            f"\n"
+            f"تذكير ⚠️ التحليل قد يصيب او يخطئ ولكن يجب عليك الالتزام ب إدارة المخاطر "
+            f"وعدم التهاون ب إدارة رأس مالك 🔒 .. بالتوفيق للجميع 👏"
+        )
+    except Exception as exc:
+        # Ultimate fallback — never let Telegram formatting crash the run
+        logger.warning("build_message critical failure (%s); returning minimal fallback message", exc)
+        try:
+            fallback_ticker = str(ticker).replace(".CA", "") if ticker else "UNKNOWN"
+            fallback_price = 0.0
+            try:
+                fallback_price = float(ctx.get("price") or 0.0) if isinstance(ctx, dict) else 0.0
+            except Exception:
+                fallback_price = 0.0
+            return (
+                f"اسم السهم : {fallback_ticker}\n"
+                f"🎯 تقييم الجودة (TQI): 5.0/10\n"
+                f"🏷️ المسار: ⚡ مضاربة لحظية (Scalp)\n"
+                f"⭐ التصنيف: ⚪ فرصة ضعيفة (Low Conviction)\n"
+                f"سعر الدخول : {fallback_price:.2f} 🏷\n"
+                f"⚠️ حدث خطأ في تكوين الرسالة الأصلية: {exc}\n"
+            )
+        except Exception:
+            return "⚠️ خطأ في تكوين رسالة التنبيه (build_message fallback)"
 
 
 # --------------------------------------------------------------------------
