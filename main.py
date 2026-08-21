@@ -207,14 +207,14 @@ STOCK_NAMES_AR: Dict[str, str] = {
 
 STRATEGY_PLAN: Dict[str, Dict[str, Any]] = {
     SCALPING: {
-        "targets_pct": (0.03, 0.05, 0.08),
+        "targets_pct": (0.025, 0.05, 0.08),
         "sl_pct": -0.03,
         "sl_condition_ar": "إغلاق شمعة أسفل الدعم",
         "allocation_ar": "5% - 10% من رأس المال",
         "duration_ar": "مضاربة لحظية / سريعة (داخل اليوم)",
         "technical_reason_ar": (
-            "اختراق لحظي لمستوى مقاومة مع تضخم واضح في حجم التداول "
-            "وكسر السعر لأعلى المتوسط المتحرك EMA20"
+            "اختراق لحظي لمستوى مقاومة مع تضخم واضح في حجم التداول اللحظي (RVOL) "
+            "وكسر السعر لأعلى المتوسط المتحرك EMA9 / VWAP مع زخم لحظي قوي"
         ),
     },
     SWING: {
@@ -421,11 +421,11 @@ def add_active_position(
             logger.warning("add_active_position called with invalid ticker/price; skipping")
             return False
         positions = load_active_positions(path)
-        # Deduplicate: skip if ACTIVE entry for same ticker+track already exists
+        # Deduplicate: skip if ACTIVE/PENDING entry for same ticker+track already exists (CLOSED is allowed)
         for pos in positions:
             try:
-                if pos.get("status") == "ACTIVE" and pos.get("ticker") == ticker and pos.get("trade_track") == trade_track:
-                    logger.info("[%s] active position already exists for track %s; skipping creation", ticker, trade_track)
+                if pos.get("status") in ("ACTIVE", "PENDING") and pos.get("ticker") == ticker and pos.get("trade_track") == trade_track:
+                    logger.info("[%s] position already exists for track %s with status %s; skipping creation", ticker, trade_track, pos.get("status"))
                     return False
             except Exception:
                 continue
@@ -510,38 +510,77 @@ def manage_active_positions(path: str = ACTIVE_POSITIONS_FILE) -> int:
                     logger.info("[%s] no current price available for trailing check; skipping", ticker)
                     continue
 
-                # Exit check first? Spec says trailing updates then exit. We'll apply trailing promotions before exit,
-                # but if price already below stop, we should exit regardless.
-                # 1) Break-even promotion: price >= target_1 and stop < entry
-                if current_price >= target_1 and current_stop_loss < entry_price:
-                    pos["current_stop_loss"] = float(entry_price)
-                    dirty = True
-                    updated_count += 1
-                    # Dispatch break-even alert
-                    alert_msg = f"🛡️ رفع وقف الخسارة لسهم {ticker} إلى سعر الدخول ({entry_price:.2f})."
-                    chat_id = _resolve_chat_id_for_track(trade_track)
-                    if bot_token and chat_id:
-                        try:
-                            send_telegram(chat_id, alert_msg, bot_token)
-                            logger.info("[%s] break-even stop promoted to %.2f", ticker, entry_price)
-                        except Exception as exc:
-                            logger.warning("[%s] failed to send break-even alert: %s", ticker, exc)
-                    else:
-                        logger.info("[TRAIL] %s", alert_msg)
-                    # Update local var for next checks
-                    current_stop_loss = float(entry_price)
+                # Determine if Scalp track for ratchet rules
+                is_scalp = False
+                try:
+                    track_str = str(trade_track) if trade_track else ""
+                    is_scalp = ("Scalp" in track_str) or ("مضاربة لحظية" in track_str)
+                except Exception:
+                    is_scalp = False
 
-                # 2) Trail to target_1 when price >= target_2 and stop < target_1
-                if current_price >= target_2 and current_stop_loss < target_1:
-                    # Only promote if not already at/above target_1
-                    pos["current_stop_loss"] = float(target_1)
-                    dirty = True
-                    updated_count += 1
-                    logger.info("[%s] trailing stop promoted to target_1 %.2f (price %.2f >= target_2 %.2f)", ticker, target_1, current_price, target_2)
-                    # No Telegram alert required per spec for this step (silent update)
-                    current_stop_loss = float(target_1)
+                # --- Scalping Ratchet Trailing Stop Rules (only for Scalp) ---
+                if is_scalp:
+                    try:
+                        gain_pct = (current_price - entry_price) / entry_price if entry_price else 0
+                    except Exception:
+                        gain_pct = 0
+                    # Check highest threshold first for direct jump handling
+                    if gain_pct >= 0.075 and current_stop_loss < entry_price * 1.055:
+                        pos["current_stop_loss"] = float(entry_price * 1.055)
+                        dirty = True
+                        updated_count += 1
+                        logger.info("[%s] Scalp ratchet: lock +5.5%% at %.2f (gain %.2f%%)", ticker, entry_price * 1.055, gain_pct * 100)
+                        current_stop_loss = float(entry_price * 1.055)
+                    elif gain_pct >= 0.05 and current_stop_loss < entry_price * 1.030:
+                        pos["current_stop_loss"] = float(entry_price * 1.030)
+                        dirty = True
+                        updated_count += 1
+                        logger.info("[%s] Scalp ratchet: lock +3.0%% at %.2f (gain %.2f%%)", ticker, entry_price * 1.030, gain_pct * 100)
+                        current_stop_loss = float(entry_price * 1.030)
+                    elif gain_pct >= 0.025 and current_stop_loss < entry_price * 1.005:
+                        pos["current_stop_loss"] = float(entry_price * 1.005)
+                        dirty = True
+                        updated_count += 1
+                        alert_msg = f"🔒 تم تفعيل محبس الأرباح السريع لـ {ticker} عند +0.5%."
+                        chat_id = _resolve_chat_id_for_track(trade_track)
+                        if bot_token and chat_id:
+                            try:
+                                send_telegram(chat_id, alert_msg, bot_token)
+                                logger.info("[%s] Scalp ratchet: lock +0.5%% at %.2f (gain %.2f%%)", ticker, entry_price * 1.005, gain_pct * 100)
+                            except Exception as exc:
+                                logger.warning("[%s] failed to send ratchet alert: %s", ticker, exc)
+                        else:
+                            logger.info("[TRAIL-SCALP] %s", alert_msg)
+                        current_stop_loss = float(entry_price * 1.005)
+                else:
+                    # --- Generic trailing for Swing/Invest (and non-Scalp) ---
+                    # 1) Break-even promotion: price >= target_1 and stop < entry
+                    if current_price >= target_1 and current_stop_loss < entry_price:
+                        pos["current_stop_loss"] = float(entry_price)
+                        dirty = True
+                        updated_count += 1
+                        alert_msg = f"🛡️ رفع وقف الخسارة لسهم {ticker} إلى سعر الدخول ({entry_price:.2f})."
+                        chat_id = _resolve_chat_id_for_track(trade_track)
+                        if bot_token and chat_id:
+                            try:
+                                send_telegram(chat_id, alert_msg, bot_token)
+                                logger.info("[%s] break-even stop promoted to %.2f", ticker, entry_price)
+                            except Exception as exc:
+                                logger.warning("[%s] failed to send break-even alert: %s", ticker, exc)
+                        else:
+                            logger.info("[TRAIL] %s", alert_msg)
+                        current_stop_loss = float(entry_price)
 
-                # 3) Exit when price <= current_stop_loss
+                    # 2) Trail to target_1 when price >= target_2 and stop < target_1
+                    if current_price >= target_2 and current_stop_loss < target_1:
+                        pos["current_stop_loss"] = float(target_1)
+                        dirty = True
+                        updated_count += 1
+                        logger.info("[%s] trailing stop promoted to target_1 %.2f (price %.2f >= target_2 %.2f)", ticker, target_1, current_price, target_2)
+                        current_stop_loss = float(target_1)
+
+                # 3) Exit when price <= current_stop_loss (applies to all, including Scalp)
+                # Only for ACTIVE positions (PENDING already filtered above)
                 if current_price <= current_stop_loss:
                     exit_msg = f"🚨 إغلاق صفقة {ticker} - تم ضرب وقف الخسارة عند {current_stop_loss:.2f}"
                     chat_id = _resolve_chat_id_for_track(trade_track)
@@ -572,6 +611,136 @@ def manage_active_positions(path: str = ACTIVE_POSITIONS_FILE) -> int:
     except Exception as exc:
         logger.warning("manage_active_positions failed unexpectedly: %s", exc)
         return 0
+
+
+def handle_telegram_callback(callback_data: Any, path: str = ACTIVE_POSITIONS_FILE) -> str:
+    """Lightweight callback handler for inline keyboard actions.
+
+    Parses callback_data and updates active_positions.json:
+      - act_{ticker}: PENDING -> ACTIVE
+      - dis_{ticker}: remove position
+      - cls_{ticker}: set status to CLOSED
+
+    Returns a short status string for webhook response. Never raises.
+    """
+    try:
+        if not isinstance(callback_data, str) or not callback_data:
+            return "invalid callback_data"
+        callback_data = callback_data.strip()
+        if "_" not in callback_data:
+            return "invalid format"
+        # Split only on first underscore to preserve ticker like COMI.CA
+        action, ticker = callback_data.split("_", 1)
+        action = action.strip()
+        ticker = ticker.strip()
+        if not ticker:
+            return "invalid ticker"
+        # Normalize ticker: ensure it contains .CA if missing and matches stored format
+        # We will match both exact ticker and ticker with/without .CA
+        ticker_variants = {ticker}
+        if "." not in ticker:
+            ticker_variants.add(f"{ticker}.CA")
+        else:
+            # Also add without suffix for flexibility
+            base = ticker.replace(".CA", "")
+            ticker_variants.add(base)
+            ticker_variants.add(f"{base}.CA")
+
+        positions = load_active_positions(path)
+        if not positions:
+            return f"no positions found for {ticker}"
+
+        original_len = len(positions)
+        matched = False
+        response_msg = ""
+
+        if action == "act":
+            # Activate PENDING -> ACTIVE
+            for pos in positions:
+                try:
+                    pos_ticker = str(pos.get("ticker", "")).strip()
+                    if pos_ticker in ticker_variants and pos.get("status") == "PENDING":
+                        pos["status"] = "ACTIVE"
+                        # Optionally update timestamp to activation time
+                        try:
+                            pos["activated_at"] = now_utc().isoformat()
+                        except Exception:
+                            pass
+                        matched = True
+                        response_msg = f"Activated {pos_ticker}"
+                        break
+                except Exception:
+                    continue
+            if not matched:
+                # Fallback: if no PENDING found, try to activate first matching ticker regardless of status
+                for pos in positions:
+                    try:
+                        if str(pos.get("ticker", "")).strip() in ticker_variants:
+                            if pos.get("status") != "ACTIVE":
+                                pos["status"] = "ACTIVE"
+                                matched = True
+                                response_msg = f"Activated {pos.get('ticker')}"
+                                break
+                    except Exception:
+                        continue
+            if matched:
+                save_active_positions(positions, path)
+                logger.info("[CALLBACK] %s", response_msg)
+                return response_msg
+            return f"no PENDING position found for {ticker}"
+
+        elif action == "dis":
+            # Dismiss: remove position(s) with matching ticker
+            new_positions = []
+            removed = 0
+            for pos in positions:
+                try:
+                    if str(pos.get("ticker", "")).strip() in ticker_variants:
+                        removed += 1
+                        continue
+                    new_positions.append(pos)
+                except Exception:
+                    new_positions.append(pos)
+            if removed > 0:
+                save_active_positions(new_positions, path)
+                logger.info("[CALLBACK] Dismissed %d position(s) for %s", removed, ticker)
+                return f"Dismissed {ticker} ({removed})"
+            return f"no position found to dismiss for {ticker}"
+
+        elif action == "cls":
+            # Close manually: set ACTIVE/PENDING -> CLOSED
+            for pos in positions:
+                try:
+                    pos_ticker = str(pos.get("ticker", "")).strip()
+                    if pos_ticker in ticker_variants and pos.get("status") in ("ACTIVE", "PENDING"):
+                        pos["status"] = "CLOSED"
+                        try:
+                            pos["closed_at"] = now_utc().isoformat()
+                            pos["close_reason"] = "manual"
+                        except Exception:
+                            pass
+                        matched = True
+                    elif pos_ticker in ticker_variants and pos.get("status") == "ACTIVE":
+                        pos["status"] = "CLOSED"
+                        matched = True
+                except Exception:
+                    continue
+            if matched:
+                save_active_positions(positions, path)
+                logger.info("[CALLBACK] Manually closed %s", ticker)
+                return f"Closed {ticker}"
+            # Also handle if already CLOSED
+            for pos in positions:
+                if str(pos.get("ticker", "")).strip() in ticker_variants:
+                    return f"already closed {ticker}"
+            return f"no position found to close for {ticker}"
+
+        else:
+            return f"unknown action {action}"
+
+    except Exception as exc:
+        logger.warning("handle_telegram_callback failed for %s: %s", callback_data, exc)
+        return f"error: {exc}"
 
 
 # --------------------------------------------------------------------------
@@ -719,6 +888,7 @@ def build_news_prompt(headlines: Any) -> str:
         "   - Relative Volume Surge (2.0 pts): قوة اندفاع الحجم النسبي مقارنة بمتوسط 20 يوم (spike >1.8x = ممتاز)\n"
         "   - Sector Alignment (1.5 pts): توافق القطاع والاتجاه العام للسوق\n"
         "   - News/Catalyst Strength (1.0 pt): قوة الأخبار/المحفزات (نتائج أعمال، عقود، إفصاحات جوهرية)\n"
+        "   ملاحظة خاصة لمسار Scalp: امنح وزنًا أعلى لـ Intraday RVOL (Relative Volume Surge) وكسر الزخم EMA9 / VWAP crossover — اعتبرهما حتى 70% من درجة Confluence + Volume للسكالبنج، وقيّم الأهداف الضيقة: Target1 +2.5% / Target2 +5.0% / Target3 +8.0%.\n"
         "   احسب المجموع بدقة من 10.0 واذكر الدرجة بصيغة `🎯 تقييم الجودة (TQI): X.X/10` (رقم عشري واحد).\n\n"
         "4) حدد المسار التجاري (Trade Track) بوضوح بإحدى القيم فقط:\n"
         "   - `⚡ مضاربة لحظية (Scalp)` للصفقات اللحظية داخل اليوم\n"
@@ -768,9 +938,11 @@ def build_tqi_prompt(strategy: Any, ctx: Any, sentiment: Any) -> str:
         price = ctx.get("price") if isinstance(ctx, dict) else None
         rsi = ctx.get("rsi") if isinstance(ctx, dict) else None
         volume_ratio = ctx.get("volume_ratio") if isinstance(ctx, dict) else None
-        rr_targets = plan.get("targets_pct", (0.03, 0.05, 0.08))
+        # Scalp uses tighter targets: 2.5% / 5% / 8%
+        default_targets = (0.025, 0.05, 0.08) if strategy == SCALPING else (0.03, 0.05, 0.08)
+        rr_targets = plan.get("targets_pct", default_targets)
         if not isinstance(rr_targets, (list, tuple)) or len(rr_targets) < 3:
-            rr_targets = (0.03, 0.05, 0.08)
+            rr_targets = default_targets
         sl_pct = plan.get("sl_pct", -0.03)
         try:
             sl_pct_f = float(sl_pct) if sl_pct is not None else -0.03
@@ -793,11 +965,12 @@ def build_tqi_prompt(strategy: Any, ctx: Any, sentiment: Any) -> str:
             f"R:R المتوقع: 1:{rr:.2f}\n"
             f"ملخص الأخبار/المعنويات: {sentiment_body}\n\n"
             "المعايير المرجحة (المجموع 10.0):\n"
-            "1) Technical Confluence (3 pts) — التقاء RSI/EMA/SMA/اختراق\n"
-            "2) Risk/Reward Ratio (2.5 pts) — جودة R:R\n"
-            "3) Relative Volume Surge (2 pts) — قوة الحجم النسبي\n"
+            "1) Technical Confluence (3 pts) — التقاء RSI/EMA/SMA/اختراق | للسكالبنغ: وزن أعلى لـ EMA9 / VWAP crossover والزخم اللحظي\n"
+            "2) Risk/Reward Ratio (2.5 pts) — جودة R:R | للسكالبنغ: أهداف ضيقة 2.5% / 5.0% / 8.0%\n"
+            "3) Relative Volume Surge (2 pts) — قوة الحجم النسبي (RVOL اللحظي) | للسكالبنغ: اعتبر RVOL >1.5x ممتازًا وامنحه حتى 70% من وزن البندين 1+3\n"
             "4) Sector Alignment (1.5 pts) — توافق القطاع\n"
-            "5) News/Catalyst Strength (1 pt) — قوة المحفز الخبري\n\n"
+            "5) News/Catalyst Strength (1 pt) — قوة المحفز الخبري\n"
+            "   ملاحظة Scalp: في حال المسار Scalp، اعطِ RVOL اللحظي وكسر EMA9/VWAP وزنًا مضاعفًا.\n\n"
             "أخرج حتمًا:\n"
             "🎯 تقييم الجودة (TQI): X.X/10\n"
             "🏷️ المسار: [⚡ مضاربة لحظية (Scalp) / 📈 تداول سوينغ (Swing) / 🏛️ استثمار طويل (Invest)]\n"
@@ -848,8 +1021,33 @@ def _summarize_with_gemini(content: str, ticker: str) -> str:
 # --------------------------------------------------------------------------
 
 
-def send_telegram(chat_id: Optional[str], message: str, bot_token: Optional[str]) -> bool:
-    """Send a Markdown-formatted message to a Telegram chat/channel."""
+def build_trade_keyboard(ticker: str) -> Dict[str, Any]:
+    """Build InlineKeyboardMarkup for trade signals with Activate/Dismiss/Close buttons.
+
+    Returns dict suitable for Telegram Bot API `reply_markup`.
+    Callback data format: act_{ticker}, dis_{ticker}, cls_{ticker}
+    """
+    try:
+        safe_ticker = str(ticker).strip() if ticker else "UNKNOWN"
+        return {
+            "inline_keyboard": [
+                [
+                    {"text": "✅ تم الدخول (Activate)", "callback_data": f"act_{safe_ticker}"},
+                    {"text": "❌ غير مهتم (Dismiss)", "callback_data": f"dis_{safe_ticker}"},
+                    {"text": "🏁 إغلاق يدوياً (Close)", "callback_data": f"cls_{safe_ticker}"},
+                ]
+            ]
+        }
+    except Exception as exc:
+        logger.warning("Failed to build trade keyboard for %s: %s", ticker, exc)
+        return {"inline_keyboard": []}
+
+
+def send_telegram(chat_id: Optional[str], message: str, bot_token: Optional[str], reply_markup: Optional[Dict[str, Any]] = None) -> bool:
+    """Send a Markdown-formatted message to a Telegram chat/channel.
+
+    Optionally attaches InlineKeyboardMarkup via reply_markup.
+    """
     if not bot_token:
         logger.error("TELEGRAM_BOT_TOKEN is not set; cannot send alerts.")
         return False
@@ -861,6 +1059,11 @@ def send_telegram(chat_id: Optional[str], message: str, bot_token: Optional[str]
         "text": message,
         "parse_mode": "Markdown",
     }
+    if reply_markup:
+        try:
+            payload["reply_markup"] = reply_markup
+        except Exception as exc:
+            logger.warning("Failed to attach reply_markup: %s", exc)
     try:
         resp = requests.post(
             TELEGRAM_API.format(token=bot_token), json=payload, timeout=30
@@ -1253,11 +1456,22 @@ def compute_fallback_tqi(ctx: Any, strategy: Any, sentiment: Any) -> float:
                 tech_score += 0.8
         if price_val is not None and ema20_val is not None and price_val > ema20_val:
             tech_score += 0.8
+            # Scalp: extra weight for EMA9/VWAP momentum break (proxied by EMA20 crossover)
+            if strategy == SCALPING:
+                tech_score += 0.5  # momentum break bonus for Scalp
         if price_val is not None and sma50_val is not None:
             if strategy == INVESTMENT and price_val < sma50_val:
                 tech_score += 0.7
             elif price_val > sma50_val:
                 tech_score += 0.5
+        # Scalp: further boost if strong RVOL accompanies momentum (simulating VWAP crossover)
+        if strategy == SCALPING:
+            try:
+                vol_tmp = float(ctx.get("volume_ratio")) if ctx.get("volume_ratio") is not None else None
+                if vol_tmp is not None and vol_tmp >= 1.5 and price_val is not None and ema20_val is not None and price_val > ema20_val:
+                    tech_score += 0.5
+            except Exception:
+                pass
         tech_score = min(tech_score, TQI_TECHNICAL_CONFLUENCE_MAX)
 
         # Risk/Reward Ratio (2.5 pts)
@@ -1291,16 +1505,29 @@ def compute_fallback_tqi(ctx: Any, strategy: Any, sentiment: Any) -> float:
             vol_ratio = float(vol_ratio_raw) if vol_ratio_raw is not None else None
         except (TypeError, ValueError):
             vol_ratio = None
-        if vol_ratio is None:
-            vol_score = 0.5
-        elif vol_ratio >= 1.8:
-            vol_score = TQI_VOLUME_SURGE_MAX
-        elif vol_ratio >= 1.3:
-            vol_score = 1.2
-        elif vol_ratio >= 1.0:
-            vol_score = 0.7
+        # Scalp: higher weight to Intraday RVOL (lower thresholds, higher base)
+        if strategy == SCALPING:
+            if vol_ratio is None:
+                vol_score = 0.7
+            elif vol_ratio >= 1.5:
+                vol_score = TQI_VOLUME_SURGE_MAX
+            elif vol_ratio >= 1.2:
+                vol_score = 1.5
+            elif vol_ratio >= 1.0:
+                vol_score = 1.0
+            else:
+                vol_score = 0.5
         else:
-            vol_score = 0.3
+            if vol_ratio is None:
+                vol_score = 0.5
+            elif vol_ratio >= 1.8:
+                vol_score = TQI_VOLUME_SURGE_MAX
+            elif vol_ratio >= 1.3:
+                vol_score = 1.2
+            elif vol_ratio >= 1.0:
+                vol_score = 0.7
+            else:
+                vol_score = 0.3
 
         # Sector Alignment (1.5 pts) — no sector feed, use conservative default
         sector_score = 1.0
@@ -1658,7 +1885,12 @@ def process_ticker(ticker: str, state: Dict[str, Any]) -> None:
             continue
         message = build_message(strategy, ticker, ctx, sentiment)
         chat_id = os.environ.get(CHANNEL_ENV[strategy]) or os.getenv("TELEGRAM_CHAT_ID", "")
-        if send_telegram(chat_id, message, bot_token):
+        # Build inline keyboard for interactive trade management
+        try:
+            keyboard = build_trade_keyboard(ticker)
+        except Exception:
+            keyboard = None
+        if send_telegram(chat_id, message, bot_token, reply_markup=keyboard):
             mark_sent(state, ticker, strategy)
             logger.info("[%s] %s alert sent to channel %s.", ticker, strategy, chat_id)
             # Persist active position for trailing stop tracking
@@ -1684,6 +1916,7 @@ def process_ticker(ticker: str, state: Dict[str, Any]) -> None:
                     target_3=t3_pos,
                     current_stop_loss=sl_price_pos,
                     trade_track=trade_track_pos,
+                    status="PENDING",
                 )
             except Exception as exc:
                 logger.warning("[%s] failed to persist active position: %s", ticker, exc)
