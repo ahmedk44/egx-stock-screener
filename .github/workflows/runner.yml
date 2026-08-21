@@ -41,6 +41,14 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: python main.py
 
+      - name: Persist Active Positions State
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action Bot"
+          git add active_positions.json
+          git diff-index --quiet HEAD || git commit -m "chore: auto-update active positions state [skip ci]"
+          git push
+
       - name: Commit updated state back to repo
         run: |
           git config user.name "github-actions[bot]"

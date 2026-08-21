@@ -451,6 +451,12 @@ def manage_active_positions(path: str = ACTIVE_POSITIONS_FILE) -> int:
     """
     try:
         positions = load_active_positions(path)
+        # Ensure file exists for git auto-commit even when empty (prevents git add error)
+        if not os.path.exists(path):
+            try:
+                save_active_positions(positions, path)
+            except Exception:
+                pass
         if not positions:
             logger.info("No active positions to manage.")
             return 0
@@ -1595,6 +1601,12 @@ def run_news_watchlist(mode: str) -> int:
 def main() -> int:
     """Run the chosen execution mode (intraday scan or off-hours news watchlist)."""
     check_required_env()
+    # Ensure active_positions.json exists for workflow auto-commit (git add will fail if missing)
+    try:
+        if not os.path.exists(ACTIVE_POSITIONS_FILE):
+            save_active_positions([], ACTIVE_POSITIONS_FILE)
+    except Exception:
+        pass
     mode = parse_mode()
     if mode in (PRE_MARKET, POST_MARKET):
         logger.info("Running off-hours news scan in %s mode.", mode)

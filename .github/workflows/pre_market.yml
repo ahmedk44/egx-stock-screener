@@ -41,3 +41,11 @@ jobs:
           CHANNEL_SWING: ${{ secrets.CHANNEL_SWING }}
           CHANNEL_INVESTMENT: ${{ secrets.CHANNEL_INVESTMENT }}
         run: python main.py --mode=pre_market
+
+      - name: Persist Active Positions State
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action Bot"
+          git add active_positions.json
+          git diff-index --quiet HEAD || git commit -m "chore: auto-update active positions state [skip ci]"
+          git push
