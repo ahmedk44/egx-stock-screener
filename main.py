@@ -134,6 +134,7 @@ TQI_RISK_REWARD_MAX: float = 2.5
 TQI_VOLUME_SURGE_MAX: float = 2.0
 TQI_SECTOR_ALIGNMENT_MAX: float = 1.5
 TQI_NEWS_CATALYST_MAX: float = 1.0
+TQI_MIN_THRESHOLD: float = 5.0  # EGX liquidity-adapted minimum; skip only if TQI < 5.0
 
 INTRADAY: str = "intraday"
 PRE_MARKET: str = "pre_market"
@@ -460,17 +461,18 @@ def build_news_prompt(headlines: Any) -> str:
         "   - `📈 تداول سوينغ (Swing)` للصفقات المتوسطة (أيام إلى أسابيع)\n"
         "   - `🏛️ استثمار طويل (Invest)` للاستثمار الطويل\n"
         "   أخرجها بصيغة `🏷️ المسار: [القيمة]`.\n\n"
-        "5) حدد مستوى القناعة (Conviction Tier) حسب TQI:\n"
-        "   - TQI >= 9.0: `🟢 فرصة استثنائية (A+ Setup)`\n"
-        "   - TQI 7.5 - 8.9: `🟡 فرصة جيدة (B+ Setup)`\n"
-        "   - TQI < 7.5: `⚪ فرصة ضعيفة (Low Conviction)`\n"
+        "5) حدد مستوى القناعة (Conviction Tier) حسب TQI (عتبة EGX = 5.0):\n"
+        "   - TQI >= 8.5: `🟢 فرصة استثنائية (A+ Setup)`\n"
+        "   - TQI 6.5 - 8.4: `🟡 فرصة جيدة (B Setup)`\n"
+        "   - TQI 5.0 - 6.4: `🟠 فرصة متوسطة (C Setup)`\n"
+        "   - TQI < 5.0: `⚪ فرصة ضعيفة (Low Conviction)`\n"
         "   أخرجها بصيغة `⭐ التصنيف: [القيمة]`.\n\n"
         "تنسيق الإخراج المطلوب (حافظ عليه حرفيًا ليتوافق مع محلل الرسائل):\n"
         "- السطر الأول/الثاني: ملخص الأخبار\n"
         "- سطر: تصنيف المعنويات\n"
         "- سطر: 🎯 تقييم الجودة (TQI): X.X/10\n"
         "- سطر: 🏷️ المسار: [Scalp / Swing / Invest]\n"
-        "- سطر: ⭐ التصنيف: [A+ Setup / B+ Setup / Low Conviction]\n\n"
+        "- سطر: ⭐ التصنيف: [A+ Setup / B Setup / C Setup / Low Conviction]\n\n"
         f"العناوين:\n{headlines_block}"
     )
 
@@ -523,8 +525,8 @@ def build_tqi_prompt(strategy: Any, ctx: Any, sentiment: Any) -> str:
             "أخرج حتمًا:\n"
             "🎯 تقييم الجودة (TQI): X.X/10\n"
             "🏷️ المسار: [⚡ مضاربة لحظية (Scalp) / 📈 تداول سوينغ (Swing) / 🏛️ استثمار طويل (Invest)]\n"
-            "⭐ التصنيف: [🟢 فرصة استثنائية (A+ Setup) / 🟡 فرصة جيدة (B+ Setup) / ⚪ فرصة ضعيفة (Low Conviction)]\n"
-            "حسب القواعد: TQI >=9.0 → 🟢 A+ | 7.5-8.9 → 🟡 B+ | <7.5 → ⚪ Low Conviction\n"
+            "⭐ التصنيف: [🟢 فرصة استثنائية (A+ Setup) / 🟡 فرصة جيدة (B Setup) / 🟠 فرصة متوسطة (C Setup) / ⚪ فرصة ضعيفة (Low Conviction)]\n"
+            "حسب القواعد: TQI >=8.5 → 🟢 A+ | 6.5-8.4 → 🟡 B | 5.0-6.4 → 🟠 C | <5.0 → ⚪ Low Conviction (عتبة الإرسال = 5.0)\n"
         )
     except Exception as exc:
         logger.warning("build_tqi_prompt failed (%s); returning fallback prompt", exc)
@@ -532,7 +534,7 @@ def build_tqi_prompt(strategy: Any, ctx: Any, sentiment: Any) -> str:
             "أنت خبير تداول كمي للبورصة المصرية. قيّم جودة الإشارة عبر Trade Quality Index (TQI) من 0.0 إلى 10.0:\n"
             "🎯 تقييم الجودة (TQI): X.X/10\n"
             "🏷️ المسار: [⚡ مضاربة لحظية (Scalp) / 📈 تداول سوينغ (Swing) / 🏛️ استثمار طويل (Invest)]\n"
-            "⭐ التصنيف: [🟢 فرصة استثنائية (A+ Setup) / 🟡 فرصة جيدة (B+ Setup) / ⚪ فرصة ضعيفة (Low Conviction)]\n"
+            "⭐ التصنيف: [🟢 فرصة استثنائية (A+ Setup) / 🟡 فرصة جيدة (B Setup) / 🟠 فرصة متوسطة (C Setup) / ⚪ فرصة ضعيفة (Low Conviction)]\n"
         )
 
 
@@ -687,15 +689,17 @@ def build_news_block(sentiment: Any) -> str:
 
 
 def get_conviction_tier(tqi: Any) -> str:
-    """Return Conviction Tier label for a TQI score."""
+    """Return Conviction Tier label for a TQI score (EGX-adapted thresholds)."""
     try:
         score = float(tqi) if tqi is not None else 0.0
     except (TypeError, ValueError):
         score = 0.0
-    if score >= 9.0:
+    if score >= 8.5:
         return "🟢 فرصة استثنائية (A+ Setup)"
-    if score >= 7.5:
-        return "🟡 فرصة جيدة (B+ Setup)"
+    if score >= 6.5:
+        return "🟡 فرصة جيدة (B Setup)"
+    if score >= 5.0:
+        return "🟠 فرصة متوسطة (C Setup)"
     return "⚪ فرصة ضعيفة (Low Conviction)"
 
 
@@ -748,24 +752,30 @@ def extract_trade_track_from_text(text: Any) -> Optional[str]:
 
 
 def extract_conviction_from_text(text: Any) -> Optional[str]:
-    """Extract Conviction Tier label from Gemini text if present."""
+    """Extract Conviction Tier label from Gemini text if present (EGX 4-tier)."""
     if not isinstance(text, str) or not text:
         return None
     try:
         candidates = [
             "🟢 فرصة استثنائية (A+ Setup)",
-            "🟡 فرصة جيدة (B+ Setup)",
+            "🟡 فرصة جيدة (B Setup)",
+            "🟠 فرصة متوسطة (C Setup)",
             "⚪ فرصة ضعيفة (Low Conviction)",
         ]
         for cand in candidates:
             if cand in text:
                 return cand
+        # Legacy fallback: handle old B+ label
+        if "B+ Setup" in text:
+            return "🟡 فرصة جيدة (B Setup)"
         if "A+ Setup" in text or "استثنائية" in text:
             return candidates[0]
-        if "B+ Setup" in text or "فرصة جيدة" in text:
+        if "B Setup" in text or "فرصة جيدة" in text:
             return candidates[1]
-        if "Low Conviction" in text or "فرصة ضعيفة" in text:
+        if "C Setup" in text or "فرصة متوسطة" in text:
             return candidates[2]
+        if "Low Conviction" in text or "فرصة ضعيفة" in text:
+            return candidates[3]
     except Exception:
         return None
     return None
@@ -1202,6 +1212,15 @@ def process_ticker(ticker: str, state: Dict[str, Any]) -> None:
                 strategy,
                 DUPLICATE_WINDOW_HOURS,
             )
+            continue
+        # TQI threshold filter — EGX liquidity adapted: skip only if TQI < 5.0
+        try:
+            tqi_for_filter, _, _ = resolve_tqi(ctx, strategy, sentiment)
+        except Exception as exc:
+            logger.warning("[%s] TQI filter check failed (%s); allowing dispatch", ticker, exc)
+            tqi_for_filter = TQI_MIN_THRESHOLD
+        if tqi_for_filter < TQI_MIN_THRESHOLD:
+            logger.info("[FILTERED] Signal for %s skipped (TQI: %.1f/10 < 5.0)", ticker, tqi_for_filter)
             continue
         message = build_message(strategy, ticker, ctx, sentiment)
         chat_id = os.environ.get(CHANNEL_ENV[strategy]) or os.getenv("TELEGRAM_CHAT_ID", "")
