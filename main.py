@@ -126,6 +126,15 @@ SENTIMENT_BADGES: Dict[str, str] = {
     "محايد": "⚪",
 }
 
+# --------------------------------------------------------------------------
+# Trade Quality Index (TQI) — weighted scoring 0.0-10.0
+# --------------------------------------------------------------------------
+TQI_TECHNICAL_CONFLUENCE_MAX: float = 3.0
+TQI_RISK_REWARD_MAX: float = 2.5
+TQI_VOLUME_SURGE_MAX: float = 2.0
+TQI_SECTOR_ALIGNMENT_MAX: float = 1.5
+TQI_NEWS_CATALYST_MAX: float = 1.0
+
 INTRADAY: str = "intraday"
 PRE_MARKET: str = "pre_market"
 POST_MARKET: str = "post_market"
@@ -150,6 +159,12 @@ CHANNEL_ENV: Dict[str, str] = {
     SCALPING: "CHANNEL_SCALPING",
     SWING: "CHANNEL_SWING",
     INVESTMENT: "CHANNEL_INVESTMENT",
+}
+
+TQI_TRACK_LABELS: Dict[str, str] = {
+    SCALPING: "⚡ مضاربة لحظية (Scalp)",
+    SWING: "📈 تداول سوينغ (Swing)",
+    INVESTMENT: "🏛️ استثمار طويل (Invest)",
 }
 
 TELEGRAM_API: str = "https://api.telegram.org/bot{token}/sendMessage"
@@ -412,15 +427,76 @@ def fetch_arabic_headlines(stock_name_ar: str, ticker: str) -> List[str]:
 
 
 def build_news_prompt(headlines: List[str]) -> str:
-    """Build the Gemini prompt classifying market sentiment from Arabic headlines."""
+    """Build Gemini prompt: sentiment + Trade Quality Index (TQI) evaluation.
+
+    Instructs Gemini to evaluate each stock signal using TQI 0.0-10.0 across
+    5 weighted parameters, assign Trade Track and Conviction Tier, and emit
+    machine-parsable lines for Telegram formatting.
+    """
     headlines_block = "\n".join(f"- {h}" for h in headlines)
     return (
-        "اقرأ العناوين التالية الخاصة بشركات البورصة المصرية، ثم أخرج:\n"
+        "أنت محلل مالي متخصص في البورصة المصرية (EGX). اقرأ العناوين التالية ثم أخرج:\n"
         "1) ملخصًا من جملتين باللغة العربية يلخّص اتجاه الأخبار.\n"
         "2) تصنيف المعنويات بإحدى الكلمات فقط: إيجابي / سلبي / محايد.\n"
         "ملاحظة: إذا أشارت الأخبار إلى نتائج مالية قوية أو قفزات في الأرباح "
         "(أرباح تتجاوز 10 مليار جنيه مصري)، صنّف المعنويات 'إيجابي' قدر الإمكان.\n\n"
+        "3) تقييم جودة الصفقة عبر Trade Quality Index (TQI) scored من 0.0 إلى 10.0 بناءً على 5 معايير مرجحة بدقة:\n"
+        "   - Technical Confluence (3.0 pts): التقاء المؤشرات الفنية (RSI, EMA20/SMA50, اختراق مقاومة/دعم، تقاطعات)\n"
+        "   - Risk/Reward Ratio (2.5 pts): جودة نسبة العائد إلى المخاطر (ممتازة > 1:2.5 ، جيدة 1:1.5-2.5 ، ضعيفة < 1:1.5)\n"
+        "   - Relative Volume Surge (2.0 pts): قوة اندفاع الحجم النسبي مقارنة بمتوسط 20 يوم (spike >1.8x = ممتاز)\n"
+        "   - Sector Alignment (1.5 pts): توافق القطاع والاتجاه العام للسوق\n"
+        "   - News/Catalyst Strength (1.0 pt): قوة الأخبار/المحفزات (نتائج أعمال، عقود، إفصاحات جوهرية)\n"
+        "   احسب المجموع بدقة من 10.0 واذكر الدرجة بصيغة `🎯 تقييم الجودة (TQI): X.X/10` (رقم عشري واحد).\n\n"
+        "4) حدد المسار التجاري (Trade Track) بوضوح بإحدى القيم فقط:\n"
+        "   - `⚡ مضاربة لحظية (Scalp)` للصفقات اللحظية داخل اليوم\n"
+        "   - `📈 تداول سوينغ (Swing)` للصفقات المتوسطة (أيام إلى أسابيع)\n"
+        "   - `🏛️ استثمار طويل (Invest)` للاستثمار الطويل\n"
+        "   أخرجها بصيغة `🏷️ المسار: [القيمة]`.\n\n"
+        "5) حدد مستوى القناعة (Conviction Tier) حسب TQI:\n"
+        "   - TQI >= 9.0: `🟢 فرصة استثنائية (A+ Setup)`\n"
+        "   - TQI 7.5 - 8.9: `🟡 فرصة جيدة (B+ Setup)`\n"
+        "   - TQI < 7.5: `⚪ فرصة ضعيفة (Low Conviction)`\n"
+        "   أخرجها بصيغة `⭐ التصنيف: [القيمة]`.\n\n"
+        "تنسيق الإخراج المطلوب (حافظ عليه حرفيًا ليتوافق مع محلل الرسائل):\n"
+        "- السطر الأول/الثاني: ملخص الأخبار\n"
+        "- سطر: تصنيف المعنويات\n"
+        "- سطر: 🎯 تقييم الجودة (TQI): X.X/10\n"
+        "- سطر: 🏷️ المسار: [Scalp / Swing / Invest]\n"
+        "- سطر: ⭐ التصنيف: [A+ Setup / B+ Setup / Low Conviction]\n\n"
         f"العناوين:\n{headlines_block}"
+    )
+
+
+def build_tqi_prompt(strategy: str, ctx: Dict[str, Any], sentiment: str) -> str:
+    """Build a dedicated Gemini prompt for TQI scoring of a specific signal.
+
+    Provides technical context (RSI, EMA, volume surge, R:R) so Gemini can
+    score the 5 TQI parameters accurately.
+    """
+    plan = STRATEGY_PLAN.get(strategy, {})
+    price = ctx.get("price")
+    rsi = ctx.get("rsi")
+    volume_ratio = ctx.get("volume_ratio")
+    rr_targets = plan.get("targets_pct", (0.03, 0.05, 0.08))
+    sl_pct = plan.get("sl_pct", -0.03)
+    rr = abs(rr_targets[2] / sl_pct) if sl_pct else 0
+    return (
+        "أنت خبير تداول كمي للبورصة المصرية. قيّم جودة الإشارة التالية عبر Trade Quality Index (TQI) من 0.0 إلى 10.0:\n"
+        f"الاستراتيجية: {strategy} | السعر: {fmt(price)} | RSI: {fmt(rsi, 1)} | "
+        f"نسبة الحجم: {fmt(volume_ratio, 2) if volume_ratio else 'غير متاح'} | "
+        f"R:R المتوقع: 1:{rr:.2f}\n"
+        f"ملخص الأخبار/المعنويات: {extract_news_body(sentiment)[:300]}\n\n"
+        "المعايير المرجحة (المجموع 10.0):\n"
+        "1) Technical Confluence (3 pts) — التقاء RSI/EMA/SMA/اختراق\n"
+        "2) Risk/Reward Ratio (2.5 pts) — جودة R:R\n"
+        "3) Relative Volume Surge (2 pts) — قوة الحجم النسبي\n"
+        "4) Sector Alignment (1.5 pts) — توافق القطاع\n"
+        "5) News/Catalyst Strength (1 pt) — قوة المحفز الخبري\n\n"
+        "أخرج حتمًا:\n"
+        "🎯 تقييم الجودة (TQI): X.X/10\n"
+        "🏷️ المسار: [⚡ مضاربة لحظية (Scalp) / 📈 تداول سوينغ (Swing) / 🏛️ استثمار طويل (Invest)]\n"
+        "⭐ التصنيف: [🟢 فرصة استثنائية (A+ Setup) / 🟡 فرصة جيدة (B+ Setup) / ⚪ فرصة ضعيفة (Low Conviction)]\n"
+        "حسب القواعد: TQI >=9.0 → 🟢 A+ | 7.5-8.9 → 🟡 B+ | <7.5 → ⚪ Low Conviction\n"
     )
 
 
@@ -546,8 +622,200 @@ def build_news_block(sentiment: str) -> str:
     return f"{header}\n{body}".strip()
 
 
+# --------------------------------------------------------------------------
+# Trade Quality Index (TQI) helpers
+# --------------------------------------------------------------------------
+
+
+def get_conviction_tier(tqi: float) -> str:
+    """Return Conviction Tier label for a TQI score."""
+    if tqi >= 9.0:
+        return "🟢 فرصة استثنائية (A+ Setup)"
+    if tqi >= 7.5:
+        return "🟡 فرصة جيدة (B+ Setup)"
+    return "⚪ فرصة ضعيفة (Low Conviction)"
+
+
+def get_trade_track_label(strategy: str) -> str:
+    """Return Trade Track label for a strategy key."""
+    return TQI_TRACK_LABELS.get(strategy, "⚪ فرصة ضعيفة (Low Conviction)")
+
+
+def extract_tqi_score(text: str) -> Optional[float]:
+    """Extract TQI score X.X/10 from Gemini text if present."""
+    if not text:
+        return None
+    # Match patterns like "TQI: 8.5/10" or "تقييم الجودة (TQI): 8.5/10"
+    pattern = re.compile(r"TQI[^0-9]*([0-9]+(?:\.[0-9]+)?)\s*/\s*10", re.IGNORECASE)
+    match = pattern.search(text)
+    if match:
+        try:
+            val = float(match.group(1))
+            # Clamp to 0.0-10.0
+            return max(0.0, min(10.0, round(val, 1)))
+        except ValueError:
+            return None
+    return None
+
+
+def extract_trade_track_from_text(text: str) -> Optional[str]:
+    """Extract Trade Track label from Gemini text if present."""
+    if not text:
+        return None
+    for label in TQI_TRACK_LABELS.values():
+        if label in text:
+            return label
+    # Fallback: detect keywords
+    if "Scalp" in text or "مضاربة لحظية" in text:
+        return TQI_TRACK_LABELS[SCALPING]
+    if "Swing" in text or "سوينغ" in text:
+        return TQI_TRACK_LABELS[SWING]
+    if "Invest" in text or "استثمار طويل" in text:
+        return TQI_TRACK_LABELS[INVESTMENT]
+    return None
+
+
+def extract_conviction_from_text(text: str) -> Optional[str]:
+    """Extract Conviction Tier label from Gemini text if present."""
+    if not text:
+        return None
+    candidates = [
+        "🟢 فرصة استثنائية (A+ Setup)",
+        "🟡 فرصة جيدة (B+ Setup)",
+        "⚪ فرصة ضعيفة (Low Conviction)",
+    ]
+    for cand in candidates:
+        if cand in text:
+            return cand
+    # Fallback keyword match
+    if "A+ Setup" in text or "استثنائية" in text:
+        return candidates[0]
+    if "B+ Setup" in text or "فرصة جيدة" in text:
+        return candidates[1]
+    if "Low Conviction" in text or "فرصة ضعيفة" in text:
+        return candidates[2]
+    return None
+
+
+def compute_fallback_tqi(ctx: Dict[str, Any], strategy: str, sentiment: str) -> float:
+    """Deterministically compute TQI 0.0-10.0 from available context.
+
+    Scoring (mirrors Gemini prompt weights):
+      - Technical Confluence 3.0 pts
+      - Risk/Reward 2.5 pts
+      - Relative Volume Surge 2.0 pts
+      - Sector Alignment 1.5 pts
+      - News/Catalyst Strength 1.0 pt
+    """
+    # Technical Confluence (3 pts)
+    tech_score = 0.0
+    rsi = ctx.get("rsi")
+    price = ctx.get("price")
+    ema20 = ctx.get("ema20")
+    sma50 = ctx.get("sma50")
+    if rsi is not None:
+        if strategy == SCALPING and rsi > 55:
+            tech_score += 1.5
+        elif strategy == SWING and rsi > 50:
+            tech_score += 1.5
+        elif strategy == INVESTMENT and rsi < 40:
+            tech_score += 1.5
+        elif 40 <= rsi <= 70:
+            tech_score += 0.8
+    if price is not None and ema20 is not None and price > ema20:
+        tech_score += 0.8
+    if price is not None and sma50 is not None:
+        if strategy == INVESTMENT and price < sma50:
+            tech_score += 0.7
+        elif price > sma50:
+            tech_score += 0.5
+    tech_score = min(tech_score, TQI_TECHNICAL_CONFLUENCE_MAX)
+
+    # Risk/Reward Ratio (2.5 pts)
+    plan = STRATEGY_PLAN.get(strategy, {})
+    sl_pct = abs(plan.get("sl_pct", 0.03))
+    targets = plan.get("targets_pct", (0.03, 0.05, 0.08))
+    rr_ratio = abs(targets[2] / sl_pct) if sl_pct else 0
+    if rr_ratio >= 2.5:
+        rr_score = TQI_RISK_REWARD_MAX
+    elif rr_ratio >= 1.5:
+        rr_score = 1.8
+    elif rr_ratio >= 1.0:
+        rr_score = 1.0
+    else:
+        rr_score = 0.5
+
+    # Relative Volume Surge (2 pts)
+    vol_ratio = ctx.get("volume_ratio")
+    if vol_ratio is None:
+        vol_score = 0.5
+    elif vol_ratio >= 1.8:
+        vol_score = TQI_VOLUME_SURGE_MAX
+    elif vol_ratio >= 1.3:
+        vol_score = 1.2
+    elif vol_ratio >= 1.0:
+        vol_score = 0.7
+    else:
+        vol_score = 0.3
+
+    # Sector Alignment (1.5 pts) — no sector feed, use conservative default with slight bump for known liquid tickers
+    sector_score = 1.0
+    if strategy == SWING and vol_ratio and vol_ratio > 1.5:
+        sector_score = 1.2
+
+    # News/Catalyst Strength (1 pt)
+    classification = classify_sentiment(sentiment) or ""
+    if classification == "إيجابي":
+        news_score = TQI_NEWS_CATALYST_MAX
+    elif classification == "سلبي":
+        news_score = 0.2
+    elif classification == "محايد":
+        news_score = 0.5
+    else:
+        # Fallback: check headlines presence via sentiment length
+        body = extract_news_body(sentiment)
+        news_score = 0.6 if len(body) > 30 else 0.3
+
+    total = tech_score + rr_score + vol_score + sector_score + news_score
+    return max(0.0, min(10.0, round(total, 1)))
+
+
+def resolve_tqi(ctx: Dict[str, Any], strategy: str, sentiment: str) -> tuple[float, str, str]:
+    """Resolve TQI, Trade Track and Conviction Tier for a message.
+
+    Priority: parse from Gemini text → fallback to deterministic computation.
+    Returns (tqi_score, track_label, conviction_label).
+    """
+    tqi = extract_tqi_score(sentiment)
+    track = extract_trade_track_from_text(sentiment)
+    conviction = extract_conviction_from_text(sentiment)
+
+    if tqi is None:
+        tqi = compute_fallback_tqi(ctx, strategy, sentiment)
+
+    if track is None:
+        track = get_trade_track_label(strategy)
+
+    if conviction is None:
+        conviction = get_conviction_tier(tqi)
+    else:
+        # Ensure conviction matches tqi if Gemini provided inconsistent tier
+        expected = get_conviction_tier(tqi)
+        # Keep Gemini conviction but prefer deterministic if mismatch is large
+        # For consistency, trust expected tier when tqi far from tier threshold
+        if conviction != expected:
+            # Re-derive to keep parser deterministic; Gemini tier is preserved only if tqi close to boundary
+            conviction = expected
+
+    return tqi, track, conviction
+
+
 def build_message(strategy: str, ticker: str, ctx: Dict[str, Any], sentiment: str) -> str:
-    """Compose a professional Arabic Markdown alert with dynamic targets & risk plan."""
+    """Compose a professional Arabic Markdown alert with dynamic targets & risk plan.
+
+    Includes Trade Quality Index (TQI), Trade Track and Conviction Tier while
+    preserving all existing target prices and news summary fields for parser compatibility.
+    """
     plan = STRATEGY_PLAN[strategy]
     sharia_tag = get_sharia_status_tag(ticker)
     stock_name_ar = STOCK_NAMES_AR.get(ticker, ticker)
@@ -561,12 +829,18 @@ def build_message(strategy: str, ticker: str, ctx: Dict[str, Any], sentiment: st
     stop_loss = entry_price * (1 + sl_pct)
     rr = abs(p3 / sl_pct)
     news_block = build_news_block(sentiment)
+    # Resolve Trade Quality Index (TQI) — parsed from Gemini or fallback computed
+    tqi_score, track_label, conviction_label = resolve_tqi(ctx, strategy, sentiment)
     return (
         f"اسم السهم : {stock_name_ar} {clean_ticker}\n"
         f"\n"
         f"سبب دخول الصفقه فنيا : {plan['technical_reason_ar']}\n"
         f"\n"
         f"{sharia_tag}\n"
+        f"\n"
+        f"🎯 تقييم الجودة (TQI): {tqi_score:.1f}/10\n"
+        f"🏷️ المسار: {track_label}\n"
+        f"⭐ التصنيف: {conviction_label}\n"
         f"\n"
         f"سعر الدخول : {entry_price:.2f} 🏷\n"
         f"\n"
