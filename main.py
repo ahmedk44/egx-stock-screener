@@ -137,6 +137,16 @@ TQI_SECTOR_ALIGNMENT_MAX: float = 1.5
 TQI_NEWS_CATALYST_MAX: float = 1.0
 TQI_MIN_THRESHOLD: float = 5.0  # EGX liquidity-adapted minimum; skip only if TQI < 5.0
 
+# EGX Sector Sensitivity Knowledge Mapping for Macro Indirect Analysis
+EGX_SECTOR_SENSITIVITY_GUIDELINES: str = (
+    "خريطة حساسية القطاعات في EGX (للتحليل غير المباشر - استخدمها بدقة):\n"
+    "- الشحن/الموانئ والخدمات اللوجستية (مثل ALEX, ETEL, SKPC) ↔ اضطرابات الشحن / أسعار الشحن والنقل البحري / إغلاق قناة السويس / أزمة البحر الأحمر والتوترات الإقليمية\n"
+    "- البتروكيماويات والأسمدة (مثل ABUK, AMOC, SKPC) ↔ أسعار النفط والغاز / أسعار السلع العالمية / أسعار اليوريا والأمونيا والبولي إيثيلين\n"
+    "- البنوك والمالية (مثل COMI, ADIB) ↔ أسعار الفائدة / التضخم / سعر صرف الجنيه مقابل الدولار / قرارات البنك المركزي\n"
+    "- العقارات والإسكان (مثل HELI, TMGH) ↔ أسعار الفائدة / التضخم / تكاليف مواد البناء (الحديد والأسمنت) / القوة الشرائية\n"
+    "- قاعدة عامة: المصدرون (البتروكيماويات) يستفيدون من ارتفاع النفط/السلع وضعف الجنيه، بينما المستوردون والمرتبطون بالشحن يتضررون من ارتفاع الشحن وتراجع الجنيه وارتفاع الفائدة.\n"
+)
+
 INTRADAY: str = "intraday"
 PRE_MARKET: str = "pre_market"
 POST_MARKET: str = "post_market"
@@ -684,23 +694,21 @@ def fetch_arabic_headlines(stock_name_ar: str, ticker: str) -> List[str]:
 
 
 def build_news_prompt(headlines: Any) -> str:
-    """Build Gemini prompt: sentiment + Trade Quality Index (TQI) evaluation.
+    """Build Gemini prompt: sentiment + TQI + Macro Chain-of-Thought (CoT) indirect analysis.
 
-    Instructs Gemini to evaluate each stock signal using TQI 0.0-10.0 across
-    5 weighted parameters, assign Trade Track and Conviction Tier, and emit
-    machine-parsable lines for Telegram formatting.
+    Enhances Gemini to apply Second-Order reasoning for global/regional macro news,
+    map sector impact on EGX, and identify affected tickers even when not named.
     Handles None / non-list inputs gracefully.
     """
     try:
         if not isinstance(headlines, (list, tuple)):
             headlines = []
-        # Filter out non-string / empty headlines
         safe_headlines = [str(h).strip() for h in headlines if h is not None and str(h).strip()]
         headlines_block = "\n".join(f"- {h}" for h in safe_headlines) if safe_headlines else "- لا توجد عناوين متاحة"
     except Exception:
         headlines_block = "- لا توجد عناوين متاحة"
     return (
-        "أنت محلل مالي متخصص في البورصة المصرية (EGX). اقرأ العناوين التالية ثم أخرج:\n"
+        "أنت محلل مالي متخصص في البورصة المصرية (EGX) وخبير في التحليل الكلي (Macro) والربط القطاعي. اقرأ العناوين التالية ثم أخرج:\n"
         "1) ملخصًا من جملتين باللغة العربية يلخّص اتجاه الأخبار.\n"
         "2) تصنيف المعنويات بإحدى الكلمات فقط: إيجابي / سلبي / محايد.\n"
         "ملاحظة: إذا أشارت الأخبار إلى نتائج مالية قوية أو قفزات في الأرباح "
@@ -723,12 +731,24 @@ def build_news_prompt(headlines: Any) -> str:
         "   - TQI 5.0 - 6.4: `🟠 فرصة متوسطة (C Setup)`\n"
         "   - TQI < 5.0: `⚪ فرصة ضعيفة (Low Conviction)`\n"
         "   أخرجها بصيغة `⭐ التصنيف: [القيمة]`.\n\n"
+        "6) طبّق تفكيرًا متسلسلًا (Chain-of-Thought) من الدرجة الثانية للأخبار الماكرو/غير المباشرة:\n"
+        "   - الخطوة 1: حدد المحفز الماكرو (Macro Trigger) بدقة: تقلبات سعر الصرف (FX)، أسعار النفط/الغاز، اضطرابات الشحن والنقل البحري (قناة السويس/البحر الأحمر)، تغيرات أسعار الفائدة، التضخم، التوترات الجيوسياسية الإقليمية.\n"
+        "   - الخطوة 2: اربط الأثر القطاعي على EGX: الشحن/الموانئ واللوجستيات، البتروكيماويات، البنوك/المالية، العقارات، المصدرون مقابل المستوردون.\n"
+        "   - الخطوة 3: حدد أسهم EGX المحددة المتأثرة حتى لو لم تُذكر صراحة في النص (استدلال غير مباشر).\n"
+        f"   {EGX_SECTOR_SENSITIVITY_GUIDELINES}\n"
+        "   إذا رصدت أثرًا غير مباشر واضحًا (مثل ارتفاع النفط يؤثر على ABUK/AMOC، أو اضطراب الشحن يؤثر على ETEL/SKPC، أو رفع الفائدة يؤثر على COMI/ADIB و HELI/TMGH)، أخرج حتمًا قسمًا منفصلًا بالتنسيق الحرفي التالي (وإلا تجاهل القسم):\n"
+        "   `🧠 التحليل الكلي والأثر غير المباشر:`\n"
+        "   `• السبب: [الحدث الماكرو - جملة واحدة]`\n"
+        "   `• القطاع المتأثر: [أسماء القطاعات]`\n"
+        "   `• الأسهم المستفيدة/المتأثرة: [رموز EGX مثل ABUK.CA, ETEL.CA, ...]`\n"
+        "   مهم: استخدم نفس الإيموجي والرموز (•) حرفيًا ليتوافق مع محلل الرسائل، ولا تضف أسهمًا غير مذكورة في خريطة الحساسية إلا إذا كان الربط منطقيًا ومُبررًا.\n\n"
         "تنسيق الإخراج المطلوب (حافظ عليه حرفيًا ليتوافق مع محلل الرسائل):\n"
         "- السطر الأول/الثاني: ملخص الأخبار\n"
         "- سطر: تصنيف المعنويات\n"
         "- سطر: 🎯 تقييم الجودة (TQI): X.X/10\n"
         "- سطر: 🏷️ المسار: [Scalp / Swing / Invest]\n"
-        "- سطر: ⭐ التصنيف: [A+ Setup / B Setup / C Setup / Low Conviction]\n\n"
+        "- سطر: ⭐ التصنيف: [A+ Setup / B Setup / C Setup / Low Conviction]\n"
+        "- قسم اختياري عند وجود أثر ماكرو: 🧠 التحليل الكلي والأثر غير المباشر: + 3 نقاط •\n\n"
         f"العناوين:\n{headlines_block}"
     )
 
@@ -937,6 +957,153 @@ def build_news_block(sentiment: Any) -> str:
     except Exception:
         # Never crash message formatting
         return f"🤖 ملخص الأخبار (Gemini AI): ⚪\n{extract_news_body(sentiment) if isinstance(sentiment, str) else ''}".strip()
+
+
+def extract_macro_analysis(text: Any) -> Optional[str]:
+    """Extract macro indirect analysis block from Gemini output if present.
+
+    Looks for header 🧠 التحليل الكلي والأثر غير المباشر and captures
+    bullet lines for سبب/قطاع/أسهم. Returns None if not found.
+    """
+    if not isinstance(text, str) or not text:
+        return None
+    try:
+        # Normalize line endings
+        normalized = text.strip()
+        # Search for header with or without emoji
+        header_patterns = [
+            r"🧠\s*التحليل\s*الكلي\s*والأثر\s*غير\s*المباشر\s*:?",
+            r"التحليل\s*الكلي\s*والأثر\s*غير\s*المباشر\s*:?",
+        ]
+        header_match = None
+        header_end = -1
+        for pat in header_patterns:
+            m = re.search(pat, normalized)
+            if m:
+                header_match = m
+                header_end = m.end()
+                break
+        if not header_match:
+            return None
+        # Extract the block from header onward
+        block_start = header_match.start()
+        # Take up to next double newline or next major section (like 🎯 or 🏷️ or ⭐) or 500 chars
+        # Find next header markers
+        rest = normalized[block_start:]
+        # Split into lines
+        lines = rest.splitlines()
+        # Keep header + up to 5 bullet lines starting with • or - or *
+        macro_lines: List[str] = []
+        for idx, line in enumerate(lines):
+            if idx == 0:
+                # Header line - normalize to required emoji header
+                macro_lines.append("🧠 التحليل الكلي والأثر غير المباشر:")
+                continue
+            stripped = line.strip()
+            if not stripped:
+                # Allow one empty line then break if two consecutive empty?
+                if len(macro_lines) > 1 and not stripped:
+                    # Check next line also empty or new section
+                    continue
+                continue
+            # Stop if we hit another major section marker
+            if any(marker in stripped for marker in ["🎯 تقييم الجودة", "🏷️ المسار", "⭐ التصنيف", "🤖 ملخص الأخبار"]):
+                break
+            # Keep bullet lines
+            if stripped.startswith("•") or stripped.startswith("-") or stripped.startswith("*"):
+                # Normalize bullet to • 
+                if stripped.startswith("-") or stripped.startswith("*"):
+                    stripped = "• " + stripped[1:].strip()
+                macro_lines.append(stripped)
+                if len(macro_lines) >= 4:  # header + 3 bullets
+                    break
+            elif any(k in stripped for k in ["السبب", "القطاع", "الأسهم", "المستفيدة", "المتأثرة"]):
+                # Lines containing those keywords but without bullet - add bullet
+                if not stripped.startswith("•"):
+                    stripped = "• " + stripped.lstrip("•- *:")
+                macro_lines.append(stripped)
+                if len(macro_lines) >= 4:
+                    break
+            else:
+                # If line doesn't look like bullet but we already have bullets, break
+                if len(macro_lines) >= 2:
+                    # Might be continuation of previous bullet
+                    if len(stripped) < 100:
+                        continue
+                    break
+        # Validate we have at least 2 bullet lines (cause + sector or tickers)
+        bullet_count = sum(1 for l in macro_lines if l.startswith("•"))
+        if bullet_count < 2:
+            # Not enough content to be considered valid macro block
+            return None
+        return "\n".join(macro_lines).strip()
+    except Exception:
+        return None
+
+
+def build_macro_block(sentiment: Any) -> str:
+    """Build formatted macro indirect impact block for Telegram message.
+
+    Returns empty string if no indirect macro effect detected, otherwise
+    returns the concise 3-bullet section with header.
+    The header and bullets match exactly the required format:
+        🧠 التحليل الكلي والأثر غير المباشر:
+        • السبب: [Macro Event]
+        • القطاع المتأثر: [Sector Impact] (or القطاع التأثر)
+        • الأسهم المستفيدة/المتأثرة: [Impacted EGX Tickers]
+    """
+    try:
+        block = extract_macro_analysis(sentiment)
+        if not block:
+            return ""
+        # Ensure bullets use correct labels (normalize variations)
+        # Replace common variations to match required labels
+        # Ensure we have exactly the three bullets with correct prefixes
+        lines = block.splitlines()
+        normalized_lines: List[str] = []
+        for line in lines:
+            if "التحليل الكلي" in line:
+                normalized_lines.append("🧠 التحليل الكلي والأثر غير المباشر:")
+                continue
+            # Normalize bullet prefixes
+            # Handle "القطاع التأثر" vs "القطاع المتأثر"
+            if "السبب" in line:
+                # Ensure format "• السبب: ..."
+                if ":" not in line:
+                    line = line.replace("السبب", "السبب:")
+                if not line.strip().startswith("•"):
+                    line = "• " + line.lstrip("•- *")
+                # Ensure "• السبب:" prefix
+                line = re.sub(r"^[•\-\*]\s*السبب\s*:?", "• السبب:", line)
+                normalized_lines.append(line.strip())
+            elif "القطاع" in line:
+                # Handle both التأثر and المتأثر
+                if ":" not in line:
+                    line = line.replace("القطاع", "القطاع المتأثر:")
+                # Normalize to "• القطاع المتأثر:" or keep original if needed
+                # Requirement says "• القطاع التأثر:" - we support both, but normalize to المتأثر for consistency
+                # Keep original label if it matches requirement exactly
+                if "القطاع التأثر" in line or "القطاع المتأثر" in line:
+                    line = re.sub(r"^[•\-\*]\s*القطاع\s*(المتأثر|التأثر)?\s*:?", "• القطاع المتأثر:", line)
+                else:
+                    line = re.sub(r"^[•\-\*]\s*القطاع.*?:?", "• القطاع المتأثر:", line)
+                normalized_lines.append(line.strip())
+            elif "الأسهم" in line:
+                if ":" not in line:
+                    line = line.replace("الأسهم", "الأسهم المستفيدة/المتأثرة:")
+                line = re.sub(r"^[•\-\*]\s*الأسهم[^:]*:?", "• الأسهم المستفيدة/المتأثرة:", line)
+                normalized_lines.append(line.strip())
+            else:
+                # Keep other bullet lines as is if they start with •
+                if line.strip().startswith("•"):
+                    normalized_lines.append(line.strip())
+        # Reconstruct; if we have less than 3 bullets, keep as is
+        if len(normalized_lines) < 2:
+            return ""
+        # Ensure at least header + 2 bullets
+        return "\n".join(normalized_lines).strip()
+    except Exception:
+        return ""
 
 
 # --------------------------------------------------------------------------
@@ -1291,6 +1458,12 @@ def build_message(strategy: Any, ticker: Any, ctx: Any, sentiment: Any) -> str:
         except Exception:
             news_block = "🤖 ملخص الأخبار (Gemini AI): ⚪"
 
+        # Extract macro indirect analysis block (CoT second-order reasoning)
+        try:
+            macro_block = build_macro_block(sentiment)
+        except Exception:
+            macro_block = ""
+
         # Resolve TQI safely
         try:
             tqi_score, track_label, conviction_label = resolve_tqi(ctx, strategy, sentiment)
@@ -1315,6 +1488,9 @@ def build_message(strategy: Any, ticker: Any, ctx: Any, sentiment: Any) -> str:
         sl_condition = plan.get("sl_condition_ar", "إغلاق شمعة أسفل الدعم") if isinstance(plan, dict) else "إغلاق شمعة أسفل الدعم"
         allocation = plan.get("allocation_ar", "5% من رأس المال") if isinstance(plan, dict) else "5% من رأس المال"
         duration = plan.get("duration_ar", "مضاربة") if isinstance(plan, dict) else "مضاربة"
+
+        # Prepare macro section (only if indirect effect detected)
+        macro_section = f"\n{macro_block}\n" if macro_block else ""
 
         return (
             f"اسم السهم : {stock_name_ar} {clean_ticker}\n"
@@ -1342,6 +1518,7 @@ def build_message(strategy: Any, ticker: Any, ctx: Any, sentiment: Any) -> str:
             f"📈 [عرض الشارت المباشر على TradingView](https://ar.tradingview.com/symbols/EGX-{clean_ticker}/)\n"
             f"\n"
             f"{news_block}\n"
+            f"{macro_section}"
             f"\n"
             f"تذكير ⚠️ التحليل قد يصيب او يخطئ ولكن يجب عليك الالتزام ب إدارة المخاطر "
             f"وعدم التهاون ب إدارة رأس مالك 🔒 .. بالتوفيق للجميع 👏"
