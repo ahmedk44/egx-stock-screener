@@ -52,7 +52,12 @@ jobs:
       - name: Persist Active Positions State
         run: |
           git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action Bot"
-          git add active_positions.json
-          git diff-index --quiet HEAD || git commit -m "chore: auto-update active positions state [skip ci]"
-          git push
+          git config --local user.name "GitHub Action"
+          git add active_positions.json || true
+          if git diff --staged --quiet; then
+            echo "No changes in active_positions.json to commit."
+          else
+            git commit -m "chore: auto-update active positions state [skip ci]"
+            git pull origin main --rebase
+            git push origin main
+          fi
