@@ -1612,7 +1612,7 @@ def fetch_arabic_headlines(stock_name_ar: str, ticker: str) -> List[str]:
     query = quote_plus(f"{stock_name_ar} البورصة المصرية")
     headlines: List[str] = []
     try:
-        resp = requests.get(NEWS_RSS_URL.format(query=query), timeout=15)
+        resp = requests.get(NEWS_RSS_URL.format(query=query), timeout=10)
         resp.raise_for_status()
         feed = feedparser.parse(resp.content)
         for entry in feed.entries[:NEWS_HEADLINES_COUNT]:

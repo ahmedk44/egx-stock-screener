@@ -35,10 +35,18 @@ jobs:
       - name: Run EGX screener
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_CHANNEL_NEWS: ${{ secrets.TELEGRAM_CHANNEL_NEWS }}
+          TELEGRAM_CHANNEL_SCALP: ${{ secrets.TELEGRAM_CHANNEL_SCALP }}
+          TELEGRAM_CHANNEL_SWING: ${{ secrets.TELEGRAM_CHANNEL_SWING }}
+          TELEGRAM_CHANNEL_INVEST: ${{ secrets.TELEGRAM_CHANNEL_INVEST }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          TELEGRAM_CHAT_ID_NEWS: ${{ secrets.TELEGRAM_CHAT_ID_NEWS }}
           CHANNEL_SCALPING: ${{ secrets.CHANNEL_SCALPING }}
           CHANNEL_SWING: ${{ secrets.CHANNEL_SWING }}
           CHANNEL_INVESTMENT: ${{ secrets.CHANNEL_INVESTMENT }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: python main.py
 
       - name: Persist Active Positions State
