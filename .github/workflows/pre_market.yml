@@ -2,7 +2,7 @@ name: Pre-Market News Scan
 
 on:
   schedule:
-    # Every day, Sun-Thu (0-4), 06:30 UTC = 08:30 Cairo time
+    # Every day, Sun-Thu (0-4), 06:30 UTC = 09:30 Cairo time
     - cron: "30 6 * * 0-4"
   workflow_dispatch:
 

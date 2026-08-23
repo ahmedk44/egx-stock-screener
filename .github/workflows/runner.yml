@@ -2,8 +2,8 @@ name: EGX Stock Screener
 
 on:
   schedule:
-    # Every 15 min, Sun-Thu (0-4), 08:00-13:00 UTC (10:00-15:00 Cairo time)
-    - cron: "*/15 8-13 * * 0-4"
+    # Every 15 min, Sun-Thu (0-4), 07:00-11:30 UTC (10:00-14:30 Cairo time)
+    - cron: "*/15 7-11 * * 0-4"
   workflow_dispatch:
 
 permissions:

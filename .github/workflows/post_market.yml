@@ -2,8 +2,8 @@ name: Post-Market News Scan
 
 on:
   schedule:
-    # Every day, Sun-Thu (0-4), 13:00 UTC = 15:00 Cairo time
-    - cron: "0 15 * * 0-4"
+    # Every day, Sun-Thu (0-4), 11:35 UTC = 14:35 Cairo time (02:35 PM Cairo)
+    - cron: "35 11 * * 0-4"
   workflow_dispatch:
 
 permissions:

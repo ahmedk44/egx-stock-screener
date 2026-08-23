@@ -25,9 +25,14 @@ import logging
 import os
 import re
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 from typing import Any, Dict, List, Optional, Set
 from urllib.parse import quote_plus
+
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    ZoneInfo = None  # fallback to fixed UTC+3
 
 import feedparser
 import pandas as pd
@@ -274,6 +279,86 @@ def check_required_env() -> None:
 def now_utc() -> datetime:
     """Current UTC timestamp (timezone-aware)."""
     return datetime.now(timezone.utc)
+
+
+def now_cairo() -> datetime:
+    """Current time in Africa/Cairo timezone (UTC+2/UTC+3 with DST)."""
+    try:
+        if ZoneInfo is not None:
+            return datetime.now(ZoneInfo("Africa/Cairo"))
+        # Fallback: fixed UTC+3 as per EGX spec (Cairo Time is UTC+3)
+        return datetime.now(timezone(timedelta(hours=3)))
+    except Exception:
+        return datetime.now(timezone(timedelta(hours=3)))
+
+
+def is_market_open(now: Optional[datetime] = None) -> bool:
+    """Check if EGX is open. Sunday-Thu 10:00-14:30 Africa/Cairo.
+
+    Ensures:
+      - Time zone uses Africa/Cairo (ZoneInfo fallback UTC+3)
+      - Sunday explicitly valid (weekday==6 / isoweekday==7)
+      - Strict 10:00-14:30 Cairo window
+    """
+    try:
+        cairo_now = now
+        if cairo_now is None:
+            cairo_now = now_cairo()
+        else:
+            # Ensure provided datetime is converted to Cairo tz
+            try:
+                if ZoneInfo is not None:
+                    cairo_tz = ZoneInfo("Africa/Cairo")
+                    if cairo_now.tzinfo is None:
+                        cairo_now = cairo_now.replace(tzinfo=timezone.utc).astimezone(cairo_tz)
+                    else:
+                        cairo_now = cairo_now.astimezone(cairo_tz)
+                else:
+                    # Fallback UTC+3
+                    cairo_tz = timezone(timedelta(hours=3))
+                    if cairo_now.tzinfo is None:
+                        cairo_now = cairo_now.replace(tzinfo=timezone.utc).astimezone(cairo_tz)
+                    else:
+                        cairo_now = cairo_now.astimezone(cairo_tz)
+            except Exception:
+                # If conversion fails, assume already Cairo
+                pass
+
+        # EGX trading days: Sunday (weekday 6, isoweekday 7) through Thursday (weekday 3, isoweekday 4)
+        # Explicit Sunday check as required
+        weekday = cairo_now.weekday()  # 0 Mon ... 6 Sun
+        isoweekday = cairo_now.isoweekday()  # 1 Mon ... 7 Sun
+        is_sunday = (weekday == 6) or (isoweekday == 7)
+        # Alternative explicit set for Sun-Thu
+        trading_weekdays = {6, 0, 1, 2, 3}  # Sun, Mon, Tue, Wed, Thu
+        trading_isoweekdays = {7, 1, 2, 3, 4}
+        if weekday not in trading_weekdays and isoweekday not in trading_isoweekdays:
+            # Also explicitly ensure Sunday is considered (redundant but required)
+            if not is_sunday:
+                return False
+            # If is_sunday True but not in set (should not happen), allow
+        # Double-check Sunday explicitly
+        if is_sunday:
+            # Sunday is valid, continue to time check
+            pass
+        elif weekday not in {0, 1, 2, 3} and not is_sunday:
+            # Mon-Thu are 0-3, Sun is 6; Fri(4) Sat(5) are closed
+            if weekday in (4, 5):
+                return False
+
+        # Strict trading hours: 10:00 AM to 02:30 PM Cairo
+        market_open = time(10, 0)
+        market_close = time(14, 30)
+        current_time = cairo_now.time()
+        # Strict check: >=10:00 and <=14:30 (inclusive start, inclusive end for 14:30:00)
+        # Use <= for 14:30:00, but >14:30:00 is closed
+        if current_time < market_open or current_time > market_close:
+            return False
+        # Also ensure not before 10:00:00 and not after 14:30:00
+        return True
+    except Exception as exc:
+        logger.warning("is_market_open check failed: %s", exc)
+        return False
 
 
 def load_state(path: str = STATE_FILE) -> Dict[str, Any]:
