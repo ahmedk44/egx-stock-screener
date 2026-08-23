@@ -25,7 +25,9 @@ import logging
 import os
 import re
 import sys
-from datetime import datetime, time, timedelta, timezone
+import time
+from datetime import datetime, timedelta, timezone
+from datetime import time as dt_time
 from typing import Any, Dict, List, Optional, Set
 from urllib.parse import quote_plus
 
@@ -347,8 +349,8 @@ def is_market_open(now: Optional[datetime] = None) -> bool:
                 return False
 
         # Strict trading hours: 10:00 AM to 02:30 PM Cairo
-        market_open = time(10, 0)
-        market_close = time(14, 30)
+        market_open = dt_time(10, 0)
+        market_close = dt_time(14, 30)
         current_time = cairo_now.time()
         # Strict check: >=10:00 and <=14:30 (inclusive start, inclusive end for 14:30:00)
         # Use <= for 14:30:00, but >14:30:00 is closed
@@ -552,6 +554,95 @@ def save_active_positions(positions: List[Dict[str, Any]], path: str = ACTIVE_PO
         logger.warning("Failed to write %s: %s", path, exc)
     except Exception as exc:
         logger.warning("Unexpected error saving %s: %s", path, exc)
+
+
+def sync_active_positions_to_supabase(path: str = ACTIVE_POSITIONS_FILE) -> int:
+    """Auto-sync local active_positions.json to Supabase table active_positions.
+
+    Takes all trades inside active_positions.json and upserts them directly
+    into Supabase table active_positions on every run. Wraps Supabase
+    insertion in try...except and prints success/error logs.
+
+    Returns number of positions synced. Never raises.
+    """
+    if not _is_supabase_configured():
+        logger.info("Supabase not configured; skipping sync (using local JSON)")
+        return 0
+    # Force load from local JSON file (not Supabase) to get source of truth
+    local_positions: List[Dict[str, Any]] = []
+    try:
+        if not os.path.exists(path):
+            logger.info("No %s found to sync; nothing to do", path)
+            return 0
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, list):
+            local_positions = data
+        elif isinstance(data, dict):
+            for k in ("positions", "active_positions", "data"):
+                if k in data and isinstance(data[k], list):
+                    local_positions = data[k]
+                    break
+        if not isinstance(local_positions, list):
+            local_positions = []
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        logger.warning("Failed to read %s for sync (%s)", path, exc)
+        print(f"[SYNC ERROR] Failed to read {path}: {exc}")
+        return 0
+    except Exception as exc:
+        logger.warning("Unexpected error reading %s for sync (%s)", path, exc)
+        print(f"[SYNC ERROR] Unexpected read error: {exc}")
+        return 0
+
+    if not local_positions:
+        logger.info("No local positions to sync to Supabase")
+        print("[SYNC] No local positions to sync")
+        return 0
+
+    url = _supabase_table_url()
+    headers = _supabase_headers()
+    if not url or not headers:
+        logger.warning("Supabase URL/headers missing; cannot sync")
+        print("[SYNC ERROR] Supabase URL/headers missing")
+        return 0
+
+    synced = 0
+    failed = 0
+    # Prepare headers for upsert
+    headers_upsert = dict(headers)
+    headers_upsert["Prefer"] = "resolution=merge-duplicates, return=representation"
+    for pos in local_positions:
+        try:
+            if not isinstance(pos, dict):
+                continue
+            # Validate required fields
+            ticker = pos.get("ticker")
+            if not ticker:
+                continue
+            # Ensure status is present
+            if not pos.get("status"):
+                pos["status"] = "PENDING"
+            # Upsert via POST with on_conflict
+            resp = requests.post(f"{url}?on_conflict=ticker,trade_track", json=pos, headers=headers_upsert, timeout=15)
+            if resp.status_code in (200, 201, 204):
+                synced += 1
+                logger.info("[SYNC] Upserted %s (%s) to Supabase", pos.get("ticker"), pos.get("status"))
+            else:
+                failed += 1
+                logger.warning("Supabase sync failed for %s (%s %s)", pos.get("ticker"), resp.status_code, resp.text[:200] if resp.text else "")
+                print(f"[SYNC ERROR] Failed for {pos.get('ticker')}: {resp.status_code} {resp.text[:200] if resp.text else ''}")
+        except requests.exceptions.RequestException as exc:
+            failed += 1
+            logger.warning("Supabase sync request failed for %s: %s", pos.get("ticker", "unknown"), exc)
+            print(f"[SYNC ERROR] Request failed for {pos.get('ticker')}: {exc}")
+        except Exception as exc:
+            failed += 1
+            logger.warning("Supabase sync failed for %s: %s", pos.get("ticker", "unknown"), exc)
+            print(f"[SYNC ERROR] Unexpected for {pos.get('ticker')}: {exc}")
+
+    print(f"[SYNC] Completed: {synced} synced, {failed} failed out of {len(local_positions)} local positions")
+    logger.info("Sync completed: %d synced, %d failed", synced, failed)
+    return synced
 
 
 def update_position_status(ticker: str, status: str, path: str = ACTIVE_POSITIONS_FILE) -> bool:
@@ -1149,15 +1240,52 @@ def handle_telegram_callback(
 
         if action == "act":
             popup_text = "✅ تم تفعيل المراقبة بنجاح!"
-            # Supabase path: update status to ACTIVE
+            # Supabase path: update status to ACTIVE + direct upsert to ensure persistence
             if supabase_used:
                 try:
-                    # Try Supabase update; fallback to file if fails
                     success = update_position_status(ticker, "ACTIVE", path=path)
-                    # update_position_status already handles fallback, but we check result
                     if success:
                         _do_answer(popup_text)
                         return f"Activated {ticker} (Supabase)"
+                    # If update failed (e.g., row not in Supabase), try direct upsert from local JSON
+                    try:
+                        positions = load_active_positions(path)
+                        # Force file load for direct upsert
+                        if not positions:
+                            try:
+                                if os.path.exists(path):
+                                    with open(path, "r", encoding="utf-8") as fh:
+                                        file_data = json.load(fh)
+                                        if isinstance(file_data, list):
+                                            positions = file_data
+                            except Exception:
+                                pass
+                        for pos in positions:
+                            if str(pos.get("ticker", "")).strip() in ticker_variants:
+                                pos_copy = dict(pos)
+                                pos_copy["status"] = "ACTIVE"
+                                pos_copy["timestamp"] = pos_copy.get("timestamp") or now_utc().isoformat()
+                                url = _supabase_table_url()
+                                headers = _supabase_headers()
+                                if url and headers:
+                                    headers_upsert = dict(headers)
+                                    headers_upsert["Prefer"] = "resolution=merge-duplicates, return=representation"
+                                    resp = requests.post(f"{url}?on_conflict=ticker,trade_track", json=pos_copy, headers=headers_upsert, timeout=15)
+                                    if resp.status_code in (200, 201, 204):
+                                        logger.info("[Supabase] Direct upsert for act %s", ticker)
+                                        _do_answer(popup_text)
+                                        # Also update local JSON to ACTIVE
+                                        try:
+                                            for p in positions:
+                                                if str(p.get("ticker", "")).strip() in ticker_variants and p.get("status") == "PENDING":
+                                                    p["status"] = "ACTIVE"
+                                            save_active_positions(positions, path)
+                                        except Exception:
+                                            pass
+                                        return f"Activated {ticker} (Supabase upsert)"
+                                break
+                    except Exception as upsert_exc:
+                        logger.warning("Direct Supabase upsert for act failed for %s: %s", ticker, upsert_exc)
                 except Exception as exc:
                     logger.warning("Supabase act failed for %s: %s; falling back to JSON", ticker, exc)
             # Local JSON fallback: PENDING -> ACTIVE
@@ -1220,34 +1348,37 @@ def handle_telegram_callback(
             popup_text = "❌ تم إلغاء متابعة الصفقة."
             if supabase_used:
                 try:
-                    # Prefer update to DISMISSED in Supabase
                     success = update_position_status(ticker, "DISMISSED", path=path)
                     if success:
-                        # Also try to delete from Supabase for clean removal (optional)
-                        try:
-                            url = _supabase_table_url()
-                            headers = _supabase_headers()
-                            if url and headers:
-                                # Delete via Supabase REST: DELETE with ticker filter
-                                # Use DISMISSED status already set, but also try delete
-                                # We'll keep DISMISSED status; delete is optional
-                                pass
-                        except Exception:
-                            pass
                         _do_answer(popup_text)
                         return f"Dismissed {ticker} (Supabase DISMISSED)"
-                    else:
-                        # Fallback to try delete directly
-                        try:
-                            url = _supabase_table_url()
-                            headers = _supabase_headers()
-                            if url and headers:
-                                resp = requests.delete(url, params={"ticker": f"eq.{ticker}"}, headers=headers, timeout=15)
-                                if resp.status_code in (200, 204):
-                                    _do_answer(popup_text)
-                                    return f"Dismissed {ticker} (Supabase deleted)"
-                        except Exception:
-                            pass
+                    # If update failed (row not found), try direct delete or upsert as DISMISSED
+                    try:
+                        url = _supabase_table_url()
+                        headers = _supabase_headers()
+                        if url and headers:
+                            resp = requests.delete(url, params={"ticker": f"eq.{ticker}"}, headers=headers, timeout=15)
+                            if resp.status_code in (200, 204):
+                                _do_answer(popup_text)
+                                return f"Dismissed {ticker} (Supabase deleted)"
+                            # If delete also fails, try upsert as DISMISSED from local JSON
+                            try:
+                                positions = load_active_positions(path)
+                                for pos in positions:
+                                    if str(pos.get("ticker", "")).strip() in ticker_variants:
+                                        pos_copy = dict(pos)
+                                        pos_copy["status"] = "DISMISSED"
+                                        headers_upsert = dict(headers)
+                                        headers_upsert["Prefer"] = "resolution=merge-duplicates, return=representation"
+                                        resp2 = requests.post(f"{url}?on_conflict=ticker,trade_track", json=pos_copy, headers=headers_upsert, timeout=15)
+                                        if resp2.status_code in (200, 201, 204):
+                                            _do_answer(popup_text)
+                                            return f"Dismissed {ticker} (Supabase upsert DISMISSED)"
+                                        break
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
                 except Exception as exc:
                     logger.warning("Supabase dis failed for %s: %s; falling back to JSON", ticker, exc)
             # Local JSON fallback: remove position(s)
@@ -1293,6 +1424,36 @@ def handle_telegram_callback(
                     if success:
                         _do_answer(popup_text)
                         return f"Closed {ticker} (Supabase)"
+                    # If update failed (row not in Supabase), try direct upsert from local JSON as CLOSED
+                    try:
+                        positions = load_active_positions(path)
+                        if not positions:
+                            try:
+                                if os.path.exists(path):
+                                    with open(path, "r", encoding="utf-8") as fh:
+                                        file_data = json.load(fh)
+                                        if isinstance(file_data, list):
+                                            positions = file_data
+                            except Exception:
+                                pass
+                        for pos in positions:
+                            if str(pos.get("ticker", "")).strip() in ticker_variants:
+                                pos_copy = dict(pos)
+                                pos_copy["status"] = "CLOSED"
+                                pos_copy["closed_at"] = now_utc().isoformat()
+                                pos_copy["close_reason"] = "manual"
+                                url = _supabase_table_url()
+                                headers = _supabase_headers()
+                                if url and headers:
+                                    headers_upsert = dict(headers)
+                                    headers_upsert["Prefer"] = "resolution=merge-duplicates, return=representation"
+                                    resp = requests.post(f"{url}?on_conflict=ticker,trade_track", json=pos_copy, headers=headers_upsert, timeout=15)
+                                    if resp.status_code in (200, 201, 204):
+                                        _do_answer(popup_text)
+                                        return f"Closed {ticker} (Supabase upsert)"
+                                break
+                    except Exception as upsert_exc:
+                        logger.warning("Direct Supabase upsert for cls failed for %s: %s", ticker, upsert_exc)
                 except Exception as exc:
                     logger.warning("Supabase cls failed for %s: %s; falling back", ticker, exc)
             # Local JSON fallback
@@ -1883,6 +2044,133 @@ def _answer_callback_query(callback_query_id: str, text: str, bot_token: Optiona
     except Exception as exc:
         logger.warning("Unexpected error answering callback query %s: %s", callback_query_id, exc)
         return False
+
+
+def listen_telegram(poll_interval: int = 2, timeout: int = 30) -> None:
+    """Standalone bot listener for Telegram callback queries (real-time).
+
+    Polls Telegram getUpdates API continuously to catch inline button clicks
+    (act_/dis_/cls_) and handles them via handle_telegram_callback.
+    Supports both python-telegram-bot polling and raw requests polling.
+    Run via: python main.py --listen-telegram
+    """
+    bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    if not bot_token:
+        logger.error("TELEGRAM_BOT_TOKEN not set; cannot start Telegram listener")
+        print("ERROR: TELEGRAM_BOT_TOKEN not set")
+        return
+    # Try python-telegram-bot if available (optional)
+    try:
+        # Attempt to use python-telegram-bot library if installed
+        try:
+            from telegram import Update
+            from telegram.ext import Application, CallbackQueryHandler, ContextTypes
+
+            logger.info("Using python-telegram-bot for polling")
+
+            async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+                try:
+                    query = update.callback_query
+                    if query and query.data:
+                        data = query.data
+                        qid = query.id
+                        result = handle_telegram_callback(data, callback_query_id=qid, bot_token=bot_token)
+                        # Answer is already done inside handle_telegram_callback via _answer_callback_query
+                        # But ensure we answer with popup if not already
+                        try:
+                            await query.answer(text="تم التحديث", show_alert=False)
+                        except Exception:
+                            pass
+                        logger.info("Handled callback %s -> %s", data, result)
+                except Exception as exc:
+                    logger.warning("Callback handler error: %s", exc)
+
+            # Build and run application
+            import asyncio
+
+            async def run_bot():
+                app = Application.builder().token(bot_token).build()
+                app.add_handler(CallbackQueryHandler(callback_handler))
+                logger.info("Telegram bot listening via python-telegram-bot polling...")
+                print("Listening for Telegram callbacks (python-telegram-bot)... Press Ctrl+C to stop")
+                await app.run_polling(allowed_updates=["callback_query"], close_loop=False)
+
+            # Run asyncio loop
+            try:
+                import asyncio
+                asyncio.run(run_bot())
+            except RuntimeError:
+                # If already in event loop (e.g., Jupyter), create new loop
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(run_bot())
+            return
+        except ImportError:
+            logger.info("python-telegram-bot not installed, falling back to raw requests polling")
+    except Exception as exc:
+        logger.warning("python-telegram-bot setup failed (%s), falling back to raw polling", exc)
+
+    # Fallback: raw requests polling via getUpdates
+    logger.info("Starting Telegram listener via raw getUpdates polling...")
+    print("Listening for Telegram callbacks (raw polling)... Press Ctrl+C to stop")
+    offset = 0
+    # Ensure active positions are synced before listening
+    try:
+        sync_active_positions_to_supabase()
+    except Exception:
+        pass
+    while True:
+        try:
+            resp = requests.get(
+                f"https://api.telegram.org/bot{bot_token}/getUpdates",
+                params={"offset": offset, "timeout": timeout, "allowed_updates": '["callback_query"]'},
+                timeout=timeout + 5,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            if not data.get("ok"):
+                logger.warning("getUpdates returned not ok: %s", data)
+                time.sleep(poll_interval)
+                continue
+            results = data.get("result", [])
+            if not results:
+                time.sleep(poll_interval)
+                continue
+            for update in results:
+                try:
+                    offset = int(update.get("update_id", 0)) + 1
+                except Exception:
+                    offset += 1
+                query = update.get("callback_query")
+                if not query:
+                    continue
+                callback_data = query.get("data")
+                callback_id = query.get("id")
+                from_user = query.get("from", {}).get("username", "unknown")
+                logger.info("Received callback %s from %s", callback_data, from_user)
+                if callback_data:
+                    try:
+                        result = handle_telegram_callback(callback_data, callback_query_id=callback_id, bot_token=bot_token)
+                        logger.info("Handled callback %s -> %s", callback_data, result)
+                    except Exception as exc:
+                        logger.warning("Failed to handle callback %s: %s", callback_data, exc)
+                        # Try to answer with error popup
+                        try:
+                            _answer_callback_query(callback_id, "حدث خطأ أثناء المعالجة", bot_token)
+                        except Exception:
+                            pass
+            # Small delay to avoid hammering
+            time.sleep(poll_interval)
+        except KeyboardInterrupt:
+            logger.info("Telegram listener stopped by user")
+            print("\nListener stopped")
+            break
+        except requests.exceptions.RequestException as exc:
+            logger.warning("Telegram polling request failed: %s", exc)
+            time.sleep(5)
+        except Exception as exc:
+            logger.warning("Telegram listener error: %s", exc)
+            time.sleep(5)
 
 
 def fmt(value: Optional[float], digits: int = 2) -> str:
@@ -2876,8 +3164,34 @@ def parse_mode(argv: Optional[List[str]] = None) -> str:
         default=INTRADAY,
         help="Execution mode (default: intraday).",
     )
+    parser.add_argument(
+        "--listen-telegram",
+        action="store_true",
+        help="Run Telegram callback listener continuously (polling) to catch inline button clicks in real-time",
+    )
+    # Also support --listen as alias
+    parser.add_argument(
+        "--listen",
+        action="store_true",
+        help="Alias for --listen-telegram",
+    )
     args, _ = parser.parse_known_args(argv)
     return args.mode
+
+
+def should_listen_telegram(argv: Optional[List[str]] = None) -> bool:
+    """Check if --listen-telegram flag is present."""
+    try:
+        parser = argparse.ArgumentParser(add_help=False)
+        parser.add_argument("--listen-telegram", action="store_true")
+        parser.add_argument("--listen", action="store_true")
+        # Also check --mode parsing to avoid unknown args
+        args, _ = parser.parse_known_args(argv)
+        return bool(getattr(args, "listen_telegram", False) or getattr(args, "listen", False))
+    except Exception:
+        # Fallback to raw argv check
+        check_argv = argv if argv is not None else sys.argv
+        return "--listen-telegram" in check_argv or "--listen" in check_argv
 
 
 NONEWS_FALLBACK_PHRASES: List[str] = ["لا توجد أخبار", "المؤشرات الفنية فقط"]
@@ -3019,7 +3333,25 @@ def run_news_watchlist(mode: str) -> int:
 
 
 def main() -> int:
-    """Run the chosen execution mode (intraday scan or off-hours news watchlist)."""
+    """Run the chosen execution mode (intraday scan or off-hours news watchlist).
+
+    Supports --listen-telegram flag for standalone bot listener (polling).
+    Also auto-syncs local JSON to Supabase on every run.
+    """
+    # Standalone bot listener support: check flag before env checks
+    try:
+        if should_listen_telegram():
+            logger.info("Starting Telegram listener mode (--listen-telegram)")
+            # Ensure sync before listening
+            try:
+                sync_active_positions_to_supabase()
+            except Exception as exc:
+                logger.warning("Initial sync failed: %s", exc)
+            listen_telegram()
+            return 0
+    except Exception as exc:
+        logger.warning("Listener check failed: %s", exc)
+
     check_required_env()
     # Ensure active_positions.json exists for workflow auto-commit (git add will fail if missing)
     try:
@@ -3027,6 +3359,14 @@ def main() -> int:
             save_active_positions([], ACTIVE_POSITIONS_FILE)
     except Exception:
         pass
+    # Auto-sync local JSON to Supabase on every run (fixes GitHub Actions exit issue)
+    try:
+        logger.info("Syncing local active positions to Supabase...")
+        synced = sync_active_positions_to_supabase()
+        print(f"[SYNC] Synced {synced} positions to Supabase (or 0 if no Supabase/empty)")
+    except Exception as exc:
+        logger.warning("Sync to Supabase failed: %s", exc)
+        print(f"[SYNC ERROR] {exc}")
     mode = parse_mode()
     if mode in (PRE_MARKET, POST_MARKET):
         logger.info("Running off-hours news scan in %s mode.", mode)
