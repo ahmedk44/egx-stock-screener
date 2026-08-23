@@ -1312,6 +1312,167 @@ def crossed_above_ema20(df: pd.DataFrame) -> bool:
 
 
 # --------------------------------------------------------------------------
+# Synthetic Order Flow & Delta Estimation (emulates Footprint/Market Depth)
+# --------------------------------------------------------------------------
+
+
+def calculate_synthetic_delta(df_1m: Any) -> Dict[str, Any]:
+    """Estimate order flow delta synthetically for free.
+
+    For each 1m candle:
+        Estimated Buy Volume = Volume * ((Close - Low) / (High - Low + 1e-6))
+        Delta = Buy - Sell (sell = Volume - buy)
+
+    Then:
+        - Cumulative Delta for last 5 candles
+        - Bullish pressure: cumulative >0 and growing (last delta > prev)
+        - Absorption: High RVOL (>1.5x avg) + Small Spread (<0.3%)
+
+    Handles MultiIndex columns, NaNs, and short frames gracefully.
+    Returns dict with cumulative_delta_5, is_bullish_pressure, is_absorption, deltas, last_buy_ratio.
+    Never raises.
+    """
+    try:
+        if df_1m is None:
+            return {"cumulative_delta_5": 0.0, "is_bullish_pressure": False, "is_absorption": False, "deltas": [], "last_buy_ratio": 0.5}
+        # Handle DataFrame with MultiIndex columns (yfinance)
+        try:
+            if hasattr(df_1m, "columns"):
+                cols = [c[0] if isinstance(c, tuple) else c for c in df_1m.columns]
+                if len(cols) == len(df_1m.columns):
+                    df_1m = df_1m.copy()
+                    df_1m.columns = cols
+        except Exception:
+            pass
+
+        if not isinstance(df_1m, pd.DataFrame) or df_1m.empty or len(df_1m) < 3:
+            return {"cumulative_delta_5": 0.0, "is_bullish_pressure": False, "is_absorption": False, "deltas": [], "last_buy_ratio": 0.5}
+
+        required = {"High", "Low", "Close", "Volume"}
+        if not required.issubset(set(df_1m.columns)):
+            return {"cumulative_delta_5": 0.0, "is_bullish_pressure": False, "is_absorption": False, "deltas": [], "last_buy_ratio": 0.5}
+
+        # Drop rows with NaNs in critical columns
+        sub = df_1m[["High", "Low", "Close", "Volume"]].dropna()
+        if len(sub) < 3:
+            return {"cumulative_delta_5": 0.0, "is_bullish_pressure": False, "is_absorption": False, "deltas": [], "last_buy_ratio": 0.5}
+
+        highs = sub["High"].astype(float)
+        lows = sub["Low"].astype(float)
+        closes = sub["Close"].astype(float)
+        volumes = sub["Volume"].astype(float)
+
+        denom = (highs - lows)
+        # Handle doji (High==Low) as neutral 0.5 to avoid division bias
+        buy_ratio = pd.Series(0.5, index=highs.index, dtype=float)
+        mask = denom.abs() > 1e-6
+        # Only compute where denom is meaningful
+        buy_ratio[mask] = (closes[mask] - lows[mask]) / denom[mask]
+        # Clamp 0-1 to avoid outlier due to wicks
+        buy_ratio = buy_ratio.clip(0, 1)
+        est_buy_vol = volumes * buy_ratio
+        est_sell_vol = volumes - est_buy_vol
+        deltas = (est_buy_vol - est_sell_vol).tolist()
+
+        # Take last 5 deltas (or fewer if short)
+        last_5 = deltas[-5:] if len(deltas) >= 5 else deltas
+        cumulative_delta_5 = float(sum(last_5))
+
+        # Bullish pressure: cumulative >0 and growing
+        is_bullish_pressure = False
+        try:
+            if cumulative_delta_5 > 0 and len(deltas) >= 2:
+                # Growing if last delta > previous delta
+                if deltas[-1] > deltas[-2]:
+                    is_bullish_pressure = True
+                # Or last 3 trend up: last > first in last 5
+                elif len(last_5) >= 3 and last_5[-1] > last_5[0]:
+                    # Check cumulative is not just slightly positive but increasing
+                    prev_cum = float(sum(deltas[-6:-1])) if len(deltas) >= 6 else 0
+                    if cumulative_delta_5 > prev_cum:
+                        is_bullish_pressure = True
+        except Exception:
+            pass
+
+        # Absorption: High RVOL + Small Spread
+        is_absorption = False
+        try:
+            # RVOL: compare last volume to 20-period average (or 5 if short)
+            window = 20 if len(volumes) >= 20 else 5
+            vol_avg = volumes.rolling(window, min_periods=3).mean().iloc[-1] if len(volumes) >= 3 else volumes.mean()
+            last_vol = float(volumes.iloc[-1])
+            last_high = float(highs.iloc[-1])
+            last_low = float(lows.iloc[-1])
+            last_close = float(closes.iloc[-1])
+            spread = (last_high - last_low) / (last_close + 1e-6)
+            # High RVOL >1.5x
+            high_rvol = False
+            if vol_avg is not None and not pd.isna(vol_avg) and vol_avg > 0:
+                high_rvol = last_vol > 1.5 * float(vol_avg)
+            # Small spread <0.3% (0.003) for 1m
+            small_spread = spread < 0.003
+            if high_rvol and small_spread:
+                is_absorption = True
+            # Also check last 3 candles: high vol but small price progress
+            if not is_absorption and len(sub) >= 3:
+                recent_vols = volumes.tail(3)
+                recent_spreads = (highs.tail(3) - lows.tail(3)) / (closes.tail(3) + 1e-6)
+                recent_avg = recent_vols.mean()
+                if recent_avg > 1.3 * float(vol_avg) if vol_avg else False:
+                    if (recent_spreads < 0.004).all():
+                        is_absorption = True
+        except Exception:
+            pass
+
+        return {
+            "cumulative_delta_5": cumulative_delta_5,
+            "is_bullish_pressure": bool(is_bullish_pressure),
+            "is_absorption": bool(is_absorption),
+            "deltas": last_5,
+            "last_buy_ratio": float(buy_ratio.iloc[-1]) if len(buy_ratio) > 0 else 0.5,
+        }
+    except Exception as exc:
+        logger.warning("calculate_synthetic_delta failed: %s", exc)
+        return {"cumulative_delta_5": 0.0, "is_bullish_pressure": False, "is_absorption": False, "deltas": [], "last_buy_ratio": 0.5}
+
+
+def _is_near_support(price: Optional[float], df: Optional[pd.DataFrame] = None, df_1m: Optional[pd.DataFrame] = None) -> bool:
+    """Check if price is near support (low of recent range or SMA)."""
+    try:
+        if price is None:
+            return False
+        price_f = float(price)
+        # Check vs recent 1m lows if available
+        if df_1m is not None and isinstance(df_1m, pd.DataFrame) and not df_1m.empty:
+            try:
+                cols = [c[0] if isinstance(c, tuple) else c for c in df_1m.columns]
+                tmp = df_1m.copy()
+                tmp.columns = cols
+                if "Low" in tmp.columns:
+                    recent_low = float(tmp["Low"].tail(10).min())
+                    if recent_low and price_f <= recent_low * 1.01:  # within 1% of recent low
+                        return True
+            except Exception:
+                pass
+        # Check vs daily SMA50 or recent daily low
+        if df is not None and isinstance(df, pd.DataFrame) and not df.empty and "Low" in df.columns:
+            try:
+                recent_low_d = float(df["Low"].tail(10).min())
+                if recent_low_d and price_f <= recent_low_d * 1.015:
+                    return True
+                # Also vs SMA50
+                if "SMA50" in df.columns:
+                    sma = latest(df, "SMA50")
+                    if sma is not None and price_f <= sma * 1.02 and price_f >= sma * 0.98:
+                        return True
+            except Exception:
+                pass
+        return False
+    except Exception:
+        return False
+
+
+# --------------------------------------------------------------------------
 # News + sentiment (Google News RSS -> Gemini)
 # --------------------------------------------------------------------------
 
@@ -2090,6 +2251,44 @@ def compute_fallback_tqi(ctx: Any, strategy: Any, sentiment: Any) -> float:
                 news_score = 0.3
 
         total = tech_score + rr_score + vol_score + sector_score + news_score
+
+        # Synthetic Order Flow & Delta Boosts (free footprint emulation)
+        try:
+            # Bullish pressure: 5m cumulative delta positive and growing
+            bullish = False
+            try:
+                bullish = bool(ctx.get("is_bullish_pressure") or ctx.get("synthetic_bullish_pressure"))
+            except Exception:
+                bullish = False
+            if bullish:
+                total += 0.5
+                logger.info("TQI synthetic boost +0.5 for bullish pressure (delta >0 & growing)")
+
+            # Absorption near support: High RVOL + Small Spread + near support
+            absorption = False
+            near_support_flag = False
+            try:
+                absorption = bool(ctx.get("is_absorption") or ctx.get("synthetic_absorption"))
+                near_support_flag = bool(ctx.get("near_support") or ctx.get("is_near_support"))
+                # If near_support not in ctx, try to infer from price/support proximity if available
+                if absorption and not near_support_flag:
+                    # Fallback: check if ctx has price and absorption implies near support handling
+                    # For now, if absorption true and price available, consider near support if not explicitly false
+                    # Keep as is - require explicit near_support to avoid over-boosting
+                    pass
+            except Exception:
+                absorption = False
+                near_support_flag = False
+            if absorption and near_support_flag:
+                total += 0.5
+                logger.info("TQI synthetic boost +0.5 for volume absorption near support (institutional buying)")
+            elif absorption and ctx.get("is_absorption") and _is_near_support(ctx.get("price"), None, ctx.get("df_1m")):
+                # Fallback check using helper if near_support not set but df_1m available
+                total += 0.5
+                logger.info("TQI synthetic boost +0.5 for absorption near support (helper check)")
+        except Exception:
+            pass
+
         return max(0.0, min(10.0, round(float(total), 1)))
     except Exception as exc:
         logger.warning("compute_fallback_tqi failed (%s); returning default 5.0", exc)
@@ -2395,6 +2594,65 @@ def process_ticker(ticker: str, state: Dict[str, Any]) -> None:
         avg_vol = latest(ind, "VolMA20")
         if current_vol is not None and avg_vol:
             ctx["volume_ratio"] = current_vol / avg_vol
+
+    # Synthetic Order Flow: 1m delta emulation (free footprint) - for TQI boost
+    try:
+        df_1m = None
+        try:
+            # Fetch 1m intraday (last 5d, yfinance limits 1m to 7d)
+            raw_1m = yf.download(
+                ticker,
+                period="5d",
+                interval="1m",
+                auto_adjust=True,
+                progress=False,
+                threads=False,
+            )
+            if raw_1m is not None and not raw_1m.empty:
+                df_1m = raw_1m.copy()
+                df_1m.columns = [col[0] if isinstance(col, tuple) else col for col in df_1m.columns]
+                # Filter to last trading day's 1m if too large, but keep all for calc
+                if len(df_1m) > 500:
+                    df_1m = df_1m.tail(500)
+        except Exception as exc:
+            logger.debug("[%s] 1m fetch failed for delta: %s", ticker, exc)
+            df_1m = None
+        # Fallback: if 1m not available, use daily df as proxy (will still compute delta but with daily granularity)
+        delta_src = df_1m if df_1m is not None and not df_1m.empty and len(df_1m) >= 3 else df
+        delta_info = calculate_synthetic_delta(delta_src)
+        # Store flags in ctx for TQI integration
+        ctx["df_1m"] = df_1m
+        ctx["cumulative_delta_5"] = delta_info.get("cumulative_delta_5", 0)
+        ctx["is_bullish_pressure"] = bool(delta_info.get("is_bullish_pressure", False))
+        ctx["is_absorption"] = bool(delta_info.get("is_absorption", False))
+        ctx["synthetic_bullish_pressure"] = bool(delta_info.get("is_bullish_pressure", False))
+        ctx["synthetic_absorption"] = bool(delta_info.get("is_absorption", False))
+        ctx["last_buy_ratio"] = delta_info.get("last_buy_ratio", 0.5)
+        try:
+            near_support = _is_near_support(ctx.get("price"), df, df_1m if df_1m is not None else df)
+            ctx["near_support"] = bool(near_support)
+            ctx["is_near_support"] = bool(near_support)
+        except Exception:
+            ctx["near_support"] = False
+            ctx["is_near_support"] = False
+        if delta_info.get("is_bullish_pressure") or delta_info.get("is_absorption"):
+            logger.info(
+                "[%s] Synthetic delta: cum=%.0f bullish=%s absorption=%s near_support=%s buy_ratio=%.2f",
+                ticker,
+                delta_info.get("cumulative_delta_5", 0),
+                delta_info.get("is_bullish_pressure"),
+                delta_info.get("is_absorption"),
+                ctx.get("near_support"),
+                delta_info.get("last_buy_ratio", 0.5),
+            )
+    except Exception as exc:
+        logger.warning("[%s] Synthetic delta calc failed: %s", ticker, exc)
+        # Ensure defaults to avoid TQI crash
+        ctx.setdefault("is_bullish_pressure", False)
+        ctx.setdefault("is_absorption", False)
+        ctx.setdefault("near_support", False)
+        ctx.setdefault("synthetic_bullish_pressure", False)
+        ctx.setdefault("synthetic_absorption", False)
 
     bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 
