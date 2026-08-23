@@ -229,7 +229,7 @@ STRATEGY_PLAN: Dict[str, Dict[str, Any]] = {
         "sl_pct": -0.06,
         "sl_condition_ar": "إغلاق يوم أسفل الدعم",
         "allocation_ar": "10% من رأس المال",
-        "duration_ar": "مضاربة متوسطة المدى (أيام إلى أسابيع)",
+        "duration_ar": "تداول سوينغ / متوسط المدى (أيام إلى أسابيع)",
         "technical_reason_ar": (
             "كسر السعر لأعلى المتوسط المتحرك EMA20 مع زخم إيجابي "
             "وارتفاع مؤشر القوة النسبية فوق مستوى 50"
@@ -240,7 +240,7 @@ STRATEGY_PLAN: Dict[str, Dict[str, Any]] = {
         "sl_pct": -0.08,
         "sl_condition_ar": "إغلاق يومين أسفل الدعم",
         "allocation_ar": "10% - 15% من رأس المال",
-        "duration_ar": "استثمار قصير إلى متوسط المدى (شهور)",
+        "duration_ar": "استثمار / طويل المدى (أسابيع إلى أشهر)",
         "technical_reason_ar": (
             "السعر دون المتوسط المتحرك SMA50 مع تسارع في التراكم "
             "ومضاعف ربحية جذاب وأسعار عند مستويات دعم قوية"
@@ -2573,11 +2573,20 @@ def build_message(strategy: Any, ticker: Any, ctx: Any, sentiment: Any) -> str:
         if not isinstance(conviction_label, str) or not conviction_label:
             conviction_label = get_conviction_tier(tqi_score_f)
 
-        # Safe plan text fields
+        # Safe plan text fields - duration dynamic per track
         technical_reason = plan.get("technical_reason_ar", "تحليل فني") if isinstance(plan, dict) else "تحليل فني"
         sl_condition = plan.get("sl_condition_ar", "إغلاق شمعة أسفل الدعم") if isinstance(plan, dict) else "إغلاق شمعة أسفل الدعم"
         allocation = plan.get("allocation_ar", "5% من رأس المال") if isinstance(plan, dict) else "5% من رأس المال"
-        duration = plan.get("duration_ar", "مضاربة") if isinstance(plan, dict) else "مضاربة"
+        # Make duration dynamic based on track (fixes hardcoded Scalp duration)
+        track_str_for_duration = str(track_label) if isinstance(track_label, str) else ""
+        if "Scalp" in track_str_for_duration or "مضاربة" in track_str_for_duration:
+            duration = "مضاربة لحظية / سريعة (داخل اليوم)"
+        elif "Swing" in track_str_for_duration or "سوينغ" in track_str_for_duration:
+            duration = "تداول سوينغ / متوسط المدى (أيام إلى أسابيع)"
+        elif "Invest" in track_str_for_duration or "استثمار" in track_str_for_duration:
+            duration = "استثمار / طويل المدى (أسابيع إلى أشهر)"
+        else:
+            duration = plan.get("duration_ar", "مضاربة") if isinstance(plan, dict) else "مضاربة"
 
         # Prepare macro section (only if indirect effect detected)
         macro_section = f"\n{macro_block}\n" if macro_block else ""
@@ -2602,7 +2611,7 @@ def build_message(strategy: Any, ticker: Any, ctx: Any, sentiment: Any) -> str:
             f"وقف الخسارة : {sl_condition} {stop_loss:.2f} ({sl_pct * 100:.1f}%) ⛔️\n"
             f"\n"
             f"نسبة الدخول من المحفظه : {allocation} 💵\n"
-            f"نوع الصفقة و مدتها : {duration} ⏳️\n"
+            f"نوع الصفقة ومدتها: {duration} ⏳️\n"
             f"معدل العائد إلى المخاطر (R:R) : 1 : {rr:.2f} ⚖️\n"
             f"\n"
             f"📈 [عرض الشارت المباشر على TradingView](https://ar.tradingview.com/symbols/EGX-{clean_ticker}/)\n"
