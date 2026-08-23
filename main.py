@@ -2935,13 +2935,60 @@ def run_news_watchlist(mode: str) -> int:
                 no_news.append(clean_ticker)
                 continue
             badge = SENTIMENT_BADGES.get(classification or "", "⚪")
+            # Enhanced pre-market formatting: cashtag, top-heavy metrics, macro
+            try:
+                tqi_score = extract_tqi_score(summary)
+            except Exception:
+                tqi_score = None
+            try:
+                track = extract_trade_track_from_text(summary)
+            except Exception:
+                track = None
+            try:
+                conviction = extract_conviction_from_text(summary)
+            except Exception:
+                conviction = None
+            try:
+                macro_block = build_macro_block(summary)
+            except Exception:
+                macro_block = ""
+            # Clean body from any leaked TQI/Track/Rating/Macro to avoid duplication with top-heavy metrics
+            try:
+                body_clean = body
+                if isinstance(body_clean, str):
+                    # Remove exact macro block if present in body
+                    if macro_block and macro_block in body_clean:
+                        body_clean = body_clean.replace(macro_block, "").strip()
+                    # Remove top-heavy metric lines if they leaked into body
+                    body_clean = re.sub(r"🎯\s*تقييم الجودة\s*\(TQI\)\s*:.*", "", body_clean).strip()
+                    body_clean = re.sub(r"🏷️\s*المسار\s*:.*", "", body_clean).strip()
+                    body_clean = re.sub(r"⭐\s*التصنيف\s*:.*", "", body_clean).strip()
+                    body_clean = re.sub(r"TQI\s*:\s*[0-9.]+/10.*", "", body_clean).strip()
+                    body_clean = re.sub(r"🧠\s*التحليل\s*الكلي.*", "", body_clean, flags=re.DOTALL).strip()
+                    body_clean = re.sub(r"التحليل\s*الكلي\s*والأثر\s*غير\s*المباشر.*", "", body_clean, flags=re.DOTALL).strip()
+                    body_clean = re.sub(r"\n\s*•\s*السبب\s*:.*", "", body_clean).strip()
+                    body_clean = re.sub(r"\n\s*•\s*القطاع\s*(المتأثر|التأثر)?\s*:.*", "", body_clean).strip()
+                    body_clean = re.sub(r"\n\s*•\s*الأسهم\s*المستفيدة.*", "", body_clean).strip()
+                    body_clean = re.sub(r"\n{3,}", "\n\n", body_clean).strip()
+                    body = body_clean
+            except Exception:
+                pass
+            # Header with Telegram cashtag
+            header = f"{badge} ${clean_ticker} | {stock_name_ar}"
+            tqi_line = f"🎯 تقييم الجودة (TQI): {tqi_score:.1f}/10" if isinstance(tqi_score, (int, float)) else "🎯 تقييم الجودة (TQI): غير متاح"
+            track_line = f"🏷️ المسار: {track}" if track else "🏷️ المسار: غير متاح"
+            conviction_line = f"⭐ التصنيف: {conviction}" if conviction else "⭐ التصنيف: غير متاح"
+            block_parts = [header, tqi_line, track_line, conviction_line, body]
+            if macro_block:
+                block_parts.append(macro_block)
+            block = "\n".join(part for part in block_parts if part and str(part).strip())
             if mode == PRE_MARKET:
                 if classification == "إيجابي":
-                    entries.append(f"🟢 {stock_name_ar} ({clean_ticker}): {body}")
+                    entries.append(block)
             else:
-                entries.append(f"{badge} {stock_name_ar} ({clean_ticker}): {body}")
+                entries.append(block)
         if entries:
-            body = "\n".join(entries)
+            body = "\n──────────────────\n".join(entries)
         else:
             body = NO_NEWS_WATCHLIST
         if no_news:
