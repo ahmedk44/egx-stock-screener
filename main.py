@@ -736,8 +736,53 @@ def update_position_stop(ticker: str, new_stop: float, path: str = ACTIVE_POSITI
         return False
 
 
+def get_channel_id_for_track(track_name: Any) -> Optional[str]:
+    """Strict multi-channel routing helper per trade track.
+
+    Mapping:
+      - Scalp / contains 'مضاربة' -> TELEGRAM_CHANNEL_SCALP
+      - Swing / contains 'سوينغ' -> TELEGRAM_CHANNEL_SWING
+      - Invest / contains 'استثمار' -> TELEGRAM_CHANNEL_INVEST
+    Fallback: TELEGRAM_CHAT_ID (general). Also checks legacy CHANNEL_* vars for backward compatibility.
+    """
+    try:
+        track_str = str(track_name) if track_name is not None else ""
+        if "Scalp" in track_str or "مضاربة" in track_str:
+            return (
+                os.environ.get("TELEGRAM_CHANNEL_SCALP")
+                or os.environ.get(CHANNEL_ENV.get(SCALPING, ""), "")
+                or os.getenv("TELEGRAM_CHAT_ID", "")
+            )
+        if "Swing" in track_str or "سوينغ" in track_str:
+            return (
+                os.environ.get("TELEGRAM_CHANNEL_SWING")
+                or os.environ.get(CHANNEL_ENV.get(SWING, ""), "")
+                or os.getenv("TELEGRAM_CHAT_ID", "")
+            )
+        if "Invest" in track_str or "استثمار" in track_str:
+            return (
+                os.environ.get("TELEGRAM_CHANNEL_INVEST")
+                or os.environ.get(CHANNEL_ENV.get(INVESTMENT, ""), "")
+                or os.getenv("TELEGRAM_CHAT_ID", "")
+            )
+    except Exception:
+        pass
+    return os.getenv("TELEGRAM_CHAT_ID", "")
+
+
 def _resolve_chat_id_for_track(trade_track: Any) -> Optional[str]:
-    """Resolve Telegram chat_id for a given trade_track label."""
+    """Resolve Telegram chat_id for a given trade_track label (legacy wrapper).
+
+    Delegates to get_channel_id_for_track for strict routing, maintaining backward compatibility.
+    """
+    try:
+        # Prefer strict helper
+        result = get_channel_id_for_track(trade_track)
+        if result:
+            return result
+    except Exception:
+        pass
+    # Fallback legacy logic
     try:
         track_str = str(trade_track) if trade_track is not None else ""
         if "Scalp" in track_str or "مضاربة لحظية" in track_str:
@@ -2761,8 +2806,17 @@ def process_ticker(ticker: str, state: Dict[str, Any]) -> None:
             logger.info("[FILTERED] Signal for %s skipped (TQI: %.1f/10 < 5.0)", ticker, tqi_for_filter)
             continue
         message = build_message(strategy, ticker, ctx, sentiment)
-        chat_id = os.environ.get(CHANNEL_ENV[strategy]) or os.getenv("TELEGRAM_CHAT_ID", "")
-        # Build inline keyboard for interactive trade management
+        # Strict multi-channel routing via trade track (Scalp/Swing/Invest)
+        try:
+            chat_id = get_channel_id_for_track(track_for_filter)
+            if not chat_id:
+                chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
+            # Legacy fallback to strategy mapping if track routing empty
+            if not chat_id:
+                chat_id = os.environ.get(CHANNEL_ENV.get(strategy, ""), "") or os.getenv("TELEGRAM_CHAT_ID", "")
+        except Exception:
+            chat_id = os.environ.get(CHANNEL_ENV.get(strategy, ""), "") or os.getenv("TELEGRAM_CHAT_ID", "")
+        # Build inline keyboard for interactive trade management (attached regardless of channel)
         try:
             keyboard = build_trade_keyboard(ticker)
         except Exception:
