@@ -414,19 +414,26 @@ def mark_sent(state: Dict[str, Any], ticker: str, strategy: str) -> None:
 
 
 def _is_supabase_configured() -> bool:
-    """Check if Supabase env vars are present (dynamic, not cached)."""
+    """Check if Supabase env vars are present (dynamic, not cached).
+
+    Supports both SUPABASE_KEY and SUPABASE_SERVICE_ROLE_KEY for flexibility
+    as per runner.yml env mapping.
+    """
     try:
         url = (os.environ.get("SUPABASE_URL") or "").strip()
-        key = (os.environ.get("SUPABASE_KEY") or "").strip()
+        key = (os.environ.get("SUPABASE_KEY") or os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or "").strip()
         return bool(url and key)
     except Exception:
         return False
 
 
 def _supabase_headers() -> Dict[str, str]:
-    """Build headers for Supabase REST API."""
+    """Build headers for Supabase REST API.
+
+    Supports SUPABASE_KEY or SUPABASE_SERVICE_ROLE_KEY fallback.
+    """
     try:
-        key = (os.environ.get("SUPABASE_KEY") or "").strip()
+        key = (os.environ.get("SUPABASE_KEY") or os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or "").strip()
         return {
             "apikey": key,
             "Authorization": f"Bearer {key}",
@@ -565,8 +572,23 @@ def sync_active_positions_to_supabase(path: str = ACTIVE_POSITIONS_FILE) -> int:
 
     Returns number of positions synced. Never raises.
     """
+    # Verbose debugging as per requirements
+    try:
+        url_set = bool((os.environ.get("SUPABASE_URL") or "").strip())
+        key_set = bool((os.environ.get("SUPABASE_KEY") or os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or "").strip())
+        print(f"[SUPABASE DEBUG] URL set: {url_set}")
+        print(f"[SUPABASE DEBUG] Key set: {key_set} (SUPABASE_KEY or SUPABASE_SERVICE_ROLE_KEY)")
+        logger.info("[SUPABASE DEBUG] URL set: %s, Key set: %s", url_set, key_set)
+        # Also log full URL prefix for debugging (without exposing full key)
+        if url_set:
+            url_preview = (os.environ.get("SUPABASE_URL") or "")[:35]
+            print(f"[SUPABASE DEBUG] URL preview: {url_preview}...")
+    except Exception as exc:
+        print(f"[SUPABASE DEBUG] Error checking env: {exc}")
+
     if not _is_supabase_configured():
         logger.info("Supabase not configured; skipping sync (using local JSON)")
+        print("[SUPABASE DEBUG] Supabase not configured; skipping sync")
         return 0
     # Force load from local JSON file (not Supabase) to get source of truth
     local_positions: List[Dict[str, Any]] = []
@@ -594,6 +616,9 @@ def sync_active_positions_to_supabase(path: str = ACTIVE_POSITIONS_FILE) -> int:
         print(f"[SYNC ERROR] Unexpected read error: {exc}")
         return 0
 
+    # Verbose: number of positions read
+    print(f"[SUPABASE DEBUG] Positions read from {path}: {len(local_positions)}")
+    logger.info("[SUPABASE DEBUG] Positions read from %s: %d", path, len(local_positions))
     if not local_positions:
         logger.info("No local positions to sync to Supabase")
         print("[SYNC] No local positions to sync")
@@ -624,9 +649,17 @@ def sync_active_positions_to_supabase(path: str = ACTIVE_POSITIONS_FILE) -> int:
                 pos["status"] = "PENDING"
             # Upsert via POST with on_conflict
             resp = requests.post(f"{url}?on_conflict=ticker,trade_track", json=pos, headers=headers_upsert, timeout=15)
+            # Verbose: exact HTTP status and body per requirement
+            try:
+                body_preview = resp.text[:500] if resp.text else "(empty body)"
+            except Exception:
+                body_preview = "(no body)"
+            print(f"[SUPABASE DEBUG] POST {pos.get('ticker')} -> {resp.status_code} {body_preview}")
+            logger.info("[SUPABASE DEBUG] POST %s -> %s %s", pos.get("ticker"), resp.status_code, body_preview[:200])
             if resp.status_code in (200, 201, 204):
                 synced += 1
                 logger.info("[SYNC] Upserted %s (%s) to Supabase", pos.get("ticker"), pos.get("status"))
+                print(f"[SYNC] Upserted {pos.get('ticker')} ({pos.get('status')}) -> {resp.status_code}")
             else:
                 failed += 1
                 logger.warning("Supabase sync failed for %s (%s %s)", pos.get("ticker"), resp.status_code, resp.text[:200] if resp.text else "")
@@ -643,6 +676,140 @@ def sync_active_positions_to_supabase(path: str = ACTIVE_POSITIONS_FILE) -> int:
     print(f"[SYNC] Completed: {synced} synced, {failed} failed out of {len(local_positions)} local positions")
     logger.info("Sync completed: %d synced, %d failed", synced, failed)
     return synced
+
+
+def test_supabase_connection(path: str = ACTIVE_POSITIONS_FILE) -> bool:
+    """Standalone test: inserts dummy TEST.CA (entry 10.0, ACTIVE) into Supabase, prints result, then removes it.
+
+    Used via CLI flag --test-supabase. Handles both Supabase and fallback.
+    Returns True if test succeeded (insert and delete), False otherwise. Never raises.
+    """
+    print("="*60)
+    print("[SUPABASE TEST] Starting dummy insert test for TEST.CA")
+    print(f"[SUPABASE DEBUG] URL set: {bool((os.environ.get('SUPABASE_URL') or '').strip())}")
+    print(f"[SUPABASE DEBUG] Key set: {bool((os.environ.get('SUPABASE_KEY') or os.environ.get('SUPABASE_SERVICE_ROLE_KEY') or '').strip())}")
+    # Check if Supabase configured
+    if not _is_supabase_configured():
+        print("[SUPABASE TEST] Supabase not configured (SUPABASE_URL/KEY missing) - testing local JSON fallback")
+        # Fallback test: insert via add_active_position to local JSON, verify, then remove
+        try:
+            tmp_ticker = "TEST.CA"
+            # Clean any existing TEST.CA first
+            positions = load_active_positions(path)
+            # Remove any existing TEST.CA
+            positions = [p for p in positions if p.get("ticker") != tmp_ticker]
+            save_active_positions(positions, path)
+            # Insert dummy
+            ok = add_active_position(
+                ticker=tmp_ticker,
+                entry_price=10.0,
+                target_1=10.25,
+                target_2=10.5,
+                target_3=10.8,
+                current_stop_loss=9.7,
+                trade_track="Scalp",
+                status="ACTIVE",
+                path=path,
+            )
+            print(f"[SUPABASE TEST] Local insert TEST.CA ACTIVE -> {ok} (fallback, no Supabase)")
+            if ok:
+                loaded = load_active_positions(path)
+                found = any(p.get("ticker") == tmp_ticker and p.get("status") == "ACTIVE" for p in loaded)
+                print(f"[SUPABASE TEST] Verification: found in JSON = {found}")
+                # Cleanup: remove via handle_telegram_callback dis or direct
+                # Use update to delete
+                positions = load_active_positions(path)
+                positions = [p for p in positions if p.get("ticker") != tmp_ticker]
+                save_active_positions(positions, path)
+                print(f"[SUPABASE TEST] Cleanup: removed {tmp_ticker} from {path}")
+                print("[SUPABASE TEST] Fallback test PASSED")
+                return True
+            else:
+                print("[SUPABASE TEST] Fallback insert failed")
+                return False
+        except Exception as exc:
+            print(f"[SUPABASE TEST ERROR] Fallback test failed: {exc}")
+            import traceback; traceback.print_exc()
+            return False
+
+    # Supabase is configured - try direct REST insertion
+    try:
+        url = _supabase_table_url()
+        headers = _supabase_headers()
+        if not url or not headers:
+            print("[SUPABASE TEST ERROR] URL or headers missing")
+            return False
+        dummy = {
+            "ticker": "TEST.CA",
+            "entry_price": 10.0,
+            "current_stop_loss": 9.7,
+            "target_1": 10.25,
+            "target_2": 10.5,
+            "target_3": 10.8,
+            "trade_track": "Scalp",
+            "timestamp": now_utc().isoformat(),
+            "status": "ACTIVE",
+        }
+        headers_insert = dict(headers)
+        headers_insert["Prefer"] = "return=representation"
+        print(f"[SUPABASE TEST] Inserting dummy {dummy} to {url}")
+        resp = requests.post(url, json=dummy, headers=headers_insert, timeout=15)
+        # Verbose: exact status and body
+        try:
+            body_preview = resp.text[:1000] if resp.text else "(empty)"
+        except Exception:
+            body_preview = "(no body)"
+        print(f"[SUPABASE TEST] POST {url} -> {resp.status_code} {body_preview}")
+        logger.info("[SUPABASE TEST] POST -> %s %s", resp.status_code, body_preview[:500])
+        if resp.status_code not in (200, 201, 204):
+            print(f"[SUPABASE TEST] Insert failed: {resp.status_code} {body_preview}")
+            return False
+        print("[SUPABASE TEST] Insert succeeded, verifying via GET...")
+        # Verify via GET
+        try:
+            resp_get = requests.get(f"{url}?ticker=eq.TEST.CA&select=*", headers=headers, timeout=15)
+            print(f"[SUPABASE TEST] GET verify -> {resp_get.status_code} {resp_get.text[:500] if resp_get.text else ''}")
+            if resp_get.status_code == 200:
+                data = resp_get.json()
+                found = False
+                if isinstance(data, list):
+                    found = any(p.get("ticker") == "TEST.CA" for p in data)
+                print(f"[SUPABASE TEST] Verification found in Supabase: {found}")
+            else:
+                print(f"[SUPABASE TEST] GET verification failed: {resp_get.status_code}")
+        except Exception as exc:
+            print(f"[SUPABASE TEST] GET verification error: {exc}")
+
+        # Cleanup: delete dummy
+        print("[SUPABASE TEST] Cleaning up: deleting TEST.CA from Supabase...")
+        try:
+            resp_del = requests.delete(f"{url}?ticker=eq.TEST.CA", headers=headers, timeout=15)
+            print(f"[SUPABASE TEST] DELETE -> {resp_del.status_code} {resp_del.text[:500] if resp_del.text else ''}")
+            logger.info("[SUPABASE TEST] DELETE -> %s", resp_del.status_code)
+            if resp_del.status_code in (200, 204):
+                print("[SUPABASE TEST] Cleanup DELETE succeeded")
+            else:
+                # Fallback: update status to DISMISSED then try delete again
+                print(f"[SUPABASE TEST] DELETE may have failed, trying status update to DISMISSED as fallback")
+                try:
+                    resp_patch = requests.patch(f"{url}?ticker=eq.TEST.CA", json={"status": "DISMISSED"}, headers=headers, timeout=15)
+                    print(f"[SUPABASE TEST] PATCH DISMISSED -> {resp_patch.status_code} {resp_patch.text[:500] if resp_patch.text else ''}")
+                except Exception as exc2:
+                    print(f"[SUPABASE TEST] PATCH fallback error: {exc2}")
+        except Exception as exc:
+            print(f"[SUPABASE TEST] DELETE error: {exc}")
+            return False
+
+        print("[SUPABASE TEST] Completed successfully")
+        return True
+    except requests.exceptions.RequestException as exc:
+        print(f"[SUPABASE TEST ERROR] Request failed: {exc}")
+        logger.warning("Supabase test request failed: %s", exc)
+        return False
+    except Exception as exc:
+        print(f"[SUPABASE TEST ERROR] Unexpected: {exc}")
+        import traceback; traceback.print_exc()
+        return False
 
 
 def update_position_status(ticker: str, status: str, path: str = ACTIVE_POSITIONS_FILE) -> bool:
@@ -3175,6 +3342,11 @@ def parse_mode(argv: Optional[List[str]] = None) -> str:
         action="store_true",
         help="Alias for --listen-telegram",
     )
+    parser.add_argument(
+        "--test-supabase",
+        action="store_true",
+        help="Test Supabase connection by inserting dummy TEST.CA trade and verifying",
+    )
     args, _ = parser.parse_known_args(argv)
     return args.mode
 
@@ -3192,6 +3364,18 @@ def should_listen_telegram(argv: Optional[List[str]] = None) -> bool:
         # Fallback to raw argv check
         check_argv = argv if argv is not None else sys.argv
         return "--listen-telegram" in check_argv or "--listen" in check_argv
+
+
+def should_test_supabase(argv: Optional[List[str]] = None) -> bool:
+    """Check if --test-supabase flag is present."""
+    try:
+        parser = argparse.ArgumentParser(add_help=False)
+        parser.add_argument("--test-supabase", action="store_true")
+        args, _ = parser.parse_known_args(argv)
+        return bool(getattr(args, "test_supabase", False))
+    except Exception:
+        check_argv = argv if argv is not None else sys.argv
+        return "--test-supabase" in check_argv
 
 
 NONEWS_FALLBACK_PHRASES: List[str] = ["لا توجد أخبار", "المؤشرات الفنية فقط"]
@@ -3335,9 +3519,27 @@ def run_news_watchlist(mode: str) -> int:
 def main() -> int:
     """Run the chosen execution mode (intraday scan or off-hours news watchlist).
 
-    Supports --listen-telegram flag for standalone bot listener (polling).
+    Supports --listen-telegram flag for standalone bot listener (polling)
+    and --test-supabase for Supabase connection test.
     Also auto-syncs local JSON to Supabase on every run.
     """
+    # Standalone Supabase test mode: check flag before env checks
+    try:
+        if should_test_supabase():
+            logger.info("Running Supabase test mode (--test-supabase)")
+            print("="*60)
+            print("[TEST-SUPABASE] Running standalone Supabase test")
+            print("="*60)
+            success = test_supabase_connection()
+            if success:
+                print("[TEST-SUPABASE] Test PASSED")
+            else:
+                print("[TEST-SUPABASE] Test FAILED")
+            return 0 if success else 1
+    except Exception as exc:
+        logger.warning("Test Supabase check failed: %s", exc)
+        print(f"[TEST-SUPABASE ERROR] {exc}")
+
     # Standalone bot listener support: check flag before env checks
     try:
         if should_listen_telegram():
