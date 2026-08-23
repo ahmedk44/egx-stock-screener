@@ -1,0 +1,35 @@
+[
+  {
+    "ticker": "FAIT.CA",
+    "entry_price": 42.439998626708984,
+    "current_stop_loss": 41.16679866790771,
+    "target_1": 43.5009985923767,
+    "target_2": 44.561998558044436,
+    "target_3": 45.83519851684571,
+    "trade_track": "📈 تداول سوينغ (Swing)",
+    "timestamp": "2026-08-23T08:51:37.468833+00:00",
+    "status": "PENDING"
+  },
+  {
+    "ticker": "FWRY.CA",
+    "entry_price": 19.209999084472656,
+    "current_stop_loss": 18.057399139404296,
+    "target_1": 20.17049903869629,
+    "target_2": 21.130998992919924,
+    "target_3": 22.475698928833005,
+    "trade_track": "📈 تداول سوينغ (Swing)",
+    "timestamp": "2026-08-23T08:51:38.929962+00:00",
+    "status": "PENDING"
+  },
+  {
+    "ticker": "SKPC.CA",
+    "entry_price": 17.700000762939453,
+    "current_stop_loss": 17.16900074005127,
+    "target_1": 18.142500782012938,
+    "target_2": 18.585000801086426,
+    "target_3": 19.11600082397461,
+    "trade_track": "⚡ مضاربة لحظية (Scalp)",
+    "timestamp": "2026-08-23T08:51:41.399213+00:00",
+    "status": "PENDING"
+  }
+]
