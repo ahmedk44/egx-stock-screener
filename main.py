@@ -1838,17 +1838,17 @@ def fetch_price_history(ticker: str) -> Optional[pd.DataFrame]:
             threads=False,
         )
     except KeyError as exc:
-        msg = f"[YFINANCE ERROR] Could not fetch data for {ticker}: {exc}"
+        msg = f"[YFINANCE ERROR] Failed fetching data for {ticker}: {exc}"
         print(msg)
         logger.warning(msg)
         return None
     except ValueError as exc:
-        msg = f"[YFINANCE ERROR] Could not fetch data for {ticker}: {exc}"
+        msg = f"[YFINANCE ERROR] Failed fetching data for {ticker}: {exc}"
         print(msg)
         logger.warning(msg)
         return None
     except Exception as exc:
-        msg = f"[YFINANCE ERROR] Could not fetch data for {ticker}: {exc}"
+        msg = f"[YFINANCE ERROR] Failed fetching data for {ticker}: {exc}"
         print(msg)
         logger.warning(msg)
         return None
@@ -1861,17 +1861,17 @@ def fetch_price_history(ticker: str) -> Optional[pd.DataFrame]:
         df.columns = [col[0] if isinstance(col, tuple) else col for col in df.columns]
         return df
     except KeyError as exc:
-        msg = f"[YFINANCE ERROR] Could not fetch data for {ticker}: {exc}"
+        msg = f"[YFINANCE ERROR] Failed fetching data for {ticker}: {exc}"
         print(msg)
         logger.warning(msg)
         return None
     except ValueError as exc:
-        msg = f"[YFINANCE ERROR] Could not fetch data for {ticker}: {exc}"
+        msg = f"[YFINANCE ERROR] Failed fetching data for {ticker}: {exc}"
         print(msg)
         logger.warning(msg)
         return None
     except Exception as exc:
-        msg = f"[YFINANCE ERROR] Could not fetch data for {ticker}: {exc}"
+        msg = f"[YFINANCE ERROR] Failed fetching data for {ticker}: {exc}"
         print(msg)
         logger.warning(msg)
         return None
@@ -1885,32 +1885,32 @@ def get_trailing_pe(ticker: str) -> Optional[float]:
         try:
             info = yf.Ticker(ticker).info  # older yfinance fallback
         except KeyError as exc:
-            msg = f"[YFINANCE ERROR] Could not fetch data for {ticker}: {exc}"
+            msg = f"[YFINANCE ERROR] Failed fetching data for {ticker}: {exc}"
             print(msg)
             logger.warning(msg)
             return None
         except ValueError as exc:
-            msg = f"[YFINANCE ERROR] Could not fetch data for {ticker}: {exc}"
+            msg = f"[YFINANCE ERROR] Failed fetching data for {ticker}: {exc}"
             print(msg)
             logger.warning(msg)
             return None
         except Exception as exc:
-            msg = f"[YFINANCE ERROR] Could not fetch data for {ticker}: {exc}"
+            msg = f"[YFINANCE ERROR] Failed fetching data for {ticker}: {exc}"
             print(msg)
             logger.warning(msg)
             return None
     except KeyError as exc:
-        msg = f"[YFINANCE ERROR] Could not fetch data for {ticker}: {exc}"
+        msg = f"[YFINANCE ERROR] Failed fetching data for {ticker}: {exc}"
         print(msg)
         logger.warning(msg)
         return None
     except ValueError as exc:
-        msg = f"[YFINANCE ERROR] Could not fetch data for {ticker}: {exc}"
+        msg = f"[YFINANCE ERROR] Failed fetching data for {ticker}: {exc}"
         print(msg)
         logger.warning(msg)
         return None
     except Exception as exc:
-        msg = f"[YFINANCE ERROR] Could not fetch data for {ticker}: {exc}"
+        msg = f"[YFINANCE ERROR] Failed fetching data for {ticker}: {exc}"
         print(msg)
         logger.warning(msg)
         return None
@@ -1920,12 +1920,12 @@ def get_trailing_pe(ticker: str) -> Optional[float]:
     except (TypeError, ValueError):
         return None
     except KeyError as exc:
-        msg = f"[YFINANCE ERROR] Could not fetch data for {ticker}: {exc}"
+        msg = f"[YFINANCE ERROR] Failed fetching data for {ticker}: {exc}"
         print(msg)
         logger.warning(msg)
         return None
     except Exception as exc:
-        msg = f"[YFINANCE ERROR] Could not fetch data for {ticker}: {exc}"
+        msg = f"[YFINANCE ERROR] Failed fetching data for {ticker}: {exc}"
         print(msg)
         logger.warning(msg)
         return None
@@ -2359,7 +2359,7 @@ def _summarize_with_gemini(content: str, ticker: str) -> str:
             print(msg)
             logger.warning(msg)
             # Return neutral sentiment so signal delivery is never blocked
-            return "🟢 محايد (تجاوز حد API)"
+            return "🟢 محايد"
         logger.warning("[%s] Gemini sentiment analysis failed: %s", ticker, exc)
         return GEMINI_FALLBACK_PROMPT
 
@@ -3724,19 +3724,19 @@ def process_ticker(ticker: str, state: Dict[str, Any]) -> None:
                     threads=False,
                 )
             except KeyError as exc:
-                msg = f"[YFINANCE ERROR] Could not fetch data for {ticker}: {exc}"
+                msg = f"[YFINANCE ERROR] Failed fetching data for {ticker}: {exc}"
                 print(msg)
                 logger.warning(msg)
                 raw_1m = None
                 df_1m = None
             except ValueError as exc:
-                msg = f"[YFINANCE ERROR] Could not fetch data for {ticker}: {exc}"
+                msg = f"[YFINANCE ERROR] Failed fetching data for {ticker}: {exc}"
                 print(msg)
                 logger.warning(msg)
                 raw_1m = None
                 df_1m = None
             except Exception as exc:
-                msg = f"[YFINANCE ERROR] Could not fetch data for {ticker}: {exc}"
+                msg = f"[YFINANCE ERROR] Failed fetching data for {ticker}: {exc}"
                 print(msg)
                 logger.warning(msg)
                 raw_1m = None
@@ -3749,34 +3749,34 @@ def process_ticker(ticker: str, state: Dict[str, Any]) -> None:
                     if len(df_1m) > 500:
                         df_1m = df_1m.tail(500)
                 except KeyError as exc:
-                    msg = f"[YFINANCE ERROR] Could not fetch data for {ticker}: {exc}"
+                    msg = f"[YFINANCE ERROR] Failed fetching data for {ticker}: {exc}"
                     print(msg)
                     logger.warning(msg)
                     df_1m = None
                 except ValueError as exc:
-                    msg = f"[YFINANCE ERROR] Could not fetch data for {ticker}: {exc}"
+                    msg = f"[YFINANCE ERROR] Failed fetching data for {ticker}: {exc}"
                     print(msg)
                     logger.warning(msg)
                     df_1m = None
                 except Exception as exc:
-                    msg = f"[YFINANCE ERROR] Could not fetch data for {ticker}: {exc}"
+                    msg = f"[YFINANCE ERROR] Failed fetching data for {ticker}: {exc}"
                     print(msg)
                     logger.warning(msg)
                     df_1m = None
         except KeyError as exc:
-            msg = f"[YFINANCE ERROR] Could not fetch data for {ticker}: {exc}"
+            msg = f"[YFINANCE ERROR] Failed fetching data for {ticker}: {exc}"
             print(msg)
             logger.warning(msg)
             df_1m = None
         except ValueError as exc:
-            msg = f"[YFINANCE ERROR] Could not fetch data for {ticker}: {exc}"
+            msg = f"[YFINANCE ERROR] Failed fetching data for {ticker}: {exc}"
             print(msg)
             logger.warning(msg)
             df_1m = None
         except Exception as exc:
             logger.debug("[%s] 1m fetch failed for delta: %s", ticker, exc)
             # Also log with required format for consistency
-            msg = f"[YFINANCE ERROR] Could not fetch data for {ticker}: {exc}"
+            msg = f"[YFINANCE ERROR] Failed fetching data for {ticker}: {exc}"
             print(msg)
             logger.warning(msg)
             df_1m = None
