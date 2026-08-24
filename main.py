@@ -2033,6 +2033,38 @@ def add_active_position(
         except Exception:
             pass
 
+    # Pre-check: prevent duplicate active positions for an existing PENDING ticker.
+    # Reads local active_positions.json (not Supabase mirror) so a repeated alert for
+    # the same normalized ticker does NOT create a second row.
+    try:
+        local_positions: List[Dict[str, Any]] = []
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    file_data = json.load(fh)
+                    if isinstance(file_data, list):
+                        local_positions = file_data
+                    elif isinstance(file_data, dict):
+                        for k in ("positions", "active_positions", "data"):
+                            if k in file_data and isinstance(file_data[k], list):
+                                local_positions = file_data[k]
+                                break
+            except Exception:
+                local_positions = []
+        ticker_exists = any(
+            p.get("status") == "PENDING" and normalize_ticker(p.get("ticker")) == ticker
+            for p in local_positions
+        )
+        if ticker_exists:
+            logger.info("[ACTIVE POS] Ticker %s is already in active positions. Updating targets/SL only or skipping insert.", ticker)
+            try:
+                print(f"[ACTIVE POS] Ticker {ticker} is already in active positions. Updating targets/SL only or skipping insert.")
+            except UnicodeEncodeError:
+                pass
+            return False
+    except Exception as exc:
+        logger.warning("[ACTIVE POS] Pre-check for %s failed (%s); continuing with insert", ticker, exc)
+
     # Try Supabase if configured
     if _is_supabase_configured():
         try:
