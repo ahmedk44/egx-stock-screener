@@ -932,11 +932,13 @@ def record_sent_alert_supabase(
     target_1: Optional[float],
     target_2: Optional[float],
     target_3: Optional[float],
+    reason: Optional[str] = None,
 ) -> bool:
     """Write sent alert record into Supabase sent_alerts.
 
     Inserts (ticker, strategy, date_sent, entry_price, current_stop_loss, target_1, target_2, target_3).
-    date_sent is today's Cairo date. Returns True if inserted, False otherwise. Never raises.
+    date_sent is today's Cairo date. Explicitly includes signal_hash for smart deduplication.
+    Returns True if inserted, False otherwise. Never raises.
     """
     if not _is_supabase_configured():
         logger.info("[DEDUP] Supabase not configured - skipping record for %s/%s", ticker, strategy)
@@ -947,10 +949,25 @@ def record_sent_alert_supabase(
         if not url or not headers:
             return False
         date_str = _today_cairo_date_str()
+        # Compute the exact signal fingerprint so the insert always carries the dedup key
+        try:
+            signal_hash = generate_signal_hash(
+                ticker=ticker,
+                signal_type=strategy,
+                entry_price=entry_price,
+                reason=reason,
+                alert_date=date_str,
+            )
+        except Exception:
+            try:
+                signal_hash = f"{normalize_ticker(ticker)}_{str(strategy).strip().lower()}_{float(entry_price):.2f}_{date_str}"
+            except Exception:
+                signal_hash = f"{normalize_ticker(ticker)}_{str(strategy).strip().lower()}_{date_str}"
         payload: Dict[str, Any] = {
             "ticker": normalize_ticker(ticker),
             "strategy": str(strategy).strip(),
             "date_sent": date_str,
+            "signal_hash": signal_hash,
             "entry_price": float(entry_price) if entry_price is not None else None,
             "current_stop_loss": float(current_stop_loss) if current_stop_loss is not None else None,
             "target_1": float(target_1) if target_1 is not None else None,
