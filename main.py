@@ -63,20 +63,34 @@ logger = logging.getLogger("egx-screener")
 TICKERS: List[str] = [
     "ABUK.CA",
     "ADIB.CA",
+    "ALCN.CA",
     "AMOC.CA",
+    "ATQA.CA",
+    "BINV.CA",
+    "CERA.CA",
+    "CLHO.CA",
     "COMI.CA",
+    "DOMT.CA",
+    "EALR.CA",
     "EAST.CA",
     "EFID.CA",
     "EFIH.CA",
+    "EKHO.CA",
     "ETEL.CA",
+    "ELWA.CA",
+    "ETRS.CA",
     "FAIT.CA",
     "FWRY.CA",
+    "GBCO.CA",
     "HELI.CA",
+    "HRHO.CA",
     "ISPH.CA",
     "JUFO.CA",
-    "OLFI.CA",
+    "LCSW.CA",
+    "MCRO.CA",
     "ORAS.CA",
     "ORWE.CA",
+    "PHDC.CA",
     "SAUD.CA",
     "SKPC.CA",
     "SWDY.CA",
@@ -189,6 +203,7 @@ TQI_TRACK_LABELS: Dict[str, str] = {
 TELEGRAM_API: str = "https://api.telegram.org/bot{token}/sendMessage"
 TELEGRAM_ANSWER_API: str = "https://api.telegram.org/bot{token}/answerCallbackQuery"
 SUPABASE_TABLE: str = "active_positions"
+SENT_ALERTS_TABLE: str = "sent_alerts"
 
 STOCK_NAMES_AR: Dict[str, str] = {
     "ABUK.CA": "أبو قير للأسمدة",
@@ -459,6 +474,135 @@ def _supabase_table_url() -> str:
     if not base:
         return ""
     return f"{base}/rest/v1/{SUPABASE_TABLE}"
+
+
+def _sent_alerts_table_url() -> str:
+    """Return full Supabase table URL for sent_alerts (deduplication)."""
+    base = _supabase_base_url()
+    if not base:
+        return ""
+    return f"{base}/rest/v1/{SENT_ALERTS_TABLE}"
+
+
+def _today_cairo_date_str() -> str:
+    """Return today's date string in Africa/Cairo timezone (YYYY-MM-DD)."""
+    try:
+        return now_cairo().date().isoformat()
+    except Exception:
+        return now_utc().date().isoformat()
+
+
+def is_already_sent_today_supabase(ticker: str, strategy: str) -> bool:
+    """Check Supabase sent_alerts for (ticker, strategy, date_sent) today (Cairo).
+
+    Returns True if a record exists for today's Cairo date, meaning we should SKIP.
+    Returns False if no record or Supabase not configured / error (allow sending).
+    Never raises.
+    """
+    if not _is_supabase_configured():
+        return False
+    try:
+        url = _sent_alerts_table_url()
+        headers = _supabase_headers()
+        if not url or not headers:
+            return False
+        ticker = str(ticker).strip() if ticker else ""
+        strategy = str(strategy).strip() if strategy else ""
+        if not ticker or not strategy:
+            return False
+        date_str = _today_cairo_date_str()
+        # Query with exact match on ticker, strategy, date_sent
+        # Supabase PostgREST filters: ticker=eq.<val>&strategy=eq.<val>&date_sent=eq.<date>
+        params = f"ticker=eq.{ticker}&strategy=eq.{strategy}&date_sent=eq.{date_str}&select=id"
+        resp = requests.get(f"{url}?{params}", headers=headers, timeout=10)
+        # Log exact response for debugging Vercel/GitHub
+        try:
+            body_preview = resp.text[:500] if resp.text else "(empty)"
+        except Exception:
+            body_preview = "(no body)"
+        print(f"[DEDUP] Check {ticker}/{strategy}/{date_str} -> {resp.status_code} {body_preview[:200]}")
+        logger.info("[DEDUP] Check %s/%s/%s -> %s %s", ticker, strategy, date_str, resp.status_code, body_preview[:200])
+        if resp.status_code != 200:
+            logger.warning("[DEDUP] Supabase check failed (%s %s); allowing send", resp.status_code, body_preview[:200])
+            return False
+        try:
+            data = resp.json()
+        except Exception:
+            return False
+        if isinstance(data, list) and len(data) > 0:
+            logger.info("[DEDUP] Duplicate found for %s %s on %s - skipping", ticker, strategy, date_str)
+            print(f"[DEDUP] Duplicate found - skipping {ticker} {strategy}")
+            return True
+        return False
+    except requests.exceptions.RequestException as exc:
+        logger.warning("[DEDUP] Request failed for %s/%s: %s (allowing send)", ticker, strategy, exc)
+        print(f"[DEDUP ERROR] Request failed: {exc}")
+        return False
+    except Exception as exc:
+        logger.warning("[DEDUP] Unexpected error for %s/%s: %s", ticker, strategy, exc)
+        print(f"[DEDUP ERROR] Unexpected: {exc}")
+        return False
+
+
+def record_sent_alert_supabase(
+    ticker: str,
+    strategy: str,
+    entry_price: Optional[float],
+    current_stop_loss: Optional[float],
+    target_1: Optional[float],
+    target_2: Optional[float],
+    target_3: Optional[float],
+) -> bool:
+    """Write sent alert record into Supabase sent_alerts.
+
+    Inserts (ticker, strategy, date_sent, entry_price, current_stop_loss, target_1, target_2, target_3).
+    date_sent is today's Cairo date. Returns True if inserted, False otherwise. Never raises.
+    """
+    if not _is_supabase_configured():
+        logger.info("[DEDUP] Supabase not configured - skipping record for %s/%s", ticker, strategy)
+        return False
+    try:
+        url = _sent_alerts_table_url()
+        headers = _supabase_headers()
+        if not url or not headers:
+            return False
+        date_str = _today_cairo_date_str()
+        payload: Dict[str, Any] = {
+            "ticker": str(ticker).strip(),
+            "strategy": str(strategy).strip(),
+            "date_sent": date_str,
+            "entry_price": float(entry_price) if entry_price is not None else None,
+            "current_stop_loss": float(current_stop_loss) if current_stop_loss is not None else None,
+            "target_1": float(target_1) if target_1 is not None else None,
+            "target_2": float(target_2) if target_2 is not None else None,
+            "target_3": float(target_3) if target_3 is not None else None,
+        }
+        # Remove None values for numeric fields? Keep as null allowed but try to send null -> Supabase allows null
+        # Use Prefer return=representation to confirm
+        headers_insert = dict(headers)
+        headers_insert["Prefer"] = "return=representation"
+        resp = requests.post(url, json=payload, headers=headers_insert, timeout=15)
+        try:
+            body_preview = resp.text[:500] if resp.text else "(empty)"
+        except Exception:
+            body_preview = "(no body)"
+        print(f"[DEDUP] Insert {ticker}/{strategy}/{date_str} -> {resp.status_code} {body_preview[:200]}")
+        logger.info("[DEDUP] Insert %s/%s/%s -> %s %s", ticker, strategy, date_str, resp.status_code, body_preview[:200])
+        if resp.status_code in (200, 201, 204):
+            logger.info("[DEDUP] Recorded sent_alert for %s %s on %s", ticker, strategy, date_str)
+            return True
+        else:
+            logger.warning("[DEDUP] Failed to record sent_alert %s/%s (%s %s)", ticker, strategy, resp.status_code, body_preview[:300])
+            print(f"[DEDUP ERROR] Insert failed: {resp.status_code} {body_preview[:300]}")
+            return False
+    except requests.exceptions.RequestException as exc:
+        logger.warning("[DEDUP] Insert request failed for %s/%s: %s", ticker, strategy, exc)
+        print(f"[DEDUP ERROR] Request failed: {exc}")
+        return False
+    except Exception as exc:
+        logger.warning("[DEDUP] Unexpected insert error for %s/%s: %s", ticker, strategy, exc)
+        print(f"[DEDUP ERROR] Unexpected: {exc}")
+        return False
 
 
 def load_active_positions(path: str = ACTIVE_POSITIONS_FILE) -> List[Dict[str, Any]]:
@@ -2114,14 +2258,59 @@ def _summarize_with_gemini(content: str, ticker: str) -> str:
 # --------------------------------------------------------------------------
 
 
-def build_trade_keyboard(ticker: str) -> Dict[str, Any]:
+def build_trade_keyboard(
+    ticker: str,
+    entry_price: Optional[float] = None,
+    current_stop_loss: Optional[float] = None,
+    target_1: Optional[float] = None,
+    target_2: Optional[float] = None,
+    target_3: Optional[float] = None,
+    trade_track: Optional[str] = None,
+) -> Dict[str, Any]:
     """Build InlineKeyboardMarkup for trade signals with Activate/Dismiss/Close buttons.
 
     Returns dict suitable for Telegram Bot API `reply_markup`.
-    Callback data format: act_{ticker}, dis_{ticker}, cls_{ticker}
+    Callback data format (enhanced to include all essential trade parameters for instant Supabase upsert):
+      - Legacy: act_{ticker}, dis_{ticker}, cls_{ticker} (still supported, webhook will fetch specs)
+      - Enhanced: act_{ticker}|{entry_price}|{current_stop_loss}|{target_1}|{target_2}|{target_3}
+        Example: act_COMI.CA|85.00|83.30|87.12|89.25|91.80
+      This ensures Vercel webhook can directly upsert full trade details without needing to fetch from active_positions.json
+      which may not be synced due to GitHub Actions exit (fixes Supabase RLS/persistence issue).
+      All callback_data stays within Telegram's 64-byte limit (ticker 7 + 5*6 + pipes ~ 40 bytes).
+      When trade details are not provided (legacy call), falls back to ticker-only for backward compatibility.
     """
     try:
         safe_ticker = str(ticker).strip() if ticker else "UNKNOWN"
+        # Build enhanced callback_data with full trade specs if provided
+        if entry_price is not None and current_stop_loss is not None and target_1 is not None and target_2 is not None and target_3 is not None:
+            try:
+                # Format prices to 2 decimals to keep within 64 bytes
+                ep = f"{float(entry_price):.2f}"
+                sl = f"{float(current_stop_loss):.2f}"
+                t1 = f"{float(target_1):.2f}"
+                t2 = f"{float(target_2):.2f}"
+                t3 = f"{float(target_3):.2f}"
+                # Enhanced payload: act_{ticker}|{entry}|{stop}|{t1}|{t2}|{t3}
+                # For dis/cls we keep ticker-only (no need for full specs, status update only)
+                act_data = f"act_{safe_ticker}|{ep}|{sl}|{t1}|{t2}|{t3}"
+                # Ensure within 64 bytes (Telegram limit) - if too long, fallback to ticker-only
+                if len(act_data.encode("utf-8")) > 64:
+                    act_data = f"act_{safe_ticker}"
+                else:
+                    # Also include trade_track in dis/cls? No, keep simple
+                    pass
+                return {
+                    "inline_keyboard": [
+                        [
+                            {"text": "✅ تم الدخول (Activate)", "callback_data": act_data},
+                            {"text": "❌ غير مهتم (Dismiss)", "callback_data": f"dis_{safe_ticker}"},
+                            {"text": "🏁 إغلاق يدوياً (Close)", "callback_data": f"cls_{safe_ticker}"},
+                        ]
+                    ]
+                }
+            except Exception:
+                pass
+        # Fallback legacy (ticker-only)
         return {
             "inline_keyboard": [
                 [
@@ -2338,6 +2527,226 @@ def listen_telegram(poll_interval: int = 2, timeout: int = 30) -> None:
         except Exception as exc:
             logger.warning("Telegram listener error: %s", exc)
             time.sleep(5)
+
+
+def set_telegram_webhook(vercel_domain: str, bot_token: Optional[str] = None) -> bool:
+    """Set Telegram webhook to Vercel domain.
+
+    Calls Telegram setWebhook API using TELEGRAM_BOT_TOKEN.
+    VERCEL_DOMAIN can be like https://your-app.vercel.app or your-app.vercel.app
+    Webhook URL will be {domain}/api/webhook
+
+    Prints clear logs and returns True if successful. Never raises.
+    """
+    try:
+        token = (bot_token or os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
+        if not token:
+            msg = "ERROR: TELEGRAM_BOT_TOKEN not set; cannot set webhook"
+            print(msg)
+            logger.error(msg)
+            return False
+        domain = (vercel_domain or "").strip()
+        if not domain:
+            msg = "ERROR: VERCEL_DOMAIN not provided. Usage: python main.py --set-webhook <VERCEL_DOMAIN>"
+            print(msg)
+            logger.error(msg)
+            return False
+        # Normalize domain: ensure https:// and no trailing slash, then /api/webhook
+        if not domain.startswith("http"):
+            domain = f"https://{domain}"
+        domain = domain.rstrip("/")
+        # If domain already ends with /api/webhook, don't duplicate
+        if domain.endswith("/api/webhook"):
+            webhook_url = domain
+        else:
+            webhook_url = f"{domain}/api/webhook"
+        print(f"[WEBHOOK] Setting Telegram webhook to: {webhook_url}")
+        logger.info("Setting Telegram webhook to %s", webhook_url)
+
+        # Call Telegram setWebhook
+        url = f"https://api.telegram.org/bot{token}/setWebhook"
+        payload = {"url": webhook_url, "allowed_updates": ["callback_query", "message"]}
+        # Use POST with JSON
+        try:
+            resp = requests.post(url, json=payload, timeout=15)
+            # Also try GET fallback for debugging
+            status = resp.status_code
+            try:
+                body = resp.json()
+            except Exception:
+                body = resp.text[:500] if resp.text else ""
+            print(f"[WEBHOOK] HTTP {status} Response: {json.dumps(body, ensure_ascii=False) if isinstance(body, dict) else body}")
+            logger.info("setWebhook response %s: %s", status, body)
+            if resp.status_code == 200:
+                # Check Telegram's ok field
+                try:
+                    data = resp.json() if isinstance(body, dict) else json.loads(body) if isinstance(body, str) and body.startswith("{") else {}
+                    if isinstance(data, dict) and data.get("ok"):
+                        msg = f"✅ Webhook set successfully to {webhook_url}"
+                        print(msg)
+                        logger.info(msg)
+                        return True
+                    else:
+                        # Even if not ok, consider success if HTTP 200
+                        if data.get("ok") is False:
+                            print(f"[WEBHOOK ERROR] Telegram returned ok=false: {data}")
+                            logger.warning("setWebhook returned not ok: %s", data)
+                            return False
+                        print(f"[WEBHOOK] Set webhook completed with HTTP 200 (response: {body})")
+                        return True
+                except Exception:
+                    # If not JSON, assume success on 200
+                    print(f"✅ Webhook set to {webhook_url} (HTTP 200)")
+                    return True
+            else:
+                print(f"[WEBHOOK ERROR] Failed to set webhook: HTTP {status} {body}")
+                logger.warning("setWebhook failed HTTP %s: %s", status, body)
+                return False
+        except requests.exceptions.RequestException as exc:
+            print(f"[WEBHOOK ERROR] Request failed: {exc}")
+            logger.warning("setWebhook request failed: %s", exc)
+            return False
+    except Exception as exc:
+        print(f"[WEBHOOK ERROR] Unexpected: {exc}")
+        logger.warning("set_telegram_webhook failed: %s", exc)
+        import traceback
+        traceback.print_exc()
+        return False
+
+
+def check_webhook_status(bot_token: Optional[str] = None) -> bool:
+    """Check Telegram webhook status via getWebhookInfo.
+
+    Queries https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/getWebhookInfo
+    and prints url, has_custom_certificate, pending_update_count,
+    last_error_date, last_error_message. Never raises.
+    """
+    try:
+        token = (bot_token or os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
+        if not token:
+            msg = "ERROR: TELEGRAM_BOT_TOKEN not set; cannot check webhook"
+            print(msg)
+            logger.error(msg)
+            return False
+        url = f"https://api.telegram.org/bot{token}/getWebhookInfo"
+        print(f"[WEBHOOK CHECK] Querying getWebhookInfo...")
+        logger.info("Checking webhook status via %s", url.replace(token, "***"))
+        try:
+            resp = requests.get(url, timeout=15)
+            status = resp.status_code
+            print(f"[WEBHOOK CHECK] HTTP {status}")
+            try:
+                data = resp.json()
+            except Exception:
+                data = {"raw": resp.text[:1000] if resp.text else ""}
+            # Telegram returns {"ok": true, "result": {...}}
+            result = data.get("result", {}) if isinstance(data, dict) else {}
+            if not isinstance(result, dict):
+                result = {}
+            url_field = result.get("url", "")
+            has_cert = result.get("has_custom_certificate", "")
+            pending = result.get("pending_update_count", "")
+            last_error_date = result.get("last_error_date", "")
+            last_error_msg = result.get("last_error_message", "")
+            # Format last_error_date
+            last_error_date_str = "None"
+            if last_error_date:
+                try:
+                    dt = datetime.fromtimestamp(int(last_error_date), tz=timezone.utc)
+                    try:
+                        if ZoneInfo is not None:
+                            dt_c = dt.astimezone(ZoneInfo("Africa/Cairo"))
+                            last_error_date_str = f"{last_error_date} ({dt_c.isoformat()})"
+                        else:
+                            last_error_date_str = f"{last_error_date} ({dt.isoformat()})"
+                    except Exception:
+                        last_error_date_str = str(last_error_date)
+                except Exception:
+                    last_error_date_str = str(last_error_date)
+            # Use safe prints (avoid cp1252 emoji issues)
+            try:
+                print(f"url: {url_field}")
+                print(f"has_custom_certificate: {has_cert}")
+                print(f"pending_update_count: {pending}")
+                print(f"last_error_date: {last_error_date_str}")
+                msg_val = last_error_msg if last_error_msg else "None"
+                # Ensure ascii-safe
+                try:
+                    print(f"last_error_message: {msg_val}")
+                except Exception:
+                    print(f"last_error_message: {repr(msg_val)}")
+            except Exception as e:
+                # Fallback with repr
+                print(f"url: {repr(url_field)}")
+                print(f"last_error_message: {repr(last_error_msg)}")
+            logger.info("check_webhook_status: url=%s pending=%s last_error=%s", url_field, pending, last_error_msg)
+            return True
+        except requests.exceptions.RequestException as exc:
+            print(f"[WEBHOOK CHECK ERROR] Request failed: {exc}")
+            logger.warning("getWebhookInfo request failed: %s", exc)
+            return False
+    except Exception as exc:
+        print(f"[WEBHOOK CHECK ERROR] Unexpected: {exc}")
+        logger.warning("check_webhook_status failed: %s", exc)
+        import traceback
+        traceback.print_exc()
+        return False
+
+
+def test_vercel_webhook(vercel_url: str = "https://egx-stock-screener.vercel.app/api/webhook", bot_token: Optional[str] = None) -> bool:
+    """Test Vercel webhook endpoint with mock callback_query.
+
+    Sends HTTP POST with fake Telegram callback_query payload (data: act_TEST.CA)
+    directly to https://egx-stock-screener.vercel.app/api/webhook and prints
+    HTTP status code and body. Never raises.
+    """
+    try:
+        url = (vercel_url or "https://egx-stock-screener.vercel.app/api/webhook").strip()
+        if not url.startswith("http"):
+            url = f"https://{url}"
+        print(f"[VERCEL TEST] Sending mock callback_query to {url}")
+        logger.info("Testing Vercel webhook at %s", url)
+        payload: Dict[str, Any] = {
+            "update_id": 999999,
+            "callback_query": {
+                "id": "test_12345",
+                "from": {"id": 123456, "is_bot": False, "first_name": "Test"},
+                "message": {"message_id": 1, "chat": {"id": 123, "type": "private"}},
+                "data": "act_TEST.CA",
+                "chat_instance": "test_instance",
+            },
+        }
+        try:
+            resp = requests.post(
+                url,
+                json=payload,
+                headers={"Content-Type": "application/json"},
+                timeout=15,
+            )
+            status = resp.status_code
+            try:
+                body = resp.text[:2000] if resp.text else "(empty body)"
+            except Exception:
+                body = "(no body)"
+            print(f"[VERCEL TEST] HTTP {status}")
+            # Print body safely
+            try:
+                print(f"[VERCEL TEST] Response Body: {body}")
+            except Exception:
+                print(f"[VERCEL TEST] Response Body (repr): {repr(body[:500])}")
+            logger.info("test_vercel_webhook %s -> %s %s", url, status, body[:500] if isinstance(body, str) else body)
+            # Consider 2xx as success
+            return status in (200, 201, 204)
+        except requests.exceptions.RequestException as exc:
+            print(f"[VERCEL TEST ERROR] Request failed: {exc}")
+            logger.warning("test_vercel_webhook request failed: %s", exc)
+            return False
+    except Exception as exc:
+        print(f"[VERCEL TEST ERROR] Unexpected: {exc}")
+        logger.warning("test_vercel_webhook failed: %s", exc)
+        import traceback
+        traceback.print_exc()
+        return False
 
 
 def fmt(value: Optional[float], digits: int = 2) -> str:
@@ -3259,6 +3668,13 @@ def process_ticker(ticker: str, state: Dict[str, Any]) -> None:
                 DUPLICATE_WINDOW_HOURS,
             )
             continue
+        # Supabase-backed deduplication: check sent_alerts for (ticker, strategy, date_sent=Cairo today)
+        try:
+            if is_already_sent_today_supabase(ticker, strategy):
+                logger.info("[%s] %s already sent today (Supabase sent_alerts); skipping duplicate.", ticker, strategy)
+                continue
+        except Exception as exc:
+            logger.warning("[%s] Supabase dedup check failed (%s); continuing", ticker, exc)
         # TQI threshold filter — EGX liquidity adapted: skip only if TQI < 5.0
         try:
             tqi_for_filter, track_for_filter, _ = resolve_tqi(ctx, strategy, sentiment)
@@ -3280,29 +3696,65 @@ def process_ticker(ticker: str, state: Dict[str, Any]) -> None:
                 chat_id = os.environ.get(CHANNEL_ENV.get(strategy, ""), "") or os.getenv("TELEGRAM_CHAT_ID", "")
         except Exception:
             chat_id = os.environ.get(CHANNEL_ENV.get(strategy, ""), "") or os.getenv("TELEGRAM_CHAT_ID", "")
-        # Build inline keyboard for interactive trade management (attached regardless of channel)
+        # Pre-compute trade details for keyboard and persistence (ensures webhook gets full payload)
         try:
-            keyboard = build_trade_keyboard(ticker)
-        except Exception:
-            keyboard = None
-        if send_telegram(chat_id, message, bot_token, reply_markup=keyboard):
-            mark_sent(state, ticker, strategy)
-            logger.info("[%s] %s alert sent to channel %s.", ticker, strategy, chat_id)
-            # Persist active position for trailing stop tracking
+            plan_for_pos = STRATEGY_PLAN.get(strategy, {})
+            entry_price_pos = float(ctx.get("price") or 0.0) if isinstance(ctx, dict) else 0.0
+            targets_pos = plan_for_pos.get("targets_pct", (0.03, 0.05, 0.08))
+            if not isinstance(targets_pos, (list, tuple)) or len(targets_pos) < 3:
+                targets_pos = (0.03, 0.05, 0.08)
+            p1_pos, p2_pos, p3_pos = float(targets_pos[0]), float(targets_pos[1]), float(targets_pos[2])
+            sl_pct_pos = float(plan_for_pos.get("sl_pct", -0.03)) if plan_for_pos.get("sl_pct") is not None else -0.03
+            t1_pos = entry_price_pos * (1 + p1_pos)
+            t2_pos = entry_price_pos * (1 + p2_pos)
+            t3_pos = entry_price_pos * (1 + p3_pos)
+            sl_price_pos = entry_price_pos * (1 + sl_pct_pos)
+            trade_track_pos = track_for_filter if isinstance(track_for_filter, str) and track_for_filter else TQI_TRACK_LABELS.get(strategy, str(strategy))
+        except Exception as exc:
+            logger.warning("[%s] failed to pre-compute trade details for keyboard: %s", ticker, exc)
+            # Fallback defaults for keyboard
             try:
-                plan_for_pos = STRATEGY_PLAN.get(strategy, {})
+                trade_track_pos = track_for_filter if isinstance(track_for_filter, str) and track_for_filter else TQI_TRACK_LABELS.get(strategy, str(strategy))
                 entry_price_pos = float(ctx.get("price") or 0.0) if isinstance(ctx, dict) else 0.0
+                # Use plan defaults if available
+                plan_for_pos = STRATEGY_PLAN.get(strategy, {})
                 targets_pos = plan_for_pos.get("targets_pct", (0.03, 0.05, 0.08))
-                if not isinstance(targets_pos, (list, tuple)) or len(targets_pos) < 3:
-                    targets_pos = (0.03, 0.05, 0.08)
                 p1_pos, p2_pos, p3_pos = float(targets_pos[0]), float(targets_pos[1]), float(targets_pos[2])
                 sl_pct_pos = float(plan_for_pos.get("sl_pct", -0.03)) if plan_for_pos.get("sl_pct") is not None else -0.03
                 t1_pos = entry_price_pos * (1 + p1_pos)
                 t2_pos = entry_price_pos * (1 + p2_pos)
                 t3_pos = entry_price_pos * (1 + p3_pos)
                 sl_price_pos = entry_price_pos * (1 + sl_pct_pos)
-                # Use resolved track if available, else mapping
-                trade_track_pos = track_for_filter if isinstance(track_for_filter, str) and track_for_filter else TQI_TRACK_LABELS.get(strategy, str(strategy))
+            except Exception:
+                entry_price_pos = 0.0
+                t1_pos = t2_pos = t3_pos = sl_price_pos = 0.0
+                trade_track_pos = TQI_TRACK_LABELS.get(strategy, str(strategy))
+        # Build inline keyboard with full trade specs for instant Supabase upsert in webhook
+        try:
+            keyboard = build_trade_keyboard(ticker, entry_price_pos, sl_price_pos, t1_pos, t2_pos, t3_pos, trade_track_pos)
+        except Exception:
+            try:
+                keyboard = build_trade_keyboard(ticker)
+            except Exception:
+                keyboard = None
+        if send_telegram(chat_id, message, bot_token, reply_markup=keyboard):
+            mark_sent(state, ticker, strategy)
+            logger.info("[%s] %s alert sent to channel %s.", ticker, strategy, chat_id)
+            # Supabase-backed deduplication: immediately write into sent_alerts
+            try:
+                record_sent_alert_supabase(
+                    ticker=ticker,
+                    strategy=strategy,
+                    entry_price=entry_price_pos,
+                    current_stop_loss=sl_price_pos,
+                    target_1=t1_pos,
+                    target_2=t2_pos,
+                    target_3=t3_pos,
+                )
+            except Exception as exc:
+                logger.warning("[%s] failed to record sent_alerts in Supabase: %s", ticker, exc)
+            # Persist active position for trailing stop tracking (using pre-computed details)
+            try:
                 add_active_position(
                     ticker=ticker,
                     entry_price=entry_price_pos,
@@ -3347,6 +3799,15 @@ def parse_mode(argv: Optional[List[str]] = None) -> str:
         action="store_true",
         help="Test Supabase connection by inserting dummy TEST.CA trade and verifying",
     )
+    parser.add_argument(
+        "--set-webhook",
+        dest="set_webhook",
+        type=str,
+        nargs="?",
+        const="",
+        default=None,
+        help="Set Telegram webhook to Vercel domain (e.g., https://your-app.vercel.app) and exit",
+    )
     args, _ = parser.parse_known_args(argv)
     return args.mode
 
@@ -3376,6 +3837,50 @@ def should_test_supabase(argv: Optional[List[str]] = None) -> bool:
     except Exception:
         check_argv = argv if argv is not None else sys.argv
         return "--test-supabase" in check_argv
+
+
+def get_set_webhook_domain(argv: Optional[List[str]] = None) -> Optional[str]:
+    """Get Vercel domain from --set-webhook flag if present."""
+    try:
+        parser = argparse.ArgumentParser(add_help=False)
+        parser.add_argument("--set-webhook", dest="set_webhook", type=str, nargs="?", const="", default=None)
+        args, _ = parser.parse_known_args(argv)
+        val = getattr(args, "set_webhook", None)
+        # Also check raw argv for --set-webhook=value form
+        if val is None:
+            check_argv = argv if argv is not None else sys.argv
+            for arg in check_argv:
+                if arg.startswith("--set-webhook="):
+                    return arg.split("=", 1)[1].strip()
+                if arg == "--set-webhook":
+                    # Next arg is value if not starting with --
+                    idx = check_argv.index(arg)
+                    if idx + 1 < len(check_argv) and not check_argv[idx + 1].startswith("--"):
+                        return check_argv[idx + 1].strip()
+            return None
+        # val could be "" if flag without value
+        if val == "":
+            # Try to get next arg as value
+            check_argv = argv if argv is not None else sys.argv
+            for i, arg in enumerate(check_argv):
+                if arg == "--set-webhook" and i + 1 < len(check_argv) and not check_argv[i + 1].startswith("--"):
+                    return check_argv[i + 1].strip()
+            return val if val else None
+        return val.strip() if isinstance(val, str) and val.strip() else None
+    except Exception:
+        try:
+            check_argv = argv if argv is not None else sys.argv
+            for i, arg in enumerate(check_argv):
+                if arg.startswith("--set-webhook"):
+                    if "=" in arg:
+                        return arg.split("=", 1)[1].strip()
+                    if i + 1 < len(check_argv):
+                        nxt = check_argv[i + 1]
+                        if not nxt.startswith("--"):
+                            return nxt.strip()
+        except Exception:
+            pass
+        return None
 
 
 NONEWS_FALLBACK_PHRASES: List[str] = ["لا توجد أخبار", "المؤشرات الفنية فقط"]
@@ -3553,6 +4058,33 @@ def main() -> int:
             return 0
     except Exception as exc:
         logger.warning("Listener check failed: %s", exc)
+
+    # Webhook auto-registration support: --set-webhook <VERCEL_DOMAIN>
+    try:
+        domain = get_set_webhook_domain()
+        if domain is not None:
+            if not domain or domain.strip() == "":
+                print("ERROR: --set-webhook requires <VERCEL_DOMAIN> argument (e.g., https://your-app.vercel.app)")
+                logger.error("No domain provided for --set-webhook")
+                return 1
+            logger.info("Setting Telegram webhook (--set-webhook) to %s", domain)
+            success = set_telegram_webhook(domain.strip())
+            return 0 if success else 1
+        # Handle case where flag is present without value (argparse const="")
+        if "--set-webhook" in sys.argv:
+            # Check if next arg is missing or is another flag
+            try:
+                idx = sys.argv.index("--set-webhook")
+                if idx + 1 >= len(sys.argv) or sys.argv[idx + 1].startswith("--"):
+                    print("ERROR: --set-webhook requires <VERCEL_DOMAIN> argument")
+                    logger.error("Missing VERCEL_DOMAIN for --set-webhook")
+                    return 1
+            except Exception:
+                pass
+    except SystemExit:
+        raise
+    except Exception as exc:
+        logger.warning("set-webhook check failed: %s", exc)
 
     check_required_env()
     # Ensure active_positions.json exists for workflow auto-commit (git add will fail if missing)

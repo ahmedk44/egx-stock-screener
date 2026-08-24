@@ -1,59 +1,268 @@
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(200).send('OK');
 
+  // Ensure body is parsed (Vercel may not auto-parse)
+  let update = req.body;
+  if (typeof update === 'string') {
+    try {
+      update = JSON.parse(update);
+    } catch (e) {
+      console.error('[WEBHOOK] Failed to parse body string:', e);
+    }
+  }
+
   try {
-    const update = req.body;
     if (update && update.callback_query) {
       const query = update.callback_query;
       const callbackId = query.id;
-      const data = query.data;
+      const data = query.data || "";
       const botToken = process.env.TELEGRAM_BOT_TOKEN;
       const supabaseUrl = process.env.SUPABASE_URL;
-      const supabaseKey = process.env.SUPABASE_KEY;
+      const supabaseKey = process.env.SUPABASE_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+      console.log(`[WEBHOOK] Received callback_query id=${callbackId} data=${data}`);
 
       let popupText = "تم التحديث بنجاح!";
       let newStatus = null;
       let ticker = null;
 
-      if (data.startsWith('act_')) {
-        ticker = data.replace('act_', '');
-        newStatus = 'ACTIVE';
-        popupText = "✅ تم تفعيل المراقبة بنجاح!";
-      } else if (data.startsWith('dis_')) {
-        ticker = data.replace('dis_', '');
-        newStatus = 'DISMISSED';
-        popupText = "❌ تم إلغاء متابعة الصفقة.";
-      } else if (data.startsWith('cls_')) {
-        ticker = data.replace('cls_', '');
-        newStatus = 'CLOSED';
-        popupText = "🏁 تم إغلاق الصفقة يدوياً.";
+      try {
+        if (data.startsWith('act_')) {
+          // Extract ticker from callback_data (supports enhanced act_{ticker}|... or legacy act_{ticker})
+          const payload = data.replace('act_', '');
+          const parts = payload.split('|');
+          ticker = parts[0] ? parts[0].trim() : "";
+          newStatus = 'ACTIVE';
+          // Required popup per spec for activation
+          popupText = "✅ تم تفعيل الصفقة بنجاح وحفظها في Supabase!";
+          console.log(`[WEBHOOK] Act activation for ticker=${ticker}`);
+        } else if (data.startsWith('dis_')) {
+          const raw = data.replace('dis_', '');
+          ticker = raw.split('|')[0].trim();
+          newStatus = 'DISMISSED';
+          popupText = "❌ تم إلغاء متابعة الصفقة.";
+        } else if (data.startsWith('cls_')) {
+          const raw = data.replace('cls_', '');
+          ticker = raw.split('|')[0].trim();
+          newStatus = 'CLOSED';
+          popupText = "🏁 تم إغلاق الصفقة يدوياً.";
+        }
+      } catch (e) {
+        console.error('[WEBHOOK ERROR] Failed to parse callback_data:', e);
       }
 
+      // Handle تفعيل الصفقة: fetch from sent_alerts and insert into active_positions
       if (newStatus && ticker && supabaseUrl && supabaseKey) {
-        await fetch(`${supabaseUrl}/rest/v1/active_positions?ticker=eq.${ticker}`, {
-          method: 'PATCH',
-          headers: {
-            'apikey': supabaseKey,
-            'Authorization': `Bearer ${supabaseKey}`,
-            'Content-Type': 'application/json',
-            'Prefer': 'return=minimal'
-          },
-          body: JSON.stringify({ status: newStatus })
-        });
+        try {
+          console.log(`[SUPABASE] Starting activation flow for ${ticker} -> ${newStatus}`);
+
+          // Special handling for act_ : fetch latest from sent_alerts then insert into active_positions
+          if (data.startsWith('act_')) {
+            let tradeDetails = null;
+
+            // 1) Fetch latest alert details for that ticker from sent_alerts
+            try {
+              const sentUrl = `${supabaseUrl}/rest/v1/sent_alerts?ticker=eq.${encodeURIComponent(ticker)}&order=created_at.desc&limit=1&select=*`;
+              console.log(`[SUPABASE] Fetching from sent_alerts: ${sentUrl}`);
+              const getRes = await fetch(sentUrl, {
+                method: 'GET',
+                headers: {
+                  'apikey': supabaseKey,
+                  'Authorization': `Bearer ${supabaseKey}`,
+                  'Content-Type': 'application/json',
+                },
+              });
+              const getBody = await getRes.text().catch(() => '');
+              console.log(`[SUPABASE] GET sent_alerts ${ticker} -> ${getRes.status} body: ${getBody}`);
+
+              if (getRes.ok) {
+                try {
+                  const parsed = JSON.parse(getBody);
+                  if (Array.isArray(parsed) && parsed.length > 0) {
+                    const latest = parsed[0];
+                    tradeDetails = {
+                      ticker: latest.ticker || ticker,
+                      entry_price: latest.entry_price,
+                      current_stop_loss: latest.current_stop_loss,
+                      target_1: latest.target_1,
+                      target_2: latest.target_2,
+                      target_3: latest.target_3,
+                    };
+                    console.log(`[SUPABASE] Found sent_alert for ${ticker}:`, tradeDetails);
+                  } else {
+                    console.log(`[SUPABASE] No sent_alert found for ${ticker}, will try fallback from callback_data`);
+                  }
+                } catch (parseErr) {
+                  console.error(`[SUPABASE ERROR] Failed to parse sent_alerts JSON for ${ticker}:`, parseErr);
+                }
+              } else {
+                console.error(`[SUPABASE ERROR] GET sent_alerts failed ${getRes.status}: ${getBody}`);
+              }
+            } catch (fetchErr) {
+              console.error(`[SUPABASE ERROR] Fetch sent_alerts failed for ${ticker}:`, fetchErr);
+            }
+
+            // Fallback: if no sent_alerts record, try extracting from callback_data pipes (enhanced payload)
+            if (!tradeDetails || tradeDetails.entry_price == null) {
+              try {
+                if (data.includes('|')) {
+                  const parts = data.replace('act_', '').split('|');
+                  if (parts.length >= 6) {
+                    tradeDetails = {
+                      ticker: parts[0].trim(),
+                      entry_price: parseFloat(parts[1]),
+                      current_stop_loss: parseFloat(parts[2]),
+                      target_1: parseFloat(parts[3]),
+                      target_2: parseFloat(parts[4]),
+                      target_3: parseFloat(parts[5]),
+                    };
+                    console.log(`[SUPABASE] Fallback extracted from callback_data for ${ticker}:`, tradeDetails);
+                  }
+                }
+              } catch (e) {
+                console.error(`[SUPABASE ERROR] Fallback extraction failed:`, e);
+              }
+            }
+
+            // 2) Insert retrieved trade details into active_positions
+            if (tradeDetails && tradeDetails.entry_price != null) {
+              try {
+                const insertPayload = {
+                  ticker: tradeDetails.ticker,
+                  entry_price: parseFloat(tradeDetails.entry_price),
+                  current_stop_loss: parseFloat(tradeDetails.current_stop_loss) || parseFloat(tradeDetails.entry_price),
+                  target_1: parseFloat(tradeDetails.target_1) || parseFloat(tradeDetails.entry_price),
+                  target_2: parseFloat(tradeDetails.target_2) || parseFloat(tradeDetails.entry_price),
+                  target_3: parseFloat(tradeDetails.target_3) || parseFloat(tradeDetails.entry_price),
+                  trade_track: 'Scalp',
+                  status: 'ACTIVE',
+                  timestamp: new Date().toISOString(),
+                };
+                console.log(`[SUPABASE] Inserting into active_positions:`, insertPayload);
+                const postRes = await fetch(`${supabaseUrl}/rest/v1/active_positions?on_conflict=ticker,trade_track`, {
+                  method: 'POST',
+                  headers: {
+                    'apikey': supabaseKey,
+                    'Authorization': `Bearer ${supabaseKey}`,
+                    'Content-Type': 'application/json',
+                    'Prefer': 'resolution=merge-duplicates,return=representation',
+                  },
+                  body: JSON.stringify(insertPayload),
+                });
+                const postBody = await postRes.text().catch(() => '');
+                console.log(`[SUPABASE] POST active_positions ${ticker} -> ${postRes.status} body: ${postBody}`);
+                if (!postRes.ok) {
+                  console.error(`[SUPABASE ERROR] Insert into active_positions failed ${postRes.status}: ${postBody}`);
+                }
+              } catch (insertErr) {
+                console.error(`[SUPABASE ERROR] Insert active_positions failed for ${ticker}:`, insertErr);
+              }
+            } else {
+              console.error(`[SUPABASE ERROR] No tradeDetails available for ${ticker}, cannot insert into active_positions`);
+              // Last resort minimal insert to ensure row exists
+              try {
+                const minimal = {
+                  ticker: ticker,
+                  entry_price: 0,
+                  current_stop_loss: 0,
+                  target_1: 0,
+                  target_2: 0,
+                  target_3: 0,
+                  trade_track: 'Scalp',
+                  status: 'ACTIVE',
+                  timestamp: new Date().toISOString(),
+                };
+                const fallbackRes = await fetch(`${supabaseUrl}/rest/v1/active_positions?on_conflict=ticker,trade_track`, {
+                  method: 'POST',
+                  headers: {
+                    'apikey': supabaseKey,
+                    'Authorization': `Bearer ${supabaseKey}`,
+                    'Content-Type': 'application/json',
+                    'Prefer': 'resolution=merge-duplicates,return=representation',
+                  },
+                  body: JSON.stringify(minimal),
+                });
+                const fallbackBody = await fallbackRes.text().catch(() => '');
+                console.log(`[SUPABASE] Fallback minimal POST ${ticker} -> ${fallbackRes.status} ${fallbackBody}`);
+              } catch (e) {
+                console.error(`[SUPABASE ERROR] Fallback minimal insert failed:`, e);
+              }
+            }
+          }
+
+          // Also perform PATCH status update for all actions (covers DISMISSED/CLOSED and ensures ACTIVE status synced)
+          try {
+            const patchRes = await fetch(`${supabaseUrl}/rest/v1/active_positions?ticker=eq.${encodeURIComponent(ticker)}`, {
+              method: 'PATCH',
+              headers: {
+                'apikey': supabaseKey,
+                'Authorization': `Bearer ${supabaseKey}`,
+                'Content-Type': 'application/json',
+                'Prefer': 'return=minimal',
+              },
+              body: JSON.stringify({ status: newStatus }),
+            });
+            const patchBody = await patchRes.text().catch(() => '');
+            console.log(`[SUPABASE] PATCH ${ticker} -> ${newStatus} status: ${patchRes.status} body: ${patchBody}`);
+            if (!patchRes.ok) {
+              console.error(`[SUPABASE ERROR] PATCH failed for ${ticker} ${patchRes.status}: ${patchBody}`);
+            }
+          } catch (patchErr) {
+            console.error(`[SUPABASE ERROR] PATCH request failed for ${ticker}:`, patchErr);
+          }
+        } catch (e) {
+          console.error(`[SUPABASE ERROR] Activation flow failed for ${ticker} -> ${newStatus}:`, e);
+          // Explicit fallback POST attempt
+          try {
+            const fallback = await fetch(`${supabaseUrl}/rest/v1/active_positions`, {
+              method: 'POST',
+              headers: {
+                'apikey': supabaseKey,
+                'Authorization': `Bearer ${supabaseKey}`,
+                'Content-Type': 'application/json',
+                'Prefer': 'resolution=merge-duplicates,return=representation',
+              },
+              body: JSON.stringify({ ticker, status: newStatus }),
+            });
+            const fbBody = await fallback.text().catch(() => '');
+            console.log(`[SUPABASE] Emergency fallback POST ${ticker} -> ${fallback.status} ${fbBody}`);
+          } catch (e2) {
+            console.error(`[SUPABASE ERROR] Emergency fallback failed:`, e2);
+          }
+        }
+      } else if (newStatus && ticker) {
+        console.warn(`[SUPABASE] Skipping Supabase update: missing URL or Key (url=${!!supabaseUrl}, key=${!!supabaseKey})`);
       }
 
-      await fetch(`https://api.telegram.org/bot${botToken}/answerCallbackQuery`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          callback_query_id: callbackId,
-          text: popupText,
-          show_alert: true
-        })
-      });
+      // Send answerCallbackQuery back to Telegram so the user receives a popup alert
+      if (botToken && callbackId) {
+        try {
+          console.log(`[TELEGRAM] Sending answerCallbackQuery id=${callbackId} text=${popupText}`);
+          const answerRes = await fetch(`https://api.telegram.org/bot${botToken}/answerCallbackQuery`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              callback_query_id: callbackId,
+              text: popupText,
+              show_alert: true,
+            }),
+          });
+          const answerBody = await answerRes.text().catch(() => '');
+          console.log(`[TELEGRAM] answerCallbackQuery ${callbackId} -> ${popupText} status: ${answerRes.status} body: ${answerBody}`);
+          if (!answerRes.ok) {
+            console.error(`[TELEGRAM ERROR] answerCallbackQuery failed ${answerRes.status}: ${answerBody}`);
+          }
+        } catch (e) {
+          console.error(`[TELEGRAM ERROR] answerCallbackQuery exception:`, e);
+        }
+      } else {
+        console.warn(`[TELEGRAM] Skipping answerCallbackQuery: missing token or callbackId (token=${!!botToken}, id=${callbackId})`);
+      }
+    } else {
+      console.log('[WEBHOOK] No callback_query in update, ignoring');
     }
   } catch (err) {
-    console.error(err);
+    console.error('[WEBHOOK ERROR] Top-level handler error:', err);
   }
 
   return res.status(200).send('OK');
