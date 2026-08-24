@@ -1,4 +1,13 @@
+function normalizeTicker(symbol) {
+  if (!symbol || typeof symbol !== 'string') return '';
+  let t = symbol.trim().toUpperCase();
+  if (!t) return '';
+  if (!t.endsWith('.CA')) t = `${t}.CA`;
+  return t;
+}
+
 export default async function handler(req, res) {
+  let httpResponded = false;
   if (req.method !== 'POST') return res.status(200).send('OK');
 
   // Ensure body is parsed (Vercel may not auto-parse)
@@ -28,22 +37,22 @@ export default async function handler(req, res) {
 
       try {
         if (data.startsWith('act_')) {
-          // Extract ticker from callback_data (supports enhanced act_{ticker}|... or legacy act_{ticker})
+          // Extract ticker from callback_data (supports enhanced act_{ticker}|... or legacy act_{ticker}) – normalize strictly
           const payload = data.replace('act_', '');
           const parts = payload.split('|');
-          ticker = parts[0] ? parts[0].trim() : "";
+          ticker = normalizeTicker(parts[0] || "");
           newStatus = 'ACTIVE';
           // Required popup per spec for activation
           popupText = "✅ تم تفعيل الصفقة بنجاح وحفظها في Supabase!";
           console.log(`[WEBHOOK] Act activation for ticker=${ticker}`);
         } else if (data.startsWith('dis_')) {
           const raw = data.replace('dis_', '');
-          ticker = raw.split('|')[0].trim();
+          ticker = normalizeTicker(raw.split('|')[0] || raw);
           newStatus = 'DISMISSED';
           popupText = "❌ تم إلغاء متابعة الصفقة.";
         } else if (data.startsWith('cls_')) {
           const raw = data.replace('cls_', '');
-          ticker = raw.split('|')[0].trim();
+          ticker = normalizeTicker(raw.split('|')[0] || raw);
           newStatus = 'CLOSED';
           popupText = "🏁 تم إغلاق الصفقة يدوياً.";
         }
@@ -71,7 +80,18 @@ export default async function handler(req, res) {
         }
       }
 
-      // Handle Supabase actions: act -> insert, dis/cls -> explicit DELETE
+      // Immediately acknowledge HTTP 200 before DB work to kill Telegram retry loop
+      try {
+        if (!res.writableEnded && !res.headersSent) {
+          res.status(200).send('OK');
+          httpResponded = true;
+          console.log('[WEBHOOK] Immediate HTTP 200 sent (before DB) to prevent retry storm');
+        }
+      } catch (e) {
+        console.error('[WEBHOOK] Immediate HTTP 200 failed:', e);
+      }
+
+      // Handle Supabase actions: act -> insert, dis/cls -> explicit DELETE (with normalized ticker)
       if (newStatus && ticker && supabaseUrl && supabaseKey) {
         try {
           console.log(`[SUPABASE] Starting callback flow for ${ticker} -> ${newStatus}`);
@@ -394,5 +414,7 @@ export default async function handler(req, res) {
     console.error('[WEBHOOK ERROR] Top-level handler error:', err);
   }
 
-  return res.status(200).send('OK');
-}
+  if (!httpResponded && !res.writableEnded && !res.headersSent) {
+    return res.status(200).send('OK');
+  }
+  return;

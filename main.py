@@ -20,6 +20,7 @@ the same stock + strategy within a 12-hour window.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -552,8 +553,216 @@ def normalize_ticker(ticker: str) -> str:
             return ""
 
 
+def generate_signal_hash(ticker: str, signal_type: str, entry_price: Optional[float], reason: Optional[str], alert_date: Optional[str] = None) -> str:
+    """Create a signal hash / signature for smart deduplication.
+
+    Normalizes ticker (COMI.CA -> COMI.CA), standardizes reason and entry_price (round to float precision),
+    and computes composite key or hash: {ticker}_{signal_type}_{entry_price}_{date}
+    Using MD5 for compactness while keeping composite readable for debugging.
+
+    Args:
+        ticker: Stock symbol (e.g., COMI, COMI.CA, ELWA.CA)
+        signal_type: Strategy name (scalping, swing, investment)
+        entry_price: Entry price (rounded to 2 decimals)
+        reason: Technical reason or signal context (standardized)
+        alert_date: Date string YYYY-MM-DD (defaults to today's Cairo date)
+
+    Returns:
+        Hash string (hex MD5) or composite key for dedup lookup.
+    """
+    try:
+        nt = normalize_ticker(ticker)
+        st = str(signal_type).strip().lower() if signal_type else "unknown"
+        # Standardize entry_price – round to 2 decimals, handle None
+        try:
+            ep = float(entry_price) if entry_price is not None else 0.0
+            ep_str = f"{ep:.2f}"
+        except Exception:
+            ep_str = "0.00"
+        # Standardize reason – strip, lower, collapse whitespace, limit length
+        try:
+            r = str(reason).strip().lower() if reason else ""
+            # Collapse whitespace and limit to first 100 chars for stability
+            r = re.sub(r"\s+", " ", r)[:100]
+            # Remove non-alphanumeric except arabic/english for stability
+            r = r.strip()
+            if not r:
+                r = "no_reason"
+        except Exception:
+            r = "no_reason"
+        # Use provided alert_date or today's Cairo date
+        try:
+            ad = str(alert_date).strip() if alert_date else _today_cairo_date_str()
+            # Validate date format YYYY-MM-DD, fallback to today if invalid
+            if not re.match(r"^\d{4}-\d{2}-\d{2}$", ad):
+                ad = _today_cairo_date_str()
+        except Exception:
+            ad = _today_cairo_date_str()
+        # Composite key for readability and debugging
+        composite = f"{nt}_{st}_{ep_str}_{ad}_{r[:30]}"
+        # Compute MD5 hash for compact storage and comparison
+        try:
+            hash_val = hashlib.md5(composite.encode("utf-8")).hexdigest()
+            # Return composite + hash for traceability, but hash is primary
+            # For Supabase lookup, we can use hash; for logging, composite is useful
+            return hash_val
+        except Exception:
+            # Fallback to composite if hashlib fails
+            return re.sub(r"[^A-Z0-9_\.]", "_", composite.upper())[:64]
+    except Exception:
+        # Ultimate fallback – simple composite
+        try:
+            return f"{str(ticker).strip().upper()}_{str(signal_type).strip().lower()}_{str(entry_price)}_{str(alert_date or _today_cairo_date_str())}"[:64]
+        except Exception:
+            return "unknown_signal_hash"
+
+
+def is_exact_duplicate_signal(ticker: str, signal_type: str, entry_price: Optional[float], reason: Optional[str], alert_date: Optional[str] = None) -> bool:
+    """Smart deduplication lookup – check if this specific signal_hash already exists in sent_alerts for TODAY.
+
+    - Checks Supabase sent_alerts for signal_hash (or composite fallback) for today's Cairo date.
+    - Also checks in-memory cache for same-loop deduplication.
+    - If signal_hash EXISTS: return True (skip, already dispatched)
+    - If DOES NOT EXIST (even if ticker exists in active positions or was sent earlier with different criteria): return False (proceed)
+
+    Never raises – logs gracefully.
+    """
+    try:
+        nt = normalize_ticker(ticker)
+        # Generate hash for this signal
+        try:
+            sig_hash = generate_signal_hash(nt, signal_type, entry_price, reason, alert_date)
+        except Exception:
+            sig_hash = f"{nt}_{signal_type}_{entry_price}_{alert_date or _today_cairo_date_str()}"
+        # Check in-memory cache first (same loop instant dedup)
+        try:
+            if sig_hash in _SENT_SIGNAL_HASH_CACHE:
+                print(f"[DEDUP SKIP] Exact same signal already dispatched (in-memory cache) for {nt} hash {sig_hash[:8]}")
+                logger.info("[DEDUP SKIP] Exact same signal already dispatched (cache) for %s hash %s", nt, sig_hash[:8])
+                return True
+            # Also check ticker+strategy+hash composite in cache
+            cache_key = f"{nt}:{signal_type}:{sig_hash[:12]}"
+            if cache_key in _SENT_TICKER_STRATEGY_CACHE:
+                # This is a fallback – if we previously cached ticker:strategy, but with hash we are more precise
+                # Only consider it duplicate if hash matches
+                pass
+        except Exception:
+            pass
+        # If Supabase not configured, fall back to local state check (is_duplicate)
+        if not _is_supabase_configured():
+            # Check local state with signal hash perspective – if same ticker+strategy already sent today, check entry_price
+            # For local fallback, we consider it duplicate only if same hash in cache
+            return False
+        # Query Supabase sent_alerts for this signal_hash for TODAY
+        # Try signal_hash column first, fallback to composite fields if column doesn't exist
+        try:
+            url = _sent_alerts_table_url()
+            headers = _supabase_headers()
+            if not url or not headers:
+                return False
+            date_str = str(alert_date).strip() if alert_date else _today_cairo_date_str()
+            if not re.match(r"^\d{4}-\d{2}-\d{2}$", date_str):
+                date_str = _today_cairo_date_str()
+            # First try: query by signal_hash column (if exists)
+            # Use signal_hash=eq.hash and date_sent=eq.date
+            params_hash = f"signal_hash=eq.{sig_hash}&date_sent=eq.{date_str}&select=id"
+            resp = requests.get(f"{url}?{params_hash}", headers=headers, timeout=10)
+            if resp.status_code == 200:
+                try:
+                    data = resp.json()
+                    if isinstance(data, list) and len(data) > 0:
+                        print(f"[DEDUP SKIP] Exact same signal already dispatched today for {nt} (hash match)")
+                        logger.info("[DEDUP SKIP] Exact same signal already dispatched today for %s (hash %s)", nt, sig_hash[:8])
+                        # Add to cache for same-loop
+                        try:
+                            _SENT_SIGNAL_HASH_CACHE.add(sig_hash)
+                        except Exception:
+                            pass
+                        return True
+                except Exception:
+                    pass
+                # If no rows with hash, try composite fallback: ticker, strategy, entry_price, date_sent
+                # This handles case where signal_hash column doesn't exist yet
+                try:
+                    # Standardize entry_price for query – round to 2 decimals
+                    try:
+                        ep_q = float(entry_price) if entry_price is not None else 0.0
+                        ep_q_str = f"{ep_q:.2f}"
+                        # Supabase numeric comparison – try exact float, but use gte/lte range for floating point tolerance
+                        # Use entry_price=eq.<value> – PostgREST will handle numeric equality
+                        ep_val = float(ep_q_str)
+                    except Exception:
+                        ep_val = entry_price
+                    # Build composite query: ticker, strategy, date_sent, entry_price
+                    # Use entry_price with tolerance – query exact, fallback to no entry_price if fails
+                    params_composite = f"ticker=eq.{nt}&strategy=eq.{signal_type}&date_sent=eq.{date_str}&select=id"
+                    # Add entry_price filter if we have it
+                    if entry_price is not None:
+                        try:
+                            params_composite += f"&entry_price=eq.{ep_val}"
+                        except Exception:
+                            pass
+                    resp2 = requests.get(f"{url}?{params_composite}", headers=headers, timeout=10)
+                    if resp2.status_code == 200:
+                        try:
+                            data2 = resp2.json()
+                            if isinstance(data2, list) and len(data2) > 0:
+                                print(f"[DEDUP SKIP] Exact same signal already dispatched today for {nt} (composite match)")
+                                logger.info("[DEDUP SKIP] Exact same signal already dispatched today for %s (composite)", nt)
+                                try:
+                                    _SENT_SIGNAL_HASH_CACHE.add(sig_hash)
+                                except Exception:
+                                    pass
+                                return True
+                        except Exception:
+                            pass
+                    # If composite also not found, check for PGRST204 (column not found) – then we know signal_hash column doesn't exist
+                    # In that case, we already did composite check, so return False (allow send)
+                except Exception:
+                    pass
+                return False
+            elif resp.status_code == 400 and "PGRST204" in (resp.text or ""):
+                # signal_hash column doesn't exist – fallback to composite check already done above, but we can do it here
+                try:
+                    params_composite = f"ticker=eq.{nt}&strategy=eq.{signal_type}&date_sent=eq.{date_str}&select=id"
+                    if entry_price is not None:
+                        try:
+                            ep_val = float(f"{float(entry_price):.2f}")
+                            params_composite += f"&entry_price=eq.{ep_val}"
+                        except Exception:
+                            pass
+                    resp2 = requests.get(f"{url}?{params_composite}", headers=headers, timeout=10)
+                    if resp2.status_code == 200:
+                        try:
+                            data2 = resp2.json()
+                            if isinstance(data2, list) and len(data2) > 0:
+                                print(f"[DEDUP SKIP] Exact same signal already dispatched today for {nt} (composite fallback)")
+                                logger.info("[DEDUP SKIP] Exact same signal already dispatched today for %s", nt)
+                                return True
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                return False
+            else:
+                # Other error – allow send (don't block on Supabase error)
+                logger.warning("[DEDUP] Supabase signal_hash check failed (%s %s); allowing send", resp.status_code, (resp.text or "")[:200])
+                return False
+        except requests.exceptions.RequestException as exc:
+            logger.warning("[DEDUP] Signal hash check request failed for %s: %s (allowing send)", nt, exc)
+            return False
+        except Exception as exc:
+            logger.warning("[DEDUP] Unexpected signal hash check error for %s: %s", nt, exc)
+            return False
+    except Exception as exc:
+        logger.warning("[DEDUP] is_exact_duplicate_signal failed for %s: %s", ticker, exc)
+        return False
+
+
 # In-memory cache for atomic pre-send dedup within same loop/run
 _SENT_TICKER_STRATEGY_CACHE: Set[str] = set()
+# Signal hash cache for same-loop deduplication (smart fingerprinting)
+_SENT_SIGNAL_HASH_CACHE: Set[str] = set()
 
 
 # Allowed fields for active_positions table – prevents PGRST204 schema cache errors
@@ -1356,7 +1565,10 @@ def update_position_status(ticker: str, status: str, path: str = ACTIVE_POSITION
     Returns True if updated, False otherwise. Never raises.
     """
     status = str(status).strip().upper() if status else ""
-    ticker = str(ticker).strip() if ticker else ""
+    try:
+        ticker = normalize_ticker(ticker)
+    except Exception:
+        ticker = str(ticker).strip() if ticker else ""
     if not ticker or not status:
         logger.warning("update_position_status called with invalid ticker/status")
         return False
@@ -1793,6 +2005,17 @@ def add_active_position(
     except Exception:
         norm_status = "PENDING"
 
+    # Strict ticker normalization – ensure COMI and COMI.CA are the same key
+    try:
+        ticker = normalize_ticker(ticker)
+    except Exception:
+        try:
+            ticker = str(ticker).strip().upper()
+            if not ticker.endswith(".CA"):
+                ticker = f"{ticker}.CA"
+        except Exception:
+            pass
+
     # Try Supabase if configured
     if _is_supabase_configured():
         try:
@@ -2135,10 +2358,10 @@ def handle_telegram_callback(
             return "invalid format"
         action, ticker = callback_data.split("_", 1)
         action = action.strip()
-        ticker = ticker.strip()
+        ticker = normalize_ticker(ticker.strip())
         if not ticker:
             return "invalid ticker"
-        ticker_variants = {ticker}
+        ticker_variants = {ticker, ticker.upper(), ticker.lower()}
         if "." not in ticker:
             ticker_variants.add(f"{ticker}.CA")
         else:

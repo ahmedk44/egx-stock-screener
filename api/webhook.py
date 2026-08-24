@@ -36,6 +36,22 @@ def _supabase_headers(prefer: str = "return=minimal"):
 _ALLOWED_ACTIVE_FIELDS = {"ticker", "entry_price", "current_stop_loss", "target_1", "target_2", "target_3", "trade_track", "status", "created_at"}
 
 
+def normalize_ticker(symbol: str) -> str:
+    """Strict ticker normalization for dedup – strips, upper-cases, handles .CA suffix."""
+    try:
+        t = str(symbol).strip().upper()
+        if not t:
+            return ""
+        if not t.endswith(".CA"):
+            t = f"{t}.CA"
+        return t
+    except Exception:
+        try:
+            return str(symbol).strip().upper()
+        except Exception:
+            return ""
+
+
 def _sanitize_active_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     """Sanitize active_positions payload to prevent PGRST204 schema cache errors.
 
@@ -57,7 +73,20 @@ def _sanitize_active_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
             if k == "created_at":
                 continue
             if k in payload and payload.get(k) is not None:
-                sanitized[k] = payload[k]
+                # Normalize ticker if present
+                if k == "ticker":
+                    try:
+                        sanitized[k] = normalize_ticker(payload[k])
+                    except Exception:
+                        sanitized[k] = payload[k]
+                else:
+                    sanitized[k] = payload[k]
+        # Ensure ticker is normalized if we set created_at but not ticker
+        if "ticker" not in sanitized and "ticker" in payload:
+            try:
+                sanitized["ticker"] = normalize_ticker(payload["ticker"])
+            except Exception:
+                pass
         return sanitized
     except Exception:
         try:
@@ -129,15 +158,15 @@ def handler(request, *args, **kwargs):
                     if data.startswith("act_"):
                         payload = data.replace("act_", "", 1)
                         parts = payload.split("|")
-                        ticker = parts[0].strip() if parts and parts[0] else ""
+                        ticker = normalize_ticker(parts[0] if parts and parts[0] else "")
                         new_status = "ACTIVE"
                         # Required popup per spec
                         popup_text = "✅ تم تفعيل الصفقة بنجاح وحفظها في Supabase!"
-                        # Also parse fallback pipe data
+                        # Also parse fallback pipe data – normalize ticker
                         if len(parts) >= 6:
                             try:
                                 parsed_trade = {
-                                    "ticker": parts[0].strip(),
+                                    "ticker": normalize_ticker(parts[0]),
                                     "entry_price": float(parts[1]) if parts[1] else None,
                                     "current_stop_loss": float(parts[2]) if parts[2] else None,
                                     "target_1": float(parts[3]) if parts[3] else None,
@@ -150,12 +179,12 @@ def handler(request, *args, **kwargs):
                         print(f"[WEBHOOK] Act activation for ticker={ticker}")
                     elif data.startswith("dis_"):
                         raw = data.replace("dis_", "", 1)
-                        ticker = raw.split("|")[0].strip() if "|" in raw else raw.strip()
+                        ticker = normalize_ticker(raw.split("|")[0] if "|" in raw else raw)
                         new_status = "DISMISSED"
                         popup_text = "❌ تم إلغاء متابعة الصفقة."
                     elif data.startswith("cls_"):
                         raw = data.replace("cls_", "", 1)
-                        ticker = raw.split("|")[0].strip() if "|" in raw else raw.strip()
+                        ticker = normalize_ticker(raw.split("|")[0] if "|" in raw else raw)
                         new_status = "CLOSED"
                         popup_text = "🏁 تم إغلاق الصفقة يدوياً."
             except Exception as e:
