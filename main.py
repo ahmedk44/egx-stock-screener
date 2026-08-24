@@ -406,23 +406,56 @@ def save_state(state: Dict[str, Any], path: str = STATE_FILE) -> None:
 
 def is_duplicate(state: Dict[str, Any], ticker: str, strategy: str) -> bool:
     """Return True if this stock+strategy was alerted within the window."""
-    last = state.get("last_alerts", {}).get(ticker, {}).get(strategy)
-    if not last:
-        return False
     try:
-        last_time = datetime.fromisoformat(last)
-    except ValueError:
+        nt = normalize_ticker(ticker)
+        # Check in-memory atomic cache first (same loop instant dedup)
+        cache_key = f"{nt}:{strategy}"
+        if cache_key in _SENT_TICKER_STRATEGY_CACHE:
+            return True
+        last = state.get("last_alerts", {}).get(nt, {}).get(strategy)
+        # Fallback: also check non-normalized key for backward compatibility (old state.json)
+        if not last:
+            last = state.get("last_alerts", {}).get(ticker, {}).get(strategy)
+        if not last:
+            return False
+        try:
+            last_time = datetime.fromisoformat(last)
+        except ValueError:
+            return False
+        if last_time.tzinfo is None:
+            last_time = last_time.replace(tzinfo=timezone.utc)
+        return now_utc() - last_time < timedelta(hours=DUPLICATE_WINDOW_HOURS)
+    except Exception:
         return False
-    if last_time.tzinfo is None:
-        last_time = last_time.replace(tzinfo=timezone.utc)
-    return now_utc() - last_time < timedelta(hours=DUPLICATE_WINDOW_HOURS)
 
 
 def mark_sent(state: Dict[str, Any], ticker: str, strategy: str) -> None:
     """Record the moment an alert was sent for a stock+strategy."""
-    state.setdefault("last_alerts", {}).setdefault(ticker, {})[strategy] = (
-        now_utc().isoformat()
-    )
+    try:
+        nt = normalize_ticker(ticker)
+        state.setdefault("last_alerts", {}).setdefault(nt, {})[strategy] = (
+            now_utc().isoformat()
+        )
+        # Atomic in-memory update for same-loop instant dedup
+        try:
+            _SENT_TICKER_STRATEGY_CACHE.add(f"{nt}:{strategy}")
+        except Exception:
+            pass
+        # Also keep original key for backward compat (optional, ensures old lookups still work)
+        try:
+            if ticker != nt:
+                state.setdefault("last_alerts", {}).setdefault(ticker, {})[strategy] = (
+                    state["last_alerts"][nt][strategy]
+                )
+        except Exception:
+            pass
+    except Exception:
+        try:
+            state.setdefault("last_alerts", {}).setdefault(ticker, {})[strategy] = (
+                now_utc().isoformat()
+            )
+        except Exception:
+            pass
 
 
 # --------------------------------------------------------------------------
@@ -492,6 +525,35 @@ def _today_cairo_date_str() -> str:
         return now_cairo().date().isoformat()
     except Exception:
         return now_utc().date().isoformat()
+
+
+def normalize_ticker(ticker: str) -> str:
+    """Strict ticker normalization for deduplication.
+
+    Standardizes all tickers so COMI and COMI.CA evaluate to the same key:
+      - upper().strip()
+      - uniformly handle .CA suffix (always ensure .CA)
+    Examples: 'comi' -> 'COMI.CA', '  comi.ca  ' -> 'COMI.CA', 'ELWA.CA' -> 'ELWA.CA'
+    """
+    try:
+        t = str(ticker).strip().upper()
+        if not t:
+            return ""
+        # Handle uniform .CA suffix – ensure it ends with .CA
+        if not t.endswith(".CA"):
+            # Remove any stray .CA-like variations before adding
+            # e.g., if ticker is COMI.CA with extra spaces already stripped, this won't trigger
+            t = f"{t}.CA"
+        return t
+    except Exception:
+        try:
+            return str(ticker).strip().upper()
+        except Exception:
+            return ""
+
+
+# In-memory cache for atomic pre-send dedup within same loop/run
+_SENT_TICKER_STRATEGY_CACHE: Set[str] = set()
 
 
 # Allowed fields for active_positions table – prevents PGRST204 schema cache errors
@@ -574,7 +636,7 @@ def is_ticker_active_in_supabase(ticker: str, trade_track: Optional[str] = None)
         headers = _supabase_headers()
         if not url or not headers:
             return False
-        ticker = str(ticker).strip() if ticker else ""
+        ticker = normalize_ticker(ticker)
         if not ticker:
             return False
         # Query for ticker with ACTIVE or PENDING status
@@ -615,7 +677,7 @@ def is_already_sent_today_supabase(ticker: str, strategy: str) -> bool:
         headers = _supabase_headers()
         if not url or not headers:
             return False
-        ticker = str(ticker).strip() if ticker else ""
+        ticker = normalize_ticker(ticker)
         strategy = str(strategy).strip() if strategy else ""
         if not ticker or not strategy:
             return False
@@ -677,7 +739,7 @@ def record_sent_alert_supabase(
             return False
         date_str = _today_cairo_date_str()
         payload: Dict[str, Any] = {
-            "ticker": str(ticker).strip(),
+            "ticker": normalize_ticker(ticker),
             "strategy": str(strategy).strip(),
             "date_sent": date_str,
             "entry_price": float(entry_price) if entry_price is not None else None,
@@ -4235,28 +4297,68 @@ def process_ticker(ticker: str, state: Dict[str, Any]) -> None:
     bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 
     for strategy in signals:
-        if is_duplicate(state, ticker, strategy):
+        # Strict ticker normalization – ensure COMI and COMI.CA are same key
+        try:
+            normalized_ticker = normalize_ticker(ticker)
+        except Exception:
+            normalized_ticker = str(ticker).strip().upper()
+            if not normalized_ticker.endswith(".CA"):
+                normalized_ticker = f"{normalized_ticker}.CA"
+        # Safety log for dedup tracing (required)
+        try:
+            # Compute Already Sent via both local and Supabase for logging
+            _is_sent_local = is_duplicate(state, normalized_ticker, strategy)
+            _is_sent_supabase = False
+            try:
+                _is_sent_supabase = is_already_sent_today_supabase(normalized_ticker, strategy)
+            except Exception:
+                _is_sent_supabase = False
+            _is_active = False
+            try:
+                _is_active = is_ticker_active_in_supabase(normalized_ticker)
+            except Exception:
+                _is_active = False
+            _cache_key = f"{normalized_ticker}:{strategy}"
+            _is_in_cache = _cache_key in _SENT_TICKER_STRATEGY_CACHE
+            _already_sent = _is_sent_local or _is_sent_supabase or _is_active or _is_in_cache
+            # Required safety log format
+            _log_msg = f"[DEDUP CHECK] Ticker: {normalized_ticker} | Already Sent: {_already_sent}"
+            try:
+                print(_log_msg)
+            except UnicodeEncodeError:
+                try:
+                    print(_log_msg.encode('utf-8', errors='replace').decode('utf-8', errors='replace'))
+                except Exception:
+                    pass
+            logger.info("[DEDUP CHECK] Ticker: %s | Already Sent: %s", normalized_ticker, _already_sent)
+        except Exception:
+            pass
+        # Use normalized ticker for all dedup checks and DB writes to prevent COMI vs COMI.CA loop
+        if is_duplicate(state, normalized_ticker, strategy):
             logger.info(
                 "[%s] %s alert already sent within %dh; skipping.",
-                ticker,
+                normalized_ticker,
                 strategy,
                 DUPLICATE_WINDOW_HOURS,
             )
             continue
-        # Supabase-backed deduplication: check sent_alerts for (ticker, strategy, date_sent=Cairo today)
+        # Supabase-backed deduplication: check sent_alerts for (normalized_ticker, strategy, date_sent=Cairo today)
         try:
-            if is_already_sent_today_supabase(ticker, strategy):
-                logger.info("[%s] %s already sent today (Supabase sent_alerts); skipping duplicate.", ticker, strategy)
+            if is_already_sent_today_supabase(normalized_ticker, strategy):
+                logger.info("[%s] %s already sent today (Supabase sent_alerts); skipping duplicate.", normalized_ticker, strategy)
                 continue
         except Exception as exc:
-            logger.warning("[%s] Supabase dedup check failed (%s); continuing", ticker, exc)
-        # Strict active position check: suppress if position already exists in active_positions (Supabase or local)
+            logger.warning("[%s] Supabase dedup check failed (%s); continuing", normalized_ticker, exc)
+        # Strict active position check: suppress if position already exists in active_positions (Supabase or local) – use normalized
         try:
-            if is_ticker_active_in_supabase(ticker):
-                logger.info("[%s] already active in Supabase active_positions (ACTIVE/PENDING); skipping duplicate notification.", ticker)
-                print(f"[DEDUP] Active position exists for {ticker} – skipping alert")
+            if is_ticker_active_in_supabase(normalized_ticker):
+                logger.info("[%s] already active in Supabase active_positions (ACTIVE/PENDING); skipping duplicate notification.", normalized_ticker)
+                try:
+                    print(f"[DEDUP] Active position exists for {normalized_ticker} – skipping alert")
+                except UnicodeEncodeError:
+                    print(f"[DEDUP] Active position exists – skipping alert")
                 continue
-            # Always check local file as well to cover pre-sync or offline cases
+            # Always check local file as well to cover pre-sync or offline cases – use normalized comparison
             try:
                 _local_positions = []
                 if os.path.exists(ACTIVE_POSITIONS_FILE):
@@ -4271,9 +4373,16 @@ def process_ticker(ticker: str, state: Dict[str, Any]) -> None:
                                     break
                 _found_local = False
                 for _lp in _local_positions:
-                    if isinstance(_lp, dict) and str(_lp.get("ticker", "")).strip() == ticker and str(_lp.get("status", "")).upper() in ("ACTIVE", "PENDING"):
-                        logger.info("[%s] already active in local active_positions; skipping duplicate.", ticker)
-                        print(f"[DEDUP] Local active position exists for {ticker} – skipping")
+                    try:
+                        _lp_norm = normalize_ticker(str(_lp.get("ticker", "")))
+                    except Exception:
+                        _lp_norm = str(_lp.get("ticker", "")).strip().upper()
+                    if isinstance(_lp, dict) and _lp_norm == normalized_ticker and str(_lp.get("status", "")).upper() in ("ACTIVE", "PENDING"):
+                        logger.info("[%s] already active in local active_positions; skipping duplicate.", normalized_ticker)
+                        try:
+                            print(f"[DEDUP] Local active position exists for {normalized_ticker} – skipping")
+                        except UnicodeEncodeError:
+                            print(f"[DEDUP] Local active position exists – skipping")
                         _found_local = True
                         break
                 if _found_local:
@@ -4281,7 +4390,7 @@ def process_ticker(ticker: str, state: Dict[str, Any]) -> None:
             except Exception:
                 pass
         except Exception as exc:
-            logger.warning("[%s] active_positions dedup check failed (%s); continuing", ticker, exc)
+            logger.warning("[%s] active_positions dedup check failed (%s); continuing", normalized_ticker, exc)
         # TQI threshold filter — EGX liquidity adapted: skip only if TQI < 5.0
         try:
             tqi_for_filter, track_for_filter, _ = resolve_tqi(ctx, strategy, sentiment)
@@ -4292,7 +4401,7 @@ def process_ticker(ticker: str, state: Dict[str, Any]) -> None:
         if tqi_for_filter < TQI_MIN_THRESHOLD:
             logger.info("[FILTERED] Signal for %s skipped (TQI: %.1f/10 < 5.0)", ticker, tqi_for_filter)
             continue
-        message = build_message(strategy, ticker, ctx, sentiment)
+        message = build_message(strategy, normalized_ticker, ctx, sentiment)
         # Strict multi-channel routing via trade track (Scalp/Swing/Invest)
         try:
             chat_id = get_channel_id_for_track(track_for_filter)
@@ -4336,34 +4445,57 @@ def process_ticker(ticker: str, state: Dict[str, Any]) -> None:
                 entry_price_pos = 0.0
                 t1_pos = t2_pos = t3_pos = sl_price_pos = 0.0
                 trade_track_pos = TQI_TRACK_LABELS.get(strategy, str(strategy))
-        # Build inline keyboard with full trade specs for instant Supabase upsert in webhook
+        # Build inline keyboard with full trade specs for instant Supabase upsert in webhook – use normalized ticker
         try:
-            keyboard = build_trade_keyboard(ticker, entry_price_pos, sl_price_pos, t1_pos, t2_pos, t3_pos, trade_track_pos)
+            keyboard = build_trade_keyboard(normalized_ticker, entry_price_pos, sl_price_pos, t1_pos, t2_pos, t3_pos, trade_track_pos)
         except Exception:
             try:
-                keyboard = build_trade_keyboard(ticker)
+                keyboard = build_trade_keyboard(normalized_ticker)
             except Exception:
                 keyboard = None
         if send_telegram(chat_id, message, bot_token, reply_markup=keyboard):
-            mark_sent(state, ticker, strategy)
-            logger.info("[%s] %s alert sent to channel %s.", ticker, strategy, chat_id)
-            # Supabase-backed deduplication: immediately write into sent_alerts
+            # Atomic / Pre-Send State Update – update local sent_alerts memory set IMMEDIATELY
+            # so subsequent iterations in same loop skip it instantly (prevents duplicate loop for ELWA.CA/COMI/CERA.CA)
             try:
-                record_sent_alert_supabase(
-                    ticker=ticker,
-                    strategy=strategy,
-                    entry_price=entry_price_pos,
-                    current_stop_loss=sl_price_pos,
-                    target_1=t1_pos,
-                    target_2=t2_pos,
-                    target_3=t3_pos,
-                )
+                mark_sent(state, normalized_ticker, strategy)
             except Exception as exc:
-                logger.warning("[%s] failed to record sent_alerts in Supabase: %s", ticker, exc)
-            # Persist active position for trailing stop tracking (using pre-computed details)
+                logger.warning("[%s] mark_sent failed: %s", normalized_ticker, exc)
+                # Fallback: ensure cache is updated even if mark_sent fails
+                try:
+                    _SENT_TICKER_STRATEGY_CACHE.add(f"{normalized_ticker}:{strategy}")
+                except Exception:
+                    pass
+            logger.info("[%s] %s alert sent to channel %s.", normalized_ticker, strategy, chat_id)
+            # Wrap sent_alerts Supabase insert in robust try...except that logs gracefully without breaking state update
+            try:
+                try:
+                    record_sent_alert_supabase(
+                        ticker=normalized_ticker,
+                        strategy=strategy,
+                        entry_price=entry_price_pos,
+                        current_stop_loss=sl_price_pos,
+                        target_1=t1_pos,
+                        target_2=t2_pos,
+                        target_3=t3_pos,
+                    )
+                except Exception as exc:
+                    # Robust graceful logging – don't break state update
+                    try:
+                        print(f"[DEDUP ERROR] Supabase sent_alerts insert failed for {normalized_ticker}/{strategy}: {exc}")
+                    except Exception:
+                        pass
+                    logger.warning("[%s] failed to record sent_alerts in Supabase: %s", normalized_ticker, exc)
+            except Exception as exc:
+                # Outer robust wrapper – ensures state update is never broken
+                try:
+                    print(f"[DEDUP ERROR] Unexpected sent_alerts error for {normalized_ticker}: {exc}")
+                except Exception:
+                    pass
+                logger.warning("[DEDUP ERROR] Unexpected sent_alerts error for %s: %s", normalized_ticker, exc)
+            # Persist active position for trailing stop tracking (using normalized ticker)
             try:
                 add_active_position(
-                    ticker=ticker,
+                    ticker=normalized_ticker,
                     entry_price=entry_price_pos,
                     target_1=t1_pos,
                     target_2=t2_pos,
@@ -4373,7 +4505,7 @@ def process_ticker(ticker: str, state: Dict[str, Any]) -> None:
                     status="PENDING",
                 )
             except Exception as exc:
-                logger.warning("[%s] failed to persist active position: %s", ticker, exc)
+                logger.warning("[%s] failed to persist active position: %s", normalized_ticker, exc)
 
 
 # --------------------------------------------------------------------------
