@@ -23,6 +23,14 @@ import argparse
 import json
 import logging
 import os
+from dotenv import load_dotenv
+
+# Auto-load .env at the very top so local runs pick up SUPABASE_URL and SUPABASE_KEY
+try:
+    load_dotenv()
+except Exception:
+    pass
+
 import re
 import sys
 import time
@@ -41,13 +49,7 @@ import pandas as pd
 import pandas_ta as ta
 import requests
 import yfinance as yf
-from dotenv import load_dotenv
 from google import genai
-
-try:
-    load_dotenv()
-except Exception:
-    pass
 
 logging.basicConfig(
     level=logging.INFO,
@@ -1835,16 +1837,44 @@ def fetch_price_history(ticker: str) -> Optional[pd.DataFrame]:
             progress=False,
             threads=False,
         )
+    except KeyError as exc:
+        msg = f"[YFINANCE ERROR] Could not fetch data for {ticker}: {exc}"
+        print(msg)
+        logger.warning(msg)
+        return None
+    except ValueError as exc:
+        msg = f"[YFINANCE ERROR] Could not fetch data for {ticker}: {exc}"
+        print(msg)
+        logger.warning(msg)
+        return None
     except Exception as exc:
-        logger.warning("[%s] yfinance download failed: %s", ticker, exc)
+        msg = f"[YFINANCE ERROR] Could not fetch data for {ticker}: {exc}"
+        print(msg)
+        logger.warning(msg)
         return None
     if raw is None or raw.empty:
         logger.warning("[%s] yfinance returned no data.", ticker)
         return None
-    df = raw.copy()
-    # Newer yfinance versions return MultiIndex columns (e.g. ("Close", "COMI.CA")).
-    df.columns = [col[0] if isinstance(col, tuple) else col for col in df.columns]
-    return df
+    try:
+        df = raw.copy()
+        # Newer yfinance versions return MultiIndex columns (e.g. ("Close", "COMI.CA")).
+        df.columns = [col[0] if isinstance(col, tuple) else col for col in df.columns]
+        return df
+    except KeyError as exc:
+        msg = f"[YFINANCE ERROR] Could not fetch data for {ticker}: {exc}"
+        print(msg)
+        logger.warning(msg)
+        return None
+    except ValueError as exc:
+        msg = f"[YFINANCE ERROR] Could not fetch data for {ticker}: {exc}"
+        print(msg)
+        logger.warning(msg)
+        return None
+    except Exception as exc:
+        msg = f"[YFINANCE ERROR] Could not fetch data for {ticker}: {exc}"
+        print(msg)
+        logger.warning(msg)
+        return None
 
 
 def get_trailing_pe(ticker: str) -> Optional[float]:
@@ -1854,16 +1884,50 @@ def get_trailing_pe(ticker: str) -> Optional[float]:
     except AttributeError:
         try:
             info = yf.Ticker(ticker).info  # older yfinance fallback
-        except Exception as exc:
-            logger.warning("[%s] failed to fetch fundamentals: %s", ticker, exc)
+        except KeyError as exc:
+            msg = f"[YFINANCE ERROR] Could not fetch data for {ticker}: {exc}"
+            print(msg)
+            logger.warning(msg)
             return None
+        except ValueError as exc:
+            msg = f"[YFINANCE ERROR] Could not fetch data for {ticker}: {exc}"
+            print(msg)
+            logger.warning(msg)
+            return None
+        except Exception as exc:
+            msg = f"[YFINANCE ERROR] Could not fetch data for {ticker}: {exc}"
+            print(msg)
+            logger.warning(msg)
+            return None
+    except KeyError as exc:
+        msg = f"[YFINANCE ERROR] Could not fetch data for {ticker}: {exc}"
+        print(msg)
+        logger.warning(msg)
+        return None
+    except ValueError as exc:
+        msg = f"[YFINANCE ERROR] Could not fetch data for {ticker}: {exc}"
+        print(msg)
+        logger.warning(msg)
+        return None
     except Exception as exc:
-        logger.warning("[%s] failed to fetch fundamentals: %s", ticker, exc)
+        msg = f"[YFINANCE ERROR] Could not fetch data for {ticker}: {exc}"
+        print(msg)
+        logger.warning(msg)
         return None
     try:
         pe = info.get("trailingPE") if isinstance(info, dict) else None
         return float(pe) if pe is not None else None
     except (TypeError, ValueError):
+        return None
+    except KeyError as exc:
+        msg = f"[YFINANCE ERROR] Could not fetch data for {ticker}: {exc}"
+        print(msg)
+        logger.warning(msg)
+        return None
+    except Exception as exc:
+        msg = f"[YFINANCE ERROR] Could not fetch data for {ticker}: {exc}"
+        print(msg)
+        logger.warning(msg)
         return None
 
 
@@ -2249,6 +2313,53 @@ def _summarize_with_gemini(content: str, ticker: str) -> str:
         text = (response.text or "").strip()
         return text if text else GEMINI_FALLBACK_PROMPT
     except Exception as exc:
+        # Graceful Gemini 429 quota fallback – catch ResourceExhausted or HTTP 429
+        is_quota_error = False
+        try:
+            exc_name = exc.__class__.__name__
+            exc_str = str(exc)
+            # Direct class name check
+            if exc_name == "ResourceExhausted":
+                is_quota_error = True
+            # Check for 429 in message or status attributes
+            elif "429" in exc_str:
+                is_quota_error = True
+            elif "ResourceExhausted" in exc_str:
+                is_quota_error = True
+            elif "quota" in exc_str.lower():
+                is_quota_error = True
+            # Check common status/code attributes
+            elif getattr(exc, "status_code", None) == 429:
+                is_quota_error = True
+            elif getattr(exc, "code", None) == 429:
+                is_quota_error = True
+            elif getattr(exc, "status", None) == 429:
+                is_quota_error = True
+            # Also inspect cause if wrapped
+            else:
+                cause = getattr(exc, "__cause__", None) or getattr(exc, "__context__", None)
+                if cause is not None:
+                    cause_str = str(cause)
+                    cause_name = cause.__class__.__name__
+                    if cause_name == "ResourceExhausted" or "429" in cause_str or "ResourceExhausted" in cause_str:
+                        is_quota_error = True
+        except Exception:
+            pass
+        # Try importing ResourceExhausted for isinstance check (optional)
+        if not is_quota_error:
+            try:
+                from google.api_core.exceptions import ResourceExhausted as _ResEx
+
+                if isinstance(exc, _ResEx):
+                    is_quota_error = True
+            except Exception:
+                pass
+        if is_quota_error:
+            msg = "[GEMINI] Quota limit reached (429). Falling back to Neutral sentiment."
+            print(msg)
+            logger.warning(msg)
+            # Return neutral sentiment so signal delivery is never blocked
+            return "🟢 محايد (تجاوز حد API)"
         logger.warning("[%s] Gemini sentiment analysis failed: %s", ticker, exc)
         return GEMINI_FALLBACK_PROMPT
 
@@ -3603,22 +3714,71 @@ def process_ticker(ticker: str, state: Dict[str, Any]) -> None:
         df_1m = None
         try:
             # Fetch 1m intraday (last 5d, yfinance limits 1m to 7d)
-            raw_1m = yf.download(
-                ticker,
-                period="5d",
-                interval="1m",
-                auto_adjust=True,
-                progress=False,
-                threads=False,
-            )
+            try:
+                raw_1m = yf.download(
+                    ticker,
+                    period="5d",
+                    interval="1m",
+                    auto_adjust=True,
+                    progress=False,
+                    threads=False,
+                )
+            except KeyError as exc:
+                msg = f"[YFINANCE ERROR] Could not fetch data for {ticker}: {exc}"
+                print(msg)
+                logger.warning(msg)
+                raw_1m = None
+                df_1m = None
+            except ValueError as exc:
+                msg = f"[YFINANCE ERROR] Could not fetch data for {ticker}: {exc}"
+                print(msg)
+                logger.warning(msg)
+                raw_1m = None
+                df_1m = None
+            except Exception as exc:
+                msg = f"[YFINANCE ERROR] Could not fetch data for {ticker}: {exc}"
+                print(msg)
+                logger.warning(msg)
+                raw_1m = None
+                df_1m = None
             if raw_1m is not None and not raw_1m.empty:
-                df_1m = raw_1m.copy()
-                df_1m.columns = [col[0] if isinstance(col, tuple) else col for col in df_1m.columns]
-                # Filter to last trading day's 1m if too large, but keep all for calc
-                if len(df_1m) > 500:
-                    df_1m = df_1m.tail(500)
+                try:
+                    df_1m = raw_1m.copy()
+                    df_1m.columns = [col[0] if isinstance(col, tuple) else col for col in df_1m.columns]
+                    # Filter to last trading day's 1m if too large, but keep all for calc
+                    if len(df_1m) > 500:
+                        df_1m = df_1m.tail(500)
+                except KeyError as exc:
+                    msg = f"[YFINANCE ERROR] Could not fetch data for {ticker}: {exc}"
+                    print(msg)
+                    logger.warning(msg)
+                    df_1m = None
+                except ValueError as exc:
+                    msg = f"[YFINANCE ERROR] Could not fetch data for {ticker}: {exc}"
+                    print(msg)
+                    logger.warning(msg)
+                    df_1m = None
+                except Exception as exc:
+                    msg = f"[YFINANCE ERROR] Could not fetch data for {ticker}: {exc}"
+                    print(msg)
+                    logger.warning(msg)
+                    df_1m = None
+        except KeyError as exc:
+            msg = f"[YFINANCE ERROR] Could not fetch data for {ticker}: {exc}"
+            print(msg)
+            logger.warning(msg)
+            df_1m = None
+        except ValueError as exc:
+            msg = f"[YFINANCE ERROR] Could not fetch data for {ticker}: {exc}"
+            print(msg)
+            logger.warning(msg)
+            df_1m = None
         except Exception as exc:
             logger.debug("[%s] 1m fetch failed for delta: %s", ticker, exc)
+            # Also log with required format for consistency
+            msg = f"[YFINANCE ERROR] Could not fetch data for {ticker}: {exc}"
+            print(msg)
+            logger.warning(msg)
             df_1m = None
         # Fallback: if 1m not available, use daily df as proxy (will still compute delta but with daily granularity)
         delta_src = df_1m if df_1m is not None and not df_1m.empty and len(df_1m) >= 3 else df
