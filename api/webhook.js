@@ -124,10 +124,32 @@ export default async function handler(req, res) {
               }
             }
 
-            // 2) Insert retrieved trade details into active_positions
+            // Helper to sanitize payload – prevents PGRST204 schema cache errors (handles timestamp/created_at)
+            function sanitizeActivePayload(payload) {
+              const allowed = new Set(['ticker','entry_price','current_stop_loss','target_1','target_2','target_3','trade_track','status','created_at']);
+              const sanitized = {};
+              // Normalize timestamp -> created_at
+              if (payload.timestamp && !payload.created_at) {
+                sanitized.created_at = payload.timestamp;
+              } else if (payload.created_at) {
+                sanitized.created_at = payload.created_at;
+              }
+              for (const key of allowed) {
+                if (key === 'created_at') continue;
+                if (payload[key] !== undefined && payload[key] !== null) {
+                  sanitized[key] = payload[key];
+                }
+              }
+              if (sanitized.created_at) {
+                // keep it
+              }
+              return sanitized;
+            }
+
+            // 2) Insert retrieved trade details into active_positions (sanitized, graceful fallback for schema errors)
             if (tradeDetails && tradeDetails.entry_price != null) {
               try {
-                const insertPayload = {
+                const rawPayload = {
                   ticker: tradeDetails.ticker,
                   entry_price: parseFloat(tradeDetails.entry_price),
                   current_stop_loss: parseFloat(tradeDetails.current_stop_loss) || parseFloat(tradeDetails.entry_price),
@@ -136,10 +158,11 @@ export default async function handler(req, res) {
                   target_3: parseFloat(tradeDetails.target_3) || parseFloat(tradeDetails.entry_price),
                   trade_track: 'Scalp',
                   status: 'ACTIVE',
-                  timestamp: new Date().toISOString(),
+                  created_at: new Date().toISOString(),
                 };
-                console.log(`[SUPABASE] Inserting into active_positions:`, insertPayload);
-                const postRes = await fetch(`${supabaseUrl}/rest/v1/active_positions?on_conflict=ticker,trade_track`, {
+                const insertPayload = sanitizeActivePayload(rawPayload);
+                console.log(`[SUPABASE] Inserting into active_positions (sanitized):`, insertPayload);
+                let postRes = await fetch(`${supabaseUrl}/rest/v1/active_positions?on_conflict=ticker,trade_track`, {
                   method: 'POST',
                   headers: {
                     'apikey': supabaseKey,
@@ -149,19 +172,57 @@ export default async function handler(req, res) {
                   },
                   body: JSON.stringify(insertPayload),
                 });
-                const postBody = await postRes.text().catch(() => '');
+                let postBody = await postRes.text().catch(() => '');
                 console.log(`[SUPABASE] POST active_positions ${ticker} -> ${postRes.status} body: ${postBody}`);
+                // Gracefully handle PGRST204 and 42P10 schema errors – fallback to plain POST
+                if (!postRes.ok && (postBody.includes('PGRST204') || postBody.includes('42P10') || postBody.includes('ON CONFLICT') || postBody.includes('schema cache'))) {
+                  console.log(`[SUPABASE] Fallback: retrying without on_conflict for ${ticker}`);
+                  const plainRes = await fetch(`${supabaseUrl}/rest/v1/active_positions`, {
+                    method: 'POST',
+                    headers: {
+                      'apikey': supabaseKey,
+                      'Authorization': `Bearer ${supabaseKey}`,
+                      'Content-Type': 'application/json',
+                      'Prefer': 'return=representation',
+                    },
+                    body: JSON.stringify(insertPayload),
+                  });
+                  const plainBody = await plainRes.text().catch(() => '');
+                  console.log(`[SUPABASE] Plain POST fallback ${ticker} -> ${plainRes.status} body: ${plainBody}`);
+                  if (!plainRes.ok && plainRes.status === 409) {
+                    // Already exists – try PATCH
+                    const patchRes = await fetch(`${supabaseUrl}/rest/v1/active_positions?ticker=eq.${encodeURIComponent(ticker)}&trade_track=eq.Scalp`, {
+                      method: 'PATCH',
+                      headers: {
+                        'apikey': supabaseKey,
+                        'Authorization': `Bearer ${supabaseKey}`,
+                        'Content-Type': 'application/json',
+                        'Prefer': 'return=minimal',
+                      },
+                      body: JSON.stringify(insertPayload),
+                    });
+                    const patchBody = await patchRes.text().catch(() => '');
+                    console.log(`[SUPABASE] PATCH fallback ${ticker} -> ${patchRes.status} body: ${patchBody}`);
+                    postRes = patchRes;
+                    postBody = patchBody;
+                  } else {
+                    postRes = plainRes;
+                    postBody = plainBody;
+                  }
+                }
                 if (!postRes.ok) {
                   console.error(`[SUPABASE ERROR] Insert into active_positions failed ${postRes.status}: ${postBody}`);
+                } else {
+                  console.log(`[SUPABASE] Insert succeeded for ${ticker}`);
                 }
               } catch (insertErr) {
                 console.error(`[SUPABASE ERROR] Insert active_positions failed for ${ticker}:`, insertErr);
               }
             } else {
               console.error(`[SUPABASE ERROR] No tradeDetails available for ${ticker}, cannot insert into active_positions`);
-              // Last resort minimal insert to ensure row exists
+              // Last resort minimal insert to ensure row exists (sanitized)
               try {
-                const minimal = {
+                const minimalRaw = {
                   ticker: ticker,
                   entry_price: 0,
                   current_stop_loss: 0,
@@ -170,9 +231,10 @@ export default async function handler(req, res) {
                   target_3: 0,
                   trade_track: 'Scalp',
                   status: 'ACTIVE',
-                  timestamp: new Date().toISOString(),
+                  created_at: new Date().toISOString(),
                 };
-                const fallbackRes = await fetch(`${supabaseUrl}/rest/v1/active_positions?on_conflict=ticker,trade_track`, {
+                const minimal = sanitizeActivePayload(minimalRaw);
+                let fallbackRes = await fetch(`${supabaseUrl}/rest/v1/active_positions?on_conflict=ticker,trade_track`, {
                   method: 'POST',
                   headers: {
                     'apikey': supabaseKey,
@@ -182,8 +244,22 @@ export default async function handler(req, res) {
                   },
                   body: JSON.stringify(minimal),
                 });
-                const fallbackBody = await fallbackRes.text().catch(() => '');
+                let fallbackBody = await fallbackRes.text().catch(() => '');
                 console.log(`[SUPABASE] Fallback minimal POST ${ticker} -> ${fallbackRes.status} ${fallbackBody}`);
+                if (!fallbackRes.ok && (fallbackBody.includes('PGRST204') || fallbackBody.includes('42P10'))) {
+                  const plainFallback = await fetch(`${supabaseUrl}/rest/v1/active_positions`, {
+                    method: 'POST',
+                    headers: {
+                      'apikey': supabaseKey,
+                      'Authorization': `Bearer ${supabaseKey}`,
+                      'Content-Type': 'application/json',
+                      'Prefer': 'return=representation',
+                    },
+                    body: JSON.stringify(minimal),
+                  });
+                  const plainBody = await plainFallback.text().catch(() => '');
+                  console.log(`[SUPABASE] Plain fallback minimal POST ${ticker} -> ${plainFallback.status} ${plainBody}`);
+                }
               } catch (e) {
                 console.error(`[SUPABASE ERROR] Fallback minimal insert failed:`, e);
               }

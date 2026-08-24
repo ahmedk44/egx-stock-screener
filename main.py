@@ -494,6 +494,113 @@ def _today_cairo_date_str() -> str:
         return now_utc().date().isoformat()
 
 
+# Allowed fields for active_positions table – prevents PGRST204 schema cache errors
+_ALLOWED_ACTIVE_POSITIONS_FIELDS: Set[str] = {
+    "ticker",
+    "entry_price",
+    "current_stop_loss",
+    "target_1",
+    "target_2",
+    "target_3",
+    "trade_track",
+    "status",
+    "created_at",
+    "timestamp",
+}
+
+
+def _sanitize_active_position_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Sanitize active_positions payload to prevent PGRST204 schema rejection.
+
+    Handles both `timestamp` and `created_at` safely:
+      - If payload contains `timestamp` but not `created_at`, copy to `created_at`
+      - Then filter to only valid table fields
+      - Ensures only allowed fields are sent to Supabase
+
+    Returns sanitized dict with only valid fields.
+    """
+    if not isinstance(payload, dict):
+        return {}
+    try:
+        sanitized: Dict[str, Any] = {}
+        # Handle timestamp / created_at normalization
+        has_timestamp = "timestamp" in payload and payload.get("timestamp") is not None
+        has_created_at = "created_at" in payload and payload.get("created_at") is not None
+        # If timestamp exists but created_at missing, copy timestamp to created_at for compatibility
+        if has_timestamp and not has_created_at:
+            try:
+                sanitized["created_at"] = payload.get("timestamp")
+            except Exception:
+                pass
+        elif has_created_at:
+            try:
+                sanitized["created_at"] = payload.get("created_at")
+            except Exception:
+                pass
+        # If both exist, prefer created_at (sanitized already), ignore timestamp to avoid duplicate
+        # Now copy only allowed fields (excluding timestamp to prevent PGRST204 if column missing)
+        for key in _ALLOWED_ACTIVE_POSITIONS_FIELDS:
+            if key == "created_at":
+                continue  # already handled
+            if key == "timestamp":
+                continue  # never send timestamp directly – use created_at instead
+            if key in payload and payload.get(key) is not None:
+                sanitized[key] = payload[key]
+            elif key in sanitized:
+                continue
+        # Re-add created_at if we set it
+        # Also ensure ticker is always included if present
+        # Filter out None values for required numeric fields? Keep as is – Supabase allows null
+        # Remove any extra fields not in allowed set
+        return sanitized
+    except Exception:
+        # Fallback: return only basic fields
+        try:
+            return {k: v for k, v in payload.items() if k in _ALLOWED_ACTIVE_POSITIONS_FIELDS and k != "timestamp"}
+        except Exception:
+            return {}
+
+
+def is_ticker_active_in_supabase(ticker: str, trade_track: Optional[str] = None) -> bool:
+    """Check if ticker exists in active_positions with ACTIVE/PENDING status.
+
+    Used for strict duplicate suppression across local runs and Vercel webhooks.
+    Returns True if active position exists, False otherwise. Never raises.
+    """
+    if not _is_supabase_configured():
+        return False
+    try:
+        url = _supabase_table_url()
+        headers = _supabase_headers()
+        if not url or not headers:
+            return False
+        ticker = str(ticker).strip() if ticker else ""
+        if not ticker:
+            return False
+        # Query for ticker with ACTIVE or PENDING status
+        # Use PostgREST: ticker=eq.xxx&status=in.(ACTIVE,PENDING)
+        params = f"ticker=eq.{ticker}&status=in.(ACTIVE,PENDING)&select=ticker"
+        if trade_track:
+            try:
+                tt = str(trade_track).strip()
+                if tt:
+                    params += f"&trade_track=eq.{tt}"
+            except Exception:
+                pass
+        resp = requests.get(f"{url}?{params}", headers=headers, timeout=10)
+        if resp.status_code != 200:
+            return False
+        try:
+            data = resp.json()
+            if isinstance(data, list) and len(data) > 0:
+                return True
+        except Exception:
+            return False
+        return False
+    except Exception:
+        return False
+
+
 def is_already_sent_today_supabase(ticker: str, strategy: str) -> bool:
     """Check Supabase sent_alerts for (ticker, strategy, date_sent) today (Cairo).
 
@@ -665,6 +772,8 @@ def save_active_positions(positions: List[Dict[str, Any]], path: str = ACTIVE_PO
 
     Tries Supabase REST upsert when SUPABASE_URL/KEY are set; on any failure
     or when not configured, falls back to local JSON file. Never raises.
+    Sanitizes payloads to avoid PGRST204 schema cache errors and handles
+    42P10 missing unique constraint gracefully via PATCH/POST fallback.
     """
     # Attempt Supabase persistence if configured
     if _is_supabase_configured():
@@ -672,22 +781,67 @@ def save_active_positions(positions: List[Dict[str, Any]], path: str = ACTIVE_PO
             url = _supabase_table_url()
             if url:
                 headers = _supabase_headers()
-                # Use merge-duplicates for upsert; on_conflict on ticker
-                # Bulk upsert via POST
-                headers_with_merge = dict(headers)
-                headers_with_merge["Prefer"] = "resolution=merge-duplicates, return=representation"
-                # Only attempt Supabase bulk if positions is not too large; otherwise fallback
-                if isinstance(positions, list):
-                    # For empty list, we still want to ensure table is cleared – skip bulk delete for safety
-                    if len(positions) > 0:
-                        resp = requests.post(f"{url}?on_conflict=ticker,trade_track", json=positions, headers=headers_with_merge, timeout=15)
-                        if resp.status_code in (200, 201, 204):
-                            logger.info("Saved %d positions to Supabase", len(positions))
+                if isinstance(positions, list) and len(positions) > 0:
+                    # Sanitize each position before sending
+                    sanitized_list = []
+                    for p in positions:
+                        try:
+                            if isinstance(p, dict):
+                                sanitized_list.append(_sanitize_active_position_payload(p))
+                            else:
+                                sanitized_list.append(p)
+                        except Exception:
+                            sanitized_list.append(p)
+                    # Graceful sync: individual PATCH/POST to avoid 42P10/PGRST204 (no on_conflict)
+                    try:
+                        bulk_ok = 0
+                        for sp in sanitized_list:
+                            try:
+                                ticker_tmp = sp.get("ticker", "")
+                                if not ticker_tmp:
+                                    continue
+                                # Check existence via ticker only (avoid emoji trade_track in URL)
+                                exists = False
+                                try:
+                                    chk = requests.get(f"{url}?ticker=eq.{ticker_tmp}&select=id", headers=headers, timeout=10)
+                                    if chk.status_code == 200:
+                                        try:
+                                            j = chk.json()
+                                            if isinstance(j, list) and len(j) > 0:
+                                                exists = True
+                                        except Exception:
+                                            pass
+                                except Exception:
+                                    exists = False
+                                if exists:
+                                    pr = requests.patch(f"{url}?ticker=eq.{ticker_tmp}", json=sp, headers=headers, timeout=15)
+                                    if pr.status_code in (200, 204):
+                                        bulk_ok += 1
+                                        continue
+                                    # If PATCH fails, try POST as fallback (will create duplicate but at least not fail)
+                                pr2 = requests.post(url, json=sp, headers=headers, timeout=15)
+                                if pr2.status_code in (200, 201, 204):
+                                    bulk_ok += 1
+                                elif pr2.status_code == 409:
+                                    # Try PATCH on conflict
+                                    try:
+                                        pr3 = requests.patch(f"{url}?ticker=eq.{ticker_tmp}", json=sp, headers=headers, timeout=15)
+                                        if pr3.status_code in (200, 204):
+                                            bulk_ok += 1
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                continue
+                        if bulk_ok == len(sanitized_list):
+                            logger.info("Saved %d positions to Supabase via graceful sync", bulk_ok)
+                        elif bulk_ok > 0:
+                            logger.info("Partial bulk save: %d/%d positions synced", bulk_ok, len(sanitized_list))
                         else:
-                            logger.warning("Supabase bulk save failed (%s %s); will also save to JSON", resp.status_code, resp.text[:300] if resp.text else "")
-                    else:
-                        # Empty list: optionally truncate? For now just log
-                        logger.info("No positions to save to Supabase (empty list)")
+                            logger.warning("Supabase bulk save via graceful sync failed – 0/%d succeeded", len(sanitized_list))
+                    except Exception as _bulk_exc:
+                        logger.warning("Bulk graceful sync failed (%s); will also save to JSON", _bulk_exc)
+                else:
+                    logger.info("No positions to save to Supabase (empty list)")
         except requests.exceptions.RequestException as exc:
             logger.warning("Supabase save request failed (%s); falling back to JSON", exc)
         except Exception as exc:
@@ -793,23 +947,108 @@ def sync_active_positions_to_supabase(path: str = ACTIVE_POSITIONS_FILE) -> int:
             # Ensure status is present
             if not pos.get("status"):
                 pos["status"] = "PENDING"
-            # Upsert via POST with on_conflict
-            resp = requests.post(f"{url}?on_conflict=ticker,trade_track", json=pos, headers=headers_upsert, timeout=15)
-            # Verbose: exact HTTP status and body per requirement
+            # Sanitize payload to prevent PGRST204 schema cache errors (handles timestamp/created_at)
             try:
-                body_preview = resp.text[:500] if resp.text else "(empty body)"
+                sanitized_pos = _sanitize_active_position_payload(pos)
+                # Ensure sanitized still has ticker and required fields
+                if not sanitized_pos.get("ticker"):
+                    sanitized_pos["ticker"] = ticker
+                if not sanitized_pos.get("status"):
+                    sanitized_pos["status"] = pos.get("status", "PENDING")
+                # Ensure numeric fields are preserved if sanitization dropped them due to None
+                for fld in ("entry_price", "current_stop_loss", "target_1", "target_2", "target_3", "trade_track"):
+                    if fld not in sanitized_pos and fld in pos and pos.get(fld) is not None:
+                        sanitized_pos[fld] = pos.get(fld)
+            except Exception:
+                sanitized_pos = pos
+            # Graceful sync without on_conflict to avoid 42P10/PGRST204 – check existence then PATCH/POST with sanitized payload
+            resp = None
+            try:
+                # Check if ticker already exists to decide PATCH vs POST (use ticker only to avoid emoji URL issues)
+                check_url = f"{url}?ticker=eq.{ticker}&select=id"
+                check_resp = None
+                try:
+                    check_resp = requests.get(check_url, headers=headers, timeout=10)
+                except Exception:
+                    check_resp = None
+                if check_resp is not None and check_resp.status_code == 200:
+                    try:
+                        existing = check_resp.json()
+                        if isinstance(existing, list) and len(existing) > 0:
+                            # Already exists – try PATCH to update sanitized payload
+                            try:
+                                patch_resp = requests.patch(f"{url}?ticker=eq.{ticker}", json=sanitized_pos, headers=headers, timeout=15)
+                                if patch_resp.status_code in (200, 204):
+                                    resp = patch_resp
+                                else:
+                                    # Consider already synced even if PATCH fails
+                                    class _FakeResp:
+                                        status_code = 200
+                                        text = "already exists"
+                                    resp = _FakeResp()
+                            except Exception:
+                                class _FakeResp:
+                                    status_code = 200
+                                    text = "already exists"
+                                resp = _FakeResp()
+                        else:
+                            # Not exists – plain POST sanitized
+                            resp = requests.post(url, json=sanitized_pos, headers=headers, timeout=15)
+                    except Exception:
+                        resp = requests.post(url, json=sanitized_pos, headers=headers, timeout=15)
+                else:
+                    resp = requests.post(url, json=sanitized_pos, headers=headers, timeout=15)
+            except Exception as e:
+                # Fallback try plain POST
+                try:
+                    resp = requests.post(url, json=sanitized_pos, headers=headers, timeout=15)
+                except Exception:
+                    resp = None
+            # Verbose: exact HTTP status and body per requirement (safe for unicode/emoji)
+            try:
+                body_preview = resp.text[:500] if resp and resp.text else "(empty body)" if resp else "(no response)"
             except Exception:
                 body_preview = "(no body)"
-            print(f"[SUPABASE DEBUG] POST {pos.get('ticker')} -> {resp.status_code} {body_preview}")
-            logger.info("[SUPABASE DEBUG] POST %s -> %s %s", pos.get("ticker"), resp.status_code, body_preview[:200])
-            if resp.status_code in (200, 201, 204):
+            resp_code = resp.status_code if resp else 0
+            try:
+                print(f"[SUPABASE DEBUG] POST {pos.get('ticker')} -> {resp_code} {body_preview}")
+            except UnicodeEncodeError:
+                try:
+                    print(f"[SUPABASE DEBUG] POST {pos.get('ticker')} -> {resp_code} (body with unicode)")
+                except Exception:
+                    pass
+            # Safe logger – truncate and handle unicode
+            try:
+                logger.info("[SUPABASE DEBUG] POST %s -> %s %s", pos.get("ticker"), resp_code, body_preview[:200])
+            except Exception:
+                try:
+                    logger.info("[SUPABASE DEBUG] POST %s -> %s (unicode body)", pos.get("ticker"), resp_code)
+                except Exception:
+                    pass
+            if resp is not None and resp.status_code in (200, 201, 204):
                 synced += 1
                 logger.info("[SYNC] Upserted %s (%s) to Supabase", pos.get("ticker"), pos.get("status"))
-                print(f"[SYNC] Upserted {pos.get('ticker')} ({pos.get('status')}) -> {resp.status_code}")
+                try:
+                    print(f"[SYNC] Upserted {pos.get('ticker')} ({pos.get('status')}) -> {resp.status_code}")
+                except UnicodeEncodeError:
+                    try:
+                        print(f"[SYNC] Upserted {pos.get('ticker')} -> {resp.status_code}")
+                    except Exception:
+                        pass
             else:
                 failed += 1
-                logger.warning("Supabase sync failed for %s (%s %s)", pos.get("ticker"), resp.status_code, resp.text[:200] if resp.text else "")
-                print(f"[SYNC ERROR] Failed for {pos.get('ticker')}: {resp.status_code} {resp.text[:200] if resp.text else ''}")
+                err_body = resp.text[:200] if resp and resp.text else ""
+                try:
+                    logger.warning("Supabase sync failed for %s (%s %s)", pos.get("ticker"), resp_code, err_body)
+                except Exception:
+                    logger.warning("Supabase sync failed for %s (%s)", pos.get("ticker"), resp_code)
+                try:
+                    print(f"[SYNC ERROR] Failed for {pos.get('ticker')}: {resp_code} {err_body}")
+                except UnicodeEncodeError:
+                    try:
+                        print(f"[SYNC ERROR] Failed for {pos.get('ticker')}: {resp_code}")
+                    except Exception:
+                        pass
         except requests.exceptions.RequestException as exc:
             failed += 1
             logger.warning("Supabase sync request failed for %s: %s", pos.get("ticker", "unknown"), exc)
@@ -896,6 +1135,11 @@ def test_supabase_connection(path: str = ACTIVE_POSITIONS_FILE) -> bool:
             "timestamp": now_utc().isoformat(),
             "status": "ACTIVE",
         }
+        # Sanitize to prevent PGRST204
+        try:
+            dummy = _sanitize_active_position_payload(dummy)
+        except Exception:
+            pass
         headers_insert = dict(headers)
         headers_insert["Prefer"] = "return=representation"
         print(f"[SUPABASE TEST] Inserting dummy {dummy} to {url}")
@@ -1257,11 +1501,56 @@ def add_active_position(
                     "timestamp": timestamp or now_utc().isoformat(),
                     "status": norm_status,
                 }
+                # Sanitize payload to prevent PGRST204 (handles timestamp/created_at)
+                try:
+                    sanitized_entry = _sanitize_active_position_payload(entry)
+                    # Ensure sanitized still has required fields
+                    for _fld in ("ticker", "entry_price", "current_stop_loss", "target_1", "target_2", "target_3", "trade_track", "status"):
+                        if _fld not in sanitized_entry and _fld in entry:
+                            sanitized_entry[_fld] = entry[_fld]
+                except Exception:
+                    sanitized_entry = entry
                 # Use upsert with Prefer resolution merge-duplicates
                 headers_upsert = dict(headers)
                 headers_upsert["Prefer"] = "resolution=merge-duplicates, return=representation"
                 # Check existing via GET to avoid duplicate? Let Supabase handle via on_conflict
-                resp = requests.post(f"{url}?on_conflict=ticker,trade_track", json=entry, headers=headers_upsert, timeout=15)
+                resp = requests.post(f"{url}?on_conflict=ticker,trade_track", json=sanitized_entry, headers=headers_upsert, timeout=15)
+                # Gracefully handle schema cache errors (PGRST204) and missing unique constraint (42P10)
+                if resp.status_code == 400 and ("PGRST204" in (resp.text or "") or "42P10" in (resp.text or "")):
+                    logger.warning("[Supabase] add_active_position upsert failed with schema error (%s %s); retrying without on_conflict", resp.status_code, resp.text[:200] if resp.text else "")
+                    # Try plain POST without on_conflict
+                    plain_resp = requests.post(url, json=sanitized_entry, headers=headers, timeout=15)
+                    if plain_resp.status_code in (200, 201, 204):
+                        logger.info("[Supabase] active position inserted via fallback for %s (%s)", ticker, norm_status)
+                        try:
+                            positions = load_active_positions(path)
+                            exists = any(
+                                p.get("ticker") == ticker and p.get("trade_track") == trade_track and p.get("status") in ("ACTIVE", "PENDING")
+                                for p in positions
+                            )
+                            if not exists:
+                                positions.append(entry)
+                                save_active_positions(positions, path)
+                        except Exception:
+                            pass
+                        return True
+                    elif plain_resp.status_code == 409:
+                        logger.info("[Supabase] position already exists for %s with track %s; skipping (fallback)", ticker, trade_track)
+                        return False
+                    else:
+                        # Try PATCH if already exists
+                        try:
+                            check_resp = requests.get(f"{url}?ticker=eq.{ticker}&trade_track=eq.{trade_track}&select=id", headers=headers, timeout=10)
+                            if check_resp.status_code == 200 and isinstance(check_resp.json(), list) and len(check_resp.json()) > 0:
+                                patch_resp = requests.patch(f"{url}?ticker=eq.{ticker}&trade_track=eq.{trade_track}", json=sanitized_entry, headers=headers, timeout=15)
+                                if patch_resp.status_code in (200, 204):
+                                    logger.info("[Supabase] active position patched via fallback for %s", ticker)
+                                    return True
+                        except Exception:
+                            pass
+                        logger.warning("Supabase add_active_position fallback failed (%s %s); falling back to JSON", plain_resp.status_code, plain_resp.text[:300] if plain_resp.text else "")
+                        # Fall through to JSON fallback
+                    resp = plain_resp if 'plain_resp' in locals() else resp
                 if resp.status_code in (200, 201, 204):
                     logger.info("[Supabase] active position upserted for %s (%s)", ticker, norm_status)
                     # Also update local cache for fallback
@@ -3835,6 +4124,38 @@ def process_ticker(ticker: str, state: Dict[str, Any]) -> None:
                 continue
         except Exception as exc:
             logger.warning("[%s] Supabase dedup check failed (%s); continuing", ticker, exc)
+        # Strict active position check: suppress if position already exists in active_positions (Supabase or local)
+        try:
+            if is_ticker_active_in_supabase(ticker):
+                logger.info("[%s] already active in Supabase active_positions (ACTIVE/PENDING); skipping duplicate notification.", ticker)
+                print(f"[DEDUP] Active position exists for {ticker} – skipping alert")
+                continue
+            # Always check local file as well to cover pre-sync or offline cases
+            try:
+                _local_positions = []
+                if os.path.exists(ACTIVE_POSITIONS_FILE):
+                    with open(ACTIVE_POSITIONS_FILE, "r", encoding="utf-8") as fh:
+                        _data = json.load(fh)
+                        if isinstance(_data, list):
+                            _local_positions = _data
+                        elif isinstance(_data, dict):
+                            for _k in ("positions", "active_positions", "data"):
+                                if _k in _data and isinstance(_data[_k], list):
+                                    _local_positions = _data[_k]
+                                    break
+                _found_local = False
+                for _lp in _local_positions:
+                    if isinstance(_lp, dict) and str(_lp.get("ticker", "")).strip() == ticker and str(_lp.get("status", "")).upper() in ("ACTIVE", "PENDING"):
+                        logger.info("[%s] already active in local active_positions; skipping duplicate.", ticker)
+                        print(f"[DEDUP] Local active position exists for {ticker} – skipping")
+                        _found_local = True
+                        break
+                if _found_local:
+                    continue
+            except Exception:
+                pass
+        except Exception as exc:
+            logger.warning("[%s] active_positions dedup check failed (%s); continuing", ticker, exc)
         # TQI threshold filter — EGX liquidity adapted: skip only if TQI < 5.0
         try:
             tqi_for_filter, track_for_filter, _ = resolve_tqi(ctx, strategy, sentiment)

@@ -32,6 +32,39 @@ def _supabase_headers(prefer: str = "return=minimal"):
         "Prefer": prefer,
     }
 
+
+_ALLOWED_ACTIVE_FIELDS = {"ticker", "entry_price", "current_stop_loss", "target_1", "target_2", "target_3", "trade_track", "status", "created_at"}
+
+
+def _sanitize_active_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Sanitize active_positions payload to prevent PGRST204 schema cache errors.
+
+    Handles both timestamp and created_at safely – normalizes timestamp to created_at
+    and filters to only valid table fields.
+    """
+    if not isinstance(payload, dict):
+        return {}
+    try:
+        sanitized: Dict[str, Any] = {}
+        # Normalize timestamp -> created_at
+        has_ts = "timestamp" in payload and payload.get("timestamp") is not None
+        has_ca = "created_at" in payload and payload.get("created_at") is not None
+        if has_ts and not has_ca:
+            sanitized["created_at"] = payload.get("timestamp")
+        elif has_ca:
+            sanitized["created_at"] = payload.get("created_at")
+        for k in _ALLOWED_ACTIVE_FIELDS:
+            if k == "created_at":
+                continue
+            if k in payload and payload.get(k) is not None:
+                sanitized[k] = payload[k]
+        return sanitized
+    except Exception:
+        try:
+            return {k: v for k, v in payload.items() if k in _ALLOWED_ACTIVE_FIELDS and k != "timestamp"}
+        except Exception:
+            return {}
+
 def handler(request, *args, **kwargs):
     """Vercel Python handler - handles POST from Telegram."""
     method = None
@@ -186,11 +219,11 @@ def handler(request, *args, **kwargs):
                             trade_details = parsed_trade
                             print(f"[SUPABASE] Using fallback tradeDetails from callback_data: {trade_details}")
 
-                        # 2) Insert retrieved trade details into active_positions
+                        # 2) Insert retrieved trade details into active_positions (sanitized, graceful handling for PGRST204/42P10)
                         if trade_details and trade_details.get("entry_price") is not None:
                             try:
                                 headers_upsert = _supabase_headers(prefer="resolution=merge-duplicates,return=representation")
-                                payload_insert: Dict[str, Any] = {
+                                raw_payload: Dict[str, Any] = {
                                     "ticker": trade_details.get("ticker") or ticker,
                                     "entry_price": float(trade_details.get("entry_price")),
                                     "current_stop_loss": float(trade_details.get("current_stop_loss") or trade_details.get("entry_price")),
@@ -199,9 +232,10 @@ def handler(request, *args, **kwargs):
                                     "target_3": float(trade_details.get("target_3") or trade_details.get("entry_price")),
                                     "trade_track": "Scalp",
                                     "status": "ACTIVE",
-                                    "timestamp": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(),
+                                    "created_at": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(),
                                 }
-                                print(f"[SUPABASE] POST active_positions payload: {payload_insert}")
+                                payload_insert = _sanitize_active_payload(raw_payload)
+                                print(f"[SUPABASE] POST active_positions payload (sanitized): {payload_insert}")
                                 post_resp = requests.post(
                                     f"{supabase_url}/rest/v1/{SUPABASE_TABLE}?on_conflict=ticker,trade_track",
                                     headers=headers_upsert,
@@ -214,6 +248,38 @@ def handler(request, *args, **kwargs):
                                     pbody = "(no body)"
                                 print(f"[SUPABASE] POST active_positions {ticker} -> {post_resp.status_code} {pbody[:500]}")
                                 logger.info(f"[SUPABASE] POST active_positions {ticker} -> {post_resp.status_code} {pbody[:200]}")
+                                # Graceful fallback for PGRST204 schema cache and 42P10 missing unique constraint
+                                if post_resp.status_code == 400 and ("PGRST204" in pbody or "42P10" in pbody or "ON CONFLICT" in pbody or "schema cache" in pbody):
+                                    print(f"[SUPABASE] Fallback: retrying without on_conflict for {ticker}")
+                                    plain_resp = requests.post(
+                                        f"{supabase_url}/rest/v1/{SUPABASE_TABLE}",
+                                        headers=_supabase_headers(prefer="return=representation"),
+                                        json=payload_insert,
+                                        timeout=10,
+                                    )
+                                    try:
+                                        plain_body = plain_resp.text[:1000] if plain_resp.text else "(empty)"
+                                    except Exception:
+                                        plain_body = "(no body)"
+                                    print(f"[SUPABASE] Plain POST fallback {ticker} -> {plain_resp.status_code} {plain_body[:300]}")
+                                    if plain_resp.status_code in (200, 201, 204):
+                                        post_resp = plain_resp
+                                        pbody = plain_body
+                                    elif plain_resp.status_code == 409:
+                                        # Try PATCH if exists
+                                        try:
+                                            patch_resp = requests.patch(
+                                                f"{supabase_url}/rest/v1/{SUPABASE_TABLE}?ticker=eq.{ticker}&trade_track=eq.Scalp",
+                                                headers=_supabase_headers(),
+                                                json=payload_insert,
+                                                timeout=10,
+                                            )
+                                            print(f"[SUPABASE] PATCH fallback {ticker} -> {patch_resp.status_code}")
+                                            if patch_resp.status_code in (200, 204):
+                                                post_resp = patch_resp
+                                                pbody = patch_resp.text[:300] if patch_resp.text else ""
+                                        except Exception:
+                                            pass
                                 if post_resp.status_code not in (200, 201, 204):
                                     print(f"[SUPABASE ERROR] Insert failed {post_resp.status_code}: {pbody[:300]}")
                                     logger.warning(f"Insert active_positions failed {post_resp.status_code}: {pbody[:300]}")
@@ -227,7 +293,7 @@ def handler(request, *args, **kwargs):
                             print(f"[SUPABASE ERROR] No tradeDetails available for {ticker}, trying minimal insert")
                             try:
                                 headers_upsert = _supabase_headers(prefer="resolution=merge-duplicates,return=representation")
-                                minimal = {
+                                raw_minimal = {
                                     "ticker": ticker,
                                     "entry_price": 0,
                                     "current_stop_loss": 0,
@@ -236,8 +302,9 @@ def handler(request, *args, **kwargs):
                                     "target_3": 0,
                                     "trade_track": "Scalp",
                                     "status": "ACTIVE",
-                                    "timestamp": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(),
+                                    "created_at": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(),
                                 }
+                                minimal = _sanitize_active_payload(raw_minimal)
                                 mresp = requests.post(
                                     f"{supabase_url}/rest/v1/{SUPABASE_TABLE}?on_conflict=ticker,trade_track",
                                     headers=headers_upsert,
@@ -245,6 +312,14 @@ def handler(request, *args, **kwargs):
                                     timeout=10,
                                 )
                                 print(f"[SUPABASE] Minimal POST {ticker} -> {mresp.status_code} {mresp.text[:300] if mresp.text else ''}")
+                                if mresp.status_code == 400 and ("PGRST204" in (mresp.text or "") or "42P10" in (mresp.text or "")):
+                                    plain_m = requests.post(
+                                        f"{supabase_url}/rest/v1/{SUPABASE_TABLE}",
+                                        headers=_supabase_headers(prefer="return=representation"),
+                                        json=minimal,
+                                        timeout=10,
+                                    )
+                                    print(f"[SUPABASE] Plain minimal fallback {ticker} -> {plain_m.status_code} {plain_m.text[:200] if plain_m.text else ''}")
                             except Exception as e:
                                 print(f"[SUPABASE ERROR] Minimal insert failed: {e}")
 
