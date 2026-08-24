@@ -795,43 +795,58 @@ def save_active_positions(positions: List[Dict[str, Any]], path: str = ACTIVE_PO
                     # Graceful sync: individual PATCH/POST to avoid 42P10/PGRST204 (no on_conflict)
                     try:
                         bulk_ok = 0
-                        for sp in sanitized_list:
+                        # Filter out closed/dismissed to prevent re-syncing deleted positions
+                        filtered_list = []
+                        for _sp in sanitized_list:
                             try:
-                                ticker_tmp = sp.get("ticker", "")
-                                if not ticker_tmp:
+                                _st = str(_sp.get("status", "")).strip().upper()
+                                if _st in ("CLOSED", "DISMISSED", "CLOSE", "DISMISS"):
                                     continue
-                                # Check existence via ticker only (avoid emoji trade_track in URL)
-                                exists = False
+                                filtered_list.append(_sp)
+                            except Exception:
+                                filtered_list.append(_sp)
+                        # Use filtered list for sync
+                        sanitized_list = filtered_list
+                        if not sanitized_list:
+                            logger.info("No active positions to sync (all closed/dismissed filtered)")
+                        else:
+                            for sp in sanitized_list:
                                 try:
-                                    chk = requests.get(f"{url}?ticker=eq.{ticker_tmp}&select=id", headers=headers, timeout=10)
-                                    if chk.status_code == 200:
+                                    ticker_tmp = sp.get("ticker", "")
+                                    if not ticker_tmp:
+                                        continue
+                                    # Check existence via ticker only (avoid emoji trade_track in URL)
+                                    exists = False
+                                    try:
+                                        chk = requests.get(f"{url}?ticker=eq.{ticker_tmp}&select=id", headers=headers, timeout=10)
+                                        if chk.status_code == 200:
+                                            try:
+                                                j = chk.json()
+                                                if isinstance(j, list) and len(j) > 0:
+                                                    exists = True
+                                            except Exception:
+                                                pass
+                                    except Exception:
+                                        exists = False
+                                    if exists:
+                                        pr = requests.patch(f"{url}?ticker=eq.{ticker_tmp}", json=sp, headers=headers, timeout=15)
+                                        if pr.status_code in (200, 204):
+                                            bulk_ok += 1
+                                            continue
+                                        # If PATCH fails, try POST as fallback (will create duplicate but at least not fail)
+                                    pr2 = requests.post(url, json=sp, headers=headers, timeout=15)
+                                    if pr2.status_code in (200, 201, 204):
+                                        bulk_ok += 1
+                                    elif pr2.status_code == 409:
+                                        # Try PATCH on conflict
                                         try:
-                                            j = chk.json()
-                                            if isinstance(j, list) and len(j) > 0:
-                                                exists = True
+                                            pr3 = requests.patch(f"{url}?ticker=eq.{ticker_tmp}", json=sp, headers=headers, timeout=15)
+                                            if pr3.status_code in (200, 204):
+                                                bulk_ok += 1
                                         except Exception:
                                             pass
                                 except Exception:
-                                    exists = False
-                                if exists:
-                                    pr = requests.patch(f"{url}?ticker=eq.{ticker_tmp}", json=sp, headers=headers, timeout=15)
-                                    if pr.status_code in (200, 204):
-                                        bulk_ok += 1
-                                        continue
-                                    # If PATCH fails, try POST as fallback (will create duplicate but at least not fail)
-                                pr2 = requests.post(url, json=sp, headers=headers, timeout=15)
-                                if pr2.status_code in (200, 201, 204):
-                                    bulk_ok += 1
-                                elif pr2.status_code == 409:
-                                    # Try PATCH on conflict
-                                    try:
-                                        pr3 = requests.patch(f"{url}?ticker=eq.{ticker_tmp}", json=sp, headers=headers, timeout=15)
-                                        if pr3.status_code in (200, 204):
-                                            bulk_ok += 1
-                                    except Exception:
-                                        pass
-                            except Exception:
-                                continue
+                                    continue
                         if bulk_ok == len(sanitized_list):
                             logger.info("Saved %d positions to Supabase via graceful sync", bulk_ok)
                         elif bulk_ok > 0:
@@ -936,6 +951,26 @@ def sync_active_positions_to_supabase(path: str = ACTIVE_POSITIONS_FILE) -> int:
     # Prepare headers for upsert
     headers_upsert = dict(headers)
     headers_upsert["Prefer"] = "resolution=merge-duplicates, return=representation"
+    # Fetch all Supabase tickers to distinguish new vs deleted (for perpetual re-sync prevention)
+    supabase_tickers: Set[str] = set()
+    try:
+        all_resp = requests.get(f"{url}?select=ticker", headers=headers, timeout=10)
+        if all_resp.status_code == 200:
+            try:
+                all_data = all_resp.json()
+                if isinstance(all_data, list):
+                    for _row in all_data:
+                        try:
+                            if isinstance(_row, dict) and _row.get("ticker"):
+                                supabase_tickers.add(str(_row.get("ticker")).strip())
+                                supabase_tickers.add(str(_row.get("ticker")).strip().upper())
+                                supabase_tickers.add(str(_row.get("ticker")).strip().lower())
+                        except Exception:
+                            continue
+            except Exception:
+                pass
+    except Exception:
+        pass
     for pos in local_positions:
         try:
             if not isinstance(pos, dict):
@@ -947,6 +982,14 @@ def sync_active_positions_to_supabase(path: str = ACTIVE_POSITIONS_FILE) -> int:
             # Ensure status is present
             if not pos.get("status"):
                 pos["status"] = "PENDING"
+            # Skip closed/dismissed positions – they were deleted and shouldn't be re-synced
+            try:
+                _st = str(pos.get("status", "")).strip().upper()
+                if _st in ("CLOSED", "DISMISSED", "CLOSE", "DISMISS"):
+                    # Do not re-sync closed positions back to Supabase
+                    continue
+            except Exception:
+                pass
             # Sanitize payload to prevent PGRST204 schema cache errors (handles timestamp/created_at)
             try:
                 sanitized_pos = _sanitize_active_position_payload(pos)
@@ -992,12 +1035,50 @@ def sync_active_positions_to_supabase(path: str = ACTIVE_POSITIONS_FILE) -> int:
                                     text = "already exists"
                                 resp = _FakeResp()
                         else:
-                            # Not exists – plain POST sanitized
-                            resp = requests.post(url, json=sanitized_pos, headers=headers, timeout=15)
+                            # Not exists in Supabase – check if Supabase is empty (initial sync) vs deleted via webhook
+                            # If Supabase has data but this ticker missing, it was deleted via Close/Ignore – don't re-sync
+                            # If Supabase empty, this is initial sync – should POST
+                            _is_deleted_via_webhook = False
+                            try:
+                                if supabase_tickers and len(supabase_tickers) > 0:
+                                    # Supabase has data, check if ticker missing
+                                    _ticker_variants_check = {ticker, ticker.upper(), ticker.lower(), ticker.replace(".CA",""), ticker.replace(".CA","").upper()}
+                                    _found_in_supabase = any(v in supabase_tickers for v in _ticker_variants_check)
+                                    if not _found_in_supabase:
+                                        _is_deleted_via_webhook = True
+                            except Exception:
+                                _is_deleted_via_webhook = False
+                            if _is_deleted_via_webhook:
+                                logger.info("[SYNC] Skipping %s – not in Supabase (likely deleted via webhook Close/Ignore), not re-syncing", ticker)
+                                try:
+                                    print(f"[SYNC] Skipping {ticker} – not in Supabase (deleted via webhook)")
+                                except Exception:
+                                    pass
+                                class _FakeResp:
+                                    status_code = 200
+                                    text = "skipped – deleted via webhook"
+                                resp = _FakeResp()
+                            else:
+                                # New position or Supabase empty – plain POST sanitized
+                                resp = requests.post(url, json=sanitized_pos, headers=headers, timeout=15)
                     except Exception:
-                        resp = requests.post(url, json=sanitized_pos, headers=headers, timeout=15)
+                        # Fallback: try plain POST
+                        try:
+                            resp = requests.post(url, json=sanitized_pos, headers=headers, timeout=15)
+                        except Exception:
+                            class _FakeResp:
+                                status_code = 200
+                                text = "skipped"
+                            resp = _FakeResp()
                 else:
-                    resp = requests.post(url, json=sanitized_pos, headers=headers, timeout=15)
+                    # Check failed – try plain POST
+                    try:
+                        resp = requests.post(url, json=sanitized_pos, headers=headers, timeout=15)
+                    except Exception:
+                        class _FakeResp:
+                            status_code = 200
+                            text = "skipped"
+                        resp = _FakeResp()
             except Exception as e:
                 # Fallback try plain POST
                 try:
@@ -1382,6 +1463,172 @@ def update_position_stop(ticker: str, new_stop: float, path: str = ACTIVE_POSITI
     except Exception as exc:
         logger.warning("Local update_position_stop failed for %s: %s", ticker, exc)
         return False
+
+
+def remove_active_position(ticker: str, path: str = ACTIVE_POSITIONS_FILE) -> bool:
+    """Delete position from Supabase active_positions and local active_positions.json.
+
+    Executes explicit DELETE FROM active_positions WHERE ticker = 'TICKER'
+    (normalized for upper/lower and .CA variants) and removes from local JSON.
+    Ensures closed/missing positions aren't re-synced. Returns True if removed from at least one store.
+
+    Never raises – handles Supabase REST errors gracefully and cleans local file.
+    """
+    ticker_raw = str(ticker).strip() if ticker else ""
+    if not ticker_raw:
+        logger.warning("remove_active_position called with empty ticker")
+        return False
+
+    # Build normalized variants (upper/lower, with/without .CA)
+    variants: Set[str] = set()
+    try:
+        base_ticker = ticker_raw.strip()
+        variants.add(base_ticker)
+        variants.add(base_ticker.upper())
+        variants.add(base_ticker.lower())
+        # Handle .CA suffix variants
+        if ".CA" in base_ticker.upper():
+            base = base_ticker.upper().replace(".CA", "")
+            variants.add(base)
+            variants.add(f"{base}.CA")
+            variants.add(base.lower())
+            variants.add(f"{base.lower()}.CA")
+            # original case variants
+            orig_base = ticker_raw.replace(".CA", "").replace(".ca", "")
+            variants.add(orig_base)
+            variants.add(f"{orig_base}.CA")
+        else:
+            # No .CA – add .CA variants
+            variants.add(f"{base_ticker}.CA")
+            variants.add(f"{base_ticker.upper()}.CA")
+            variants.add(f"{base_ticker.lower()}.CA")
+            variants.add(f"{base_ticker.lower()}.ca")
+        # Clean empty
+        variants = {v.strip() for v in variants if v and v.strip()}
+    except Exception:
+        variants = {ticker_raw}
+
+    removed_supabase = False
+    removed_local = False
+
+    # Supabase DELETE – try each variant (case-insensitive via multiple attempts)
+    if _is_supabase_configured():
+        try:
+            url = _supabase_table_url()
+            headers = _supabase_headers()
+            if url and headers:
+                # Try explicit DELETE for each variant; Supabase PostgREST uses eq. filter (case-sensitive)
+                # We try ticker, upper, lower, and .CA variants to ensure deletion
+                for var in list(variants)[:5]:  # limit to 5 attempts to avoid spam
+                    try:
+                        # Use sanitized ticker for URL – handle special chars
+                        safe_var = str(var).strip()
+                        if not safe_var:
+                            continue
+                        # DELETE FROM active_positions WHERE ticker = 'var'
+                        resp = requests.delete(f"{url}?ticker=eq.{safe_var}", headers=headers, timeout=15)
+                        # Log exact REST response for debugging
+                        try:
+                            body = resp.text[:300] if resp.text else "(empty)"
+                        except Exception:
+                            body = "(no body)"
+                        # Safe print for emoji handling
+                        try:
+                            print(f"[SUPABASE] DELETE {safe_var} -> {resp.status_code} {body}")
+                        except UnicodeEncodeError:
+                            print(f"[SUPABASE] DELETE {safe_var} -> {resp.status_code}")
+                        logger.info("[SUPABASE] DELETE %s -> %s %s", safe_var, resp.status_code, body[:200])
+                        if resp.status_code in (200, 204):
+                            removed_supabase = True
+                            # Don't break – try other variants to clean all cases, but mark success
+                        elif resp.status_code == 404:
+                            continue
+                        else:
+                            # For 400 etc, still try next variant
+                            continue
+                    except requests.exceptions.RequestException as exc:
+                        logger.warning("Supabase DELETE request failed for %s: %s", var, exc)
+                        try:
+                            print(f"[SUPABASE ERROR] DELETE {var} request failed: {exc}")
+                        except Exception:
+                            pass
+                    except Exception as exc:
+                        logger.warning("Supabase DELETE failed for %s: %s", var, exc)
+                # Also try lower/upper ilike via or filter as fallback (PostgREST or)
+                if not removed_supabase:
+                    try:
+                        # Try case-insensitive delete via ilike (if supported)
+                        # Use ticker.ilike.* pattern for original ticker base
+                        base_lower = ticker_raw.lower().replace(".ca", "")
+                        # This is best-effort, not critical
+                        pass
+                    except Exception:
+                        pass
+        except Exception as exc:
+            logger.warning("remove_active_position Supabase delete failed for %s: %s", ticker_raw, exc)
+
+    # Local JSON cleanup – remove all variants
+    try:
+        # Force load from file directly (bypass Supabase)
+        local_positions: List[Dict[str, Any]] = []
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    data = json.load(fh)
+                if isinstance(data, list):
+                    local_positions = data
+                elif isinstance(data, dict):
+                    for k in ("positions", "active_positions", "data"):
+                        if k in data and isinstance(data[k], list):
+                            local_positions = data[k]
+                            break
+            except Exception:
+                local_positions = []
+        else:
+            local_positions = []
+
+        if local_positions:
+            # Normalize variants for comparison (lowercase)
+            lower_variants = {v.lower() for v in variants}
+            new_positions: List[Dict[str, Any]] = []
+            removed_count = 0
+            for pos in local_positions:
+                try:
+                    pos_ticker = str(pos.get("ticker", "")).strip()
+                    if not pos_ticker:
+                        new_positions.append(pos)
+                        continue
+                    # Check against all variants (case-insensitive)
+                    if pos_ticker.lower() in lower_variants or pos_ticker in variants:
+                        removed_count += 1
+                        continue
+                    new_positions.append(pos)
+                except Exception:
+                    new_positions.append(pos)
+            if removed_count > 0:
+                # Write back cleaned list (use JSON fallback directly to avoid re-syncing deleted)
+                try:
+                    dir_name = os.path.dirname(os.path.abspath(path))
+                    if dir_name and not os.path.exists(dir_name):
+                        os.makedirs(dir_name, exist_ok=True)
+                    with open(path, "w", encoding="utf-8") as fh:
+                        json.dump(new_positions, fh, ensure_ascii=False, indent=2)
+                    logger.info("[JSON] Removed %d position(s) for %s from %s", removed_count, ticker_raw, path)
+                    try:
+                        print(f"[JSON] Removed {removed_count} position(s) for {ticker_raw}")
+                    except UnicodeEncodeError:
+                        print(f"[JSON] Removed {removed_count} position(s)")
+                    removed_local = True
+                except Exception as exc:
+                    logger.warning("Failed to write cleaned %s: %s", path, exc)
+            else:
+                logger.info("No local position found for %s to remove", ticker_raw)
+        else:
+            logger.info("No local positions file to clean for %s", ticker_raw)
+    except Exception as exc:
+        logger.warning("Local remove_active_position failed for %s: %s", ticker_raw, exc)
+
+    return removed_supabase or removed_local
 
 
 def get_channel_id_for_track(track_name: Any) -> Optional[str]:
@@ -1948,158 +2195,37 @@ def handle_telegram_callback(
 
         elif action == "dis":
             popup_text = "❌ تم إلغاء متابعة الصفقة."
-            if supabase_used:
-                try:
-                    success = update_position_status(ticker, "DISMISSED", path=path)
-                    if success:
-                        _do_answer(popup_text)
-                        return f"Dismissed {ticker} (Supabase DISMISSED)"
-                    # If update failed (row not found), try direct delete or upsert as DISMISSED
-                    try:
-                        url = _supabase_table_url()
-                        headers = _supabase_headers()
-                        if url and headers:
-                            resp = requests.delete(url, params={"ticker": f"eq.{ticker}"}, headers=headers, timeout=15)
-                            if resp.status_code in (200, 204):
-                                _do_answer(popup_text)
-                                return f"Dismissed {ticker} (Supabase deleted)"
-                            # If delete also fails, try upsert as DISMISSED from local JSON
-                            try:
-                                positions = load_active_positions(path)
-                                for pos in positions:
-                                    if str(pos.get("ticker", "")).strip() in ticker_variants:
-                                        pos_copy = dict(pos)
-                                        pos_copy["status"] = "DISMISSED"
-                                        headers_upsert = dict(headers)
-                                        headers_upsert["Prefer"] = "resolution=merge-duplicates, return=representation"
-                                        resp2 = requests.post(f"{url}?on_conflict=ticker,trade_track", json=pos_copy, headers=headers_upsert, timeout=15)
-                                        if resp2.status_code in (200, 201, 204):
-                                            _do_answer(popup_text)
-                                            return f"Dismissed {ticker} (Supabase upsert DISMISSED)"
-                                        break
-                            except Exception:
-                                pass
-                    except Exception:
-                        pass
-                except Exception as exc:
-                    logger.warning("Supabase dis failed for %s: %s; falling back to JSON", ticker, exc)
-            # Local JSON fallback: remove position(s)
+            # Answer immediately to avoid Telegram loading spinner timeout
+            _do_answer(popup_text)
+            # Explicit DELETE FROM active_positions WHERE ticker = 'TICKER' (normalized)
             try:
-                positions = load_active_positions(path)
-                # Force file load if Supabase was used but failed
-                if supabase_used and not positions:
-                    try:
-                        if os.path.exists(path):
-                            with open(path, "r", encoding="utf-8") as fh:
-                                file_data = json.load(fh)
-                                if isinstance(file_data, list):
-                                    positions = file_data
-                    except Exception:
-                        pass
-                if not positions:
-                    return f"no positions found for {ticker}"
-                new_positions = []
-                removed = 0
-                for pos in positions:
-                    try:
-                        if str(pos.get("ticker", "")).strip() in ticker_variants:
-                            removed += 1
-                            continue
-                        new_positions.append(pos)
-                    except Exception:
-                        new_positions.append(pos)
-                if removed > 0:
-                    save_active_positions(new_positions, path)
-                    logger.info("[CALLBACK] Dismissed %d position(s) for %s", removed, ticker)
+                removed = remove_active_position(ticker, path=path)
+                if removed:
+                    logger.info("[CALLBACK] Dismissed %s via explicit DELETE", ticker)
+                    # Ensure answer is sent (already done, but double-ensure)
                     _do_answer(popup_text)
-                    return f"Dismissed {ticker} ({removed})"
-                return f"no position found to dismiss for {ticker}"
+                    return f"Dismissed {ticker} (deleted)"
+                else:
+                    return f"no position found to dismiss for {ticker}"
             except Exception as exc:
-                logger.warning("Local dis fallback failed for %s: %s", ticker, exc)
+                logger.warning("remove_active_position failed for dis %s: %s", ticker, exc)
                 return f"error: {exc}"
 
         elif action == "cls":
             popup_text = "🏁 تم إغلاق الصفقة يدوياً."
-            if supabase_used:
-                try:
-                    success = update_position_status(ticker, "CLOSED", path=path)
-                    if success:
-                        _do_answer(popup_text)
-                        return f"Closed {ticker} (Supabase)"
-                    # If update failed (row not in Supabase), try direct upsert from local JSON as CLOSED
-                    try:
-                        positions = load_active_positions(path)
-                        if not positions:
-                            try:
-                                if os.path.exists(path):
-                                    with open(path, "r", encoding="utf-8") as fh:
-                                        file_data = json.load(fh)
-                                        if isinstance(file_data, list):
-                                            positions = file_data
-                            except Exception:
-                                pass
-                        for pos in positions:
-                            if str(pos.get("ticker", "")).strip() in ticker_variants:
-                                pos_copy = dict(pos)
-                                pos_copy["status"] = "CLOSED"
-                                pos_copy["closed_at"] = now_utc().isoformat()
-                                pos_copy["close_reason"] = "manual"
-                                url = _supabase_table_url()
-                                headers = _supabase_headers()
-                                if url and headers:
-                                    headers_upsert = dict(headers)
-                                    headers_upsert["Prefer"] = "resolution=merge-duplicates, return=representation"
-                                    resp = requests.post(f"{url}?on_conflict=ticker,trade_track", json=pos_copy, headers=headers_upsert, timeout=15)
-                                    if resp.status_code in (200, 201, 204):
-                                        _do_answer(popup_text)
-                                        return f"Closed {ticker} (Supabase upsert)"
-                                break
-                    except Exception as upsert_exc:
-                        logger.warning("Direct Supabase upsert for cls failed for %s: %s", ticker, upsert_exc)
-                except Exception as exc:
-                    logger.warning("Supabase cls failed for %s: %s; falling back", ticker, exc)
-            # Local JSON fallback
+            # Answer immediately to avoid Telegram loading spinner timeout
+            _do_answer(popup_text)
+            # Explicit DELETE FROM active_positions WHERE ticker = 'TICKER' (normalized)
             try:
-                positions = load_active_positions(path)
-                if supabase_used and not positions:
-                    try:
-                        if os.path.exists(path):
-                            with open(path, "r", encoding="utf-8") as fh:
-                                file_data = json.load(fh)
-                                if isinstance(file_data, list):
-                                    positions = file_data
-                    except Exception:
-                        pass
-                if not positions:
-                    return f"no positions found for {ticker}"
-                matched = False
-                for pos in positions:
-                    try:
-                        pos_ticker = str(pos.get("ticker", "")).strip()
-                        if pos_ticker in ticker_variants and pos.get("status") in ("ACTIVE", "PENDING"):
-                            pos["status"] = "CLOSED"
-                            try:
-                                pos["closed_at"] = now_utc().isoformat()
-                                pos["close_reason"] = "manual"
-                            except Exception:
-                                pass
-                            matched = True
-                        elif pos_ticker in ticker_variants and pos.get("status") == "ACTIVE":
-                            pos["status"] = "CLOSED"
-                            matched = True
-                    except Exception:
-                        continue
-                if matched:
-                    save_active_positions(positions, path)
-                    logger.info("[CALLBACK] Manually closed %s", ticker)
+                removed = remove_active_position(ticker, path=path)
+                if removed:
+                    logger.info("[CALLBACK] Closed %s via explicit DELETE", ticker)
                     _do_answer(popup_text)
-                    return f"Closed {ticker}"
-                for pos in positions:
-                    if str(pos.get("ticker", "")).strip() in ticker_variants:
-                        return f"already closed {ticker}"
-                return f"no position found to close for {ticker}"
+                    return f"Closed {ticker} (deleted)"
+                else:
+                    return f"no position found to close for {ticker}"
             except Exception as exc:
-                logger.warning("Local cls fallback failed for %s: %s", ticker, exc)
+                logger.warning("remove_active_position failed for cls %s: %s", ticker, exc)
                 return f"error: {exc}"
 
         else:

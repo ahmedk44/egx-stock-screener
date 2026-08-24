@@ -162,7 +162,37 @@ def handler(request, *args, **kwargs):
                 print(f"[WEBHOOK ERROR] Failed to parse callback_data: {e}")
                 logger.warning(f"Failed to parse callback_data: {e}")
 
-            # Handle تفعيل الصفقة: fetch from sent_alerts and insert into active_positions
+            # Answer Telegram callback query immediately so Telegram doesn't show loading spinner timeout (per requirement)
+            _already_answered = False
+            if bot_token and callback_id and requests:
+                try:
+                    print(f"[TELEGRAM] Immediate answerCallbackQuery id={callback_id} text={popup_text}")
+                    logger.info(f"[TELEGRAM] Immediate answerCallbackQuery id={callback_id} text={popup_text}")
+                    _ans_resp = requests.post(
+                        f"https://api.telegram.org/bot{bot_token}/answerCallbackQuery",
+                        json={
+                            "callback_query_id": callback_id,
+                            "text": popup_text,
+                            "show_alert": True,
+                        },
+                        timeout=10,
+                    )
+                    try:
+                        _ans_body = _ans_resp.text[:500] if _ans_resp.text else "(empty)"
+                    except Exception:
+                        _ans_body = "(no body)"
+                    print(f"[TELEGRAM] Immediate answerCallbackQuery -> {_ans_resp.status_code} {_ans_body[:300]}")
+                    logger.info(f"[TELEGRAM] Immediate answerCallbackQuery -> {_ans_resp.status_code} {_ans_body[:200]}")
+                    _already_answered = True
+                except requests.exceptions.RequestException as e:
+                    print(f"[TELEGRAM ERROR] Immediate answerCallbackQuery request failed: {e}")
+                    logger.warning(f"Immediate answerCallbackQuery request failed: {e}")
+                except Exception as e:
+                    print(f"[TELEGRAM ERROR] Immediate answerCallbackQuery unexpected: {e}")
+                    logger.warning(f"Immediate answerCallbackQuery unexpected: {e}")
+
+            # Handle explicit DELETE for إغلاق الصفقة / غير مهتم (dis/cls) and insert for act
+            # When dis/cls, execute explicit DELETE FROM active_positions WHERE ticker = 'TICKER' (normalized)
             if new_status and ticker and supabase_url and supabase_key and requests:
                 try:
                     print(f"[SUPABASE] Starting activation flow for {ticker} -> {new_status}")
@@ -323,26 +353,83 @@ def handler(request, *args, **kwargs):
                             except Exception as e:
                                 print(f"[SUPABASE ERROR] Minimal insert failed: {e}")
 
-                    # Also PATCH status update for all cases
-                    try:
-                        headers = _supabase_headers()
-                        patch_url = f"{supabase_url}/rest/v1/{SUPABASE_TABLE}?ticker=eq.{ticker}"
-                        print(f"[SUPABASE] PATCH {ticker} -> {new_status} URL: {patch_url}")
-                        resp = requests.patch(patch_url, headers=headers, json={"status": new_status}, timeout=10)
+                    # For dis/cls (إغلاق الصفقة / غير مهتم) -> explicit DELETE FROM active_positions WHERE ticker = 'TICKER'
+                    if new_status in ("DISMISSED", "CLOSED"):
                         try:
-                            body = resp.text[:1000] if resp.text else "(empty)"
-                        except Exception:
-                            body = "(no body)"
-                        print(f"[SUPABASE] PATCH {ticker} -> {new_status} {resp.status_code} {body[:300]}")
-                        logger.info(f"[SUPABASE] PATCH {ticker} -> {new_status} {resp.status_code} {body[:200]}")
-                        if resp.status_code not in (200, 204):
-                            print(f"[SUPABASE ERROR] PATCH non-200: {body[:300]}")
-                    except requests.exceptions.RequestException as e:
-                        print(f"[SUPABASE ERROR] PATCH request failed for {ticker}: {e}")
-                        logger.warning(f"PATCH request failed: {e}")
-                    except Exception as e:
-                        print(f"[SUPABASE ERROR] PATCH unexpected for {ticker}: {e}")
-                        logger.warning(f"PATCH unexpected: {e}")
+                            print(f"[SUPABASE] Explicit DELETE for {ticker} (action {new_status})")
+                            logger.info(f"[SUPABASE] Explicit DELETE for {ticker}")
+                            # Build normalized variants (upper/lower, with/without .CA)
+                            raw_ticker = str(ticker).strip()
+                            variants = set()
+                            try:
+                                variants.add(raw_ticker)
+                                variants.add(raw_ticker.upper())
+                                variants.add(raw_ticker.lower())
+                                # Handle .CA suffix
+                                if ".CA" in raw_ticker.upper():
+                                    base = raw_ticker.upper().replace(".CA", "")
+                                    variants.add(base)
+                                    variants.add(f"{base}.CA")
+                                    variants.add(base.lower())
+                                    variants.add(f"{base.lower()}.CA")
+                                    orig_base = raw_ticker.replace(".CA", "").replace(".ca", "")
+                                    variants.add(orig_base)
+                                    variants.add(f"{orig_base}.CA")
+                                else:
+                                    variants.add(f"{raw_ticker}.CA")
+                                    variants.add(f"{raw_ticker.upper()}.CA")
+                                    variants.add(f"{raw_ticker.lower()}.CA")
+                            except Exception:
+                                variants = {raw_ticker}
+                            variants = {v.strip() for v in variants if v and v.strip()}
+                            deleted_any = False
+                            for var in list(variants)[:6]:
+                                try:
+                                    safe_var = str(var).strip()
+                                    del_url = f"{supabase_url}/rest/v1/{SUPABASE_TABLE}?ticker=eq.{safe_var}"
+                                    headers_del = _supabase_headers()
+                                    # Use Prefer return=representation to get count
+                                    resp_del = requests.delete(del_url, headers=headers_del, timeout=10)
+                                    try:
+                                        del_body = resp_del.text[:300] if resp_del.text else "(empty)"
+                                    except Exception:
+                                        del_body = "(no body)"
+                                    print(f"[SUPABASE] DELETE {safe_var} -> {resp_del.status_code} {del_body}")
+                                    logger.info(f"[SUPABASE] DELETE {safe_var} -> {resp_del.status_code} {del_body[:200]}")
+                                    if resp_del.status_code in (200, 204):
+                                        deleted_any = True
+                                except requests.exceptions.RequestException as e:
+                                    print(f"[SUPABASE ERROR] DELETE request failed for {var}: {e}")
+                                except Exception as e:
+                                    print(f"[SUPABASE ERROR] DELETE failed for {var}: {e}")
+                            if not deleted_any:
+                                print(f"[SUPABASE] DELETE completed for {ticker} (no rows matched or already deleted)")
+                            else:
+                                print(f"[SUPABASE] DELETE succeeded for {ticker}")
+                        except Exception as e:
+                            print(f"[SUPABASE ERROR] DELETE handling failed for {ticker}: {e}")
+                            logger.warning(f"DELETE handling failed for {ticker}: {e}")
+                    else:
+                        # For ACTIVE, ensure status is ACTIVE via PATCH (optional, since already inserted)
+                        try:
+                            headers = _supabase_headers()
+                            patch_url = f"{supabase_url}/rest/v1/{SUPABASE_TABLE}?ticker=eq.{ticker}"
+                            print(f"[SUPABASE] PATCH {ticker} -> {new_status} URL: {patch_url}")
+                            resp = requests.patch(patch_url, headers=headers, json={"status": new_status}, timeout=10)
+                            try:
+                                body = resp.text[:1000] if resp.text else "(empty)"
+                            except Exception:
+                                body = "(no body)"
+                            print(f"[SUPABASE] PATCH {ticker} -> {new_status} {resp.status_code} {body[:300]}")
+                            logger.info(f"[SUPABASE] PATCH {ticker} -> {new_status} {resp.status_code} {body[:200]}")
+                            if resp.status_code not in (200, 204):
+                                print(f"[SUPABASE ERROR] PATCH non-200: {body[:300]}")
+                        except requests.exceptions.RequestException as e:
+                            print(f"[SUPABASE ERROR] PATCH request failed for {ticker}: {e}")
+                            logger.warning(f"PATCH request failed: {e}")
+                        except Exception as e:
+                            print(f"[SUPABASE ERROR] PATCH unexpected for {ticker}: {e}")
+                            logger.warning(f"PATCH unexpected: {e}")
 
                 except Exception as e:
                     print(f"[SUPABASE ERROR] Activation flow failed for {ticker}: {e}")
@@ -352,10 +439,13 @@ def handler(request, *args, **kwargs):
                 print(f"[SUPABASE] Skipping Supabase update: missing URL/Key or requests (url={bool(supabase_url)}, key={bool(supabase_key)}, req={bool(requests)})")
                 logger.warning(f"Skipping Supabase update missing config url={bool(supabase_url)} key={bool(supabase_key)}")
 
-            # Answer callback query immediately
-            if bot_token and callback_id and requests:
+            # Answer callback query (already sent immediately at top – avoid duplicate)
+            if '_already_answered' in locals() and _already_answered:
+                print(f"[TELEGRAM] answerCallbackQuery already sent immediately for {callback_id}, skipping duplicate")
+                logger.info(f"[TELEGRAM] answerCallbackQuery already sent, skipping duplicate for {callback_id}")
+            elif bot_token and callback_id and requests:
                 try:
-                    print(f"[TELEGRAM] answerCallbackQuery id={callback_id} text={popup_text}")
+                    print(f"[TELEGRAM] answerCallbackQuery id={callback_id} text={popup_text} (fallback)")
                     logger.info(f"[TELEGRAM] answerCallbackQuery id={callback_id} text={popup_text}")
                     resp = requests.post(
                         f"https://api.telegram.org/bot{bot_token}/answerCallbackQuery",

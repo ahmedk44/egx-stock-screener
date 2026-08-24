@@ -51,13 +51,109 @@ export default async function handler(req, res) {
         console.error('[WEBHOOK ERROR] Failed to parse callback_data:', e);
       }
 
-      // Handle تفعيل الصفقة: fetch from sent_alerts and insert into active_positions
+      // Answer Telegram callback query immediately to avoid loading spinner timeout (per requirement)
+      if (botToken && callbackId) {
+        try {
+          console.log(`[TELEGRAM] Sending immediate answerCallbackQuery id=${callbackId} text=${popupText}`);
+          const immediateRes = await fetch(`https://api.telegram.org/bot${botToken}/answerCallbackQuery`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              callback_query_id: callbackId,
+              text: popupText,
+              show_alert: true,
+            }),
+          });
+          const immediateBody = await immediateRes.text().catch(() => '');
+          console.log(`[TELEGRAM] Immediate answerCallbackQuery ${callbackId} -> ${popupText} status: ${immediateRes.status} body: ${immediateBody}`);
+        } catch (e) {
+          console.error(`[TELEGRAM ERROR] Immediate answerCallbackQuery failed:`, e);
+        }
+      }
+
+      // Handle Supabase actions: act -> insert, dis/cls -> explicit DELETE
       if (newStatus && ticker && supabaseUrl && supabaseKey) {
         try {
-          console.log(`[SUPABASE] Starting activation flow for ${ticker} -> ${newStatus}`);
+          console.log(`[SUPABASE] Starting callback flow for ${ticker} -> ${newStatus}`);
 
-          // Special handling for act_ : fetch latest from sent_alerts then insert into active_positions
-          if (data.startsWith('act_')) {
+          // Handle إغلاق الصفقة / غير مهتم -> explicit DELETE FROM active_positions WHERE ticker = 'TICKER'
+          if (data.startsWith('dis_') || data.startsWith('cls_')) {
+            try {
+              console.log(`[SUPABASE] Explicit DELETE for ${ticker} (action ${data.slice(0,3)})`);
+              // Build normalized ticker variants (upper/lower, with/without .CA)
+              const baseTicker = ticker.trim();
+              const variants = new Set([
+                baseTicker,
+                baseTicker.toUpperCase(),
+                baseTicker.toLowerCase(),
+                baseTicker.replace(/\.CA$/i, ''),
+                baseTicker.replace(/\.CA$/i, '').toUpperCase(),
+                baseTicker.replace(/\.CA$/i, '').toLowerCase(),
+                `${baseTicker.replace(/\.CA$/i, '')}.CA`,
+                `${baseTicker.replace(/\.CA$/i, '').toUpperCase()}.CA`,
+                `${baseTicker.replace(/\.CA$/i, '').toLowerCase()}.CA`,
+              ]);
+              // Also handle direct ticker without .CA
+              if (!baseTicker.toUpperCase().endsWith('.CA')) {
+                variants.add(`${baseTicker}.CA`);
+                variants.add(`${baseTicker.toUpperCase()}.CA`);
+              }
+              let deleted = false;
+              for (const variant of Array.from(variants).slice(0, 6)) {
+                if (!variant || !variant.trim()) continue;
+                const safeVar = variant.trim();
+                try {
+                  // Explicit DELETE query: DELETE FROM active_positions WHERE ticker = 'variant'
+                  const delUrl = `${supabaseUrl}/rest/v1/active_positions?ticker=eq.${encodeURIComponent(safeVar)}`;
+                  console.log(`[SUPABASE] DELETE ${safeVar} -> ${delUrl}`);
+                  const delRes = await fetch(delUrl, {
+                    method: 'DELETE',
+                    headers: {
+                      'apikey': supabaseKey,
+                      'Authorization': `Bearer ${supabaseKey}`,
+                      'Content-Type': 'application/json',
+                      'Prefer': 'return=representation',
+                    },
+                  });
+                  const delBody = await delRes.text().catch(() => '');
+                  console.log(`[SUPABASE] DELETE ${safeVar} -> ${delRes.status} body: ${delBody}`);
+                  if (delRes.status === 200 || delRes.status === 204 || delRes.status === 202) {
+                    deleted = true;
+                    // Try to capture deleted rows if representation returned
+                    console.log(`[SUPABASE] Deleted ${safeVar} successfully`);
+                  }
+                  // Also try lower/upper normalized explicit check
+                  if (delRes.status === 200 && delBody && delBody !== '[]') {
+                    // Successfully deleted some rows
+                  }
+                } catch (delErr) {
+                  console.error(`[SUPABASE ERROR] DELETE failed for ${safeVar}:`, delErr);
+                }
+              }
+              // Fallback: try ilike case-insensitive delete via or filter if direct eq didn't delete
+              if (!deleted) {
+                try {
+                  // Try deleting via ticker ilike (case-insensitive) – best effort
+                  const base = baseTicker.replace(/\.CA$/i, '');
+                  const ilikeUrl = `${supabaseUrl}/rest/v1/active_positions?ticker=ilike.${encodeURIComponent(base)}%`;
+                  const ilikeRes = await fetch(ilikeUrl, {
+                    method: 'DELETE',
+                    headers: {
+                      'apikey': supabaseKey,
+                      'Authorization': `Bearer ${supabaseKey}`,
+                    },
+                  });
+                  const ilikeBody = await ilikeRes.text().catch(() => '');
+                  console.log(`[SUPABASE] DELETE ilike ${base}% -> ${ilikeRes.status} ${ilikeBody}`);
+                } catch (e) {
+                  console.error(`[SUPABASE ERROR] ilike DELETE fallback failed:`, e);
+                }
+              }
+              console.log(`[SUPABASE] DELETE flow completed for ${ticker}, deleted=${deleted}`);
+            } catch (deleteErr) {
+              console.error(`[SUPABASE ERROR] Explicit DELETE failed for ${ticker}:`, deleteErr);
+            }
+          } else if (data.startsWith('act_')) {
             let tradeDetails = null;
 
             // 1) Fetch latest alert details for that ticker from sent_alerts
@@ -265,29 +361,8 @@ export default async function handler(req, res) {
               }
             }
           }
-
-          // Also perform PATCH status update for all actions (covers DISMISSED/CLOSED and ensures ACTIVE status synced)
-          try {
-            const patchRes = await fetch(`${supabaseUrl}/rest/v1/active_positions?ticker=eq.${encodeURIComponent(ticker)}`, {
-              method: 'PATCH',
-              headers: {
-                'apikey': supabaseKey,
-                'Authorization': `Bearer ${supabaseKey}`,
-                'Content-Type': 'application/json',
-                'Prefer': 'return=minimal',
-              },
-              body: JSON.stringify({ status: newStatus }),
-            });
-            const patchBody = await patchRes.text().catch(() => '');
-            console.log(`[SUPABASE] PATCH ${ticker} -> ${newStatus} status: ${patchRes.status} body: ${patchBody}`);
-            if (!patchRes.ok) {
-              console.error(`[SUPABASE ERROR] PATCH failed for ${ticker} ${patchRes.status}: ${patchBody}`);
-            }
-          } catch (patchErr) {
-            console.error(`[SUPABASE ERROR] PATCH request failed for ${ticker}:`, patchErr);
-          }
         } catch (e) {
-          console.error(`[SUPABASE ERROR] Activation flow failed for ${ticker} -> ${newStatus}:`, e);
+          console.error(`[SUPABASE ERROR] Callback flow failed for ${ticker} -> ${newStatus}:`, e);
           // Explicit fallback POST attempt
           try {
             const fallback = await fetch(`${supabaseUrl}/rest/v1/active_positions`, {
@@ -310,30 +385,8 @@ export default async function handler(req, res) {
         console.warn(`[SUPABASE] Skipping Supabase update: missing URL or Key (url=${!!supabaseUrl}, key=${!!supabaseKey})`);
       }
 
-      // Send answerCallbackQuery back to Telegram so the user receives a popup alert
-      if (botToken && callbackId) {
-        try {
-          console.log(`[TELEGRAM] Sending answerCallbackQuery id=${callbackId} text=${popupText}`);
-          const answerRes = await fetch(`https://api.telegram.org/bot${botToken}/answerCallbackQuery`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              callback_query_id: callbackId,
-              text: popupText,
-              show_alert: true,
-            }),
-          });
-          const answerBody = await answerRes.text().catch(() => '');
-          console.log(`[TELEGRAM] answerCallbackQuery ${callbackId} -> ${popupText} status: ${answerRes.status} body: ${answerBody}`);
-          if (!answerRes.ok) {
-            console.error(`[TELEGRAM ERROR] answerCallbackQuery failed ${answerRes.status}: ${answerBody}`);
-          }
-        } catch (e) {
-          console.error(`[TELEGRAM ERROR] answerCallbackQuery exception:`, e);
-        }
-      } else {
-        console.warn(`[TELEGRAM] Skipping answerCallbackQuery: missing token or callbackId (token=${!!botToken}, id=${callbackId})`);
-      }
+      // answerCallbackQuery already sent immediately at top – no duplicate needed
+      console.log(`[TELEGRAM] Callback answer already sent immediately for ${callbackId}`);
     } else {
       console.log('[WEBHOOK] No callback_query in update, ignoring');
     }
