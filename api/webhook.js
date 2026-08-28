@@ -6,6 +6,223 @@ function normalizeTicker(symbol) {
   return t;
 }
 
+const JOIN_CALLBACK_PREFIX = 'join_trade';
+const USER_PORTFOLIO_TABLE = 'user_portfolio';
+const TRACK_LABELS = {
+  scalping: '⚡ مضاربة لحظية (Scalp)',
+  swing: '📈 تداول سوينغ (Swing)',
+  investment: '🏛️ استثمار طويل (Invest)',
+};
+const SHARIAH_COMPLIANT_BASE = new Set([
+  'ABUK', 'AMOC', 'SWDY', 'TMGH', 'HELI', 'ORAS', 'EFIH', 'ADIB', 'FAIT',
+  'SAUD', 'ETEL', 'FWRY', 'JUFO', 'EFID', 'ISPH', 'SKPC', 'OLFI', 'ORWE',
+]);
+const SHARIAH_NON_COMPLIANT_BASE = new Set(['COMI', 'EAST']);
+
+function shariahFlag(symbol) {
+  const base = normalizeTicker(symbol).replace('.CA', '');
+  if (SHARIAH_NON_COMPLIANT_BASE.has(base)) return '⛔ غير متوافق (Non-Compliant)';
+  if (SHARIAH_COMPLIANT_BASE.has(base)) return '✅ متوافق (Compliant)';
+  return '⚠️ قيد المراجعة (Needs Review)';
+}
+
+function trackLabel(strategy) {
+  const key = String(strategy || '').trim().toLowerCase();
+  return TRACK_LABELS[key] || '📈 تداول سوينغ (Swing)';
+}
+
+async function tgPost(botToken, method, payload) {
+  try {
+    const r = await fetch(`https://api.telegram.org/bot${botToken}/${method}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const body = await r.text().catch(() => '');
+    return { status: r.status, body };
+  } catch (e) {
+    return { status: 0, body: `error:${e}` };
+  }
+}
+
+function parseJoinCallback(data) {
+  try {
+    const raw = String(data || '').trim();
+    if (!raw.startsWith(`${JOIN_CALLBACK_PREFIX}:`)) return null;
+    const parts = raw.split(':');
+    if (parts.length < 2) return null;
+    const ticker = normalizeTicker(parts[1]);
+    if (!ticker) return null;
+    let tradeId = 0;
+    if (parts.length >= 3 && parts[2].trim()) {
+      tradeId = parseInt(parts[2], 10);
+      if (!Number.isFinite(tradeId) || tradeId < 0) tradeId = 0;
+    }
+    return { ticker, tradeId };
+  } catch (e) {
+    return null;
+  }
+}
+
+async function fetchLatestSentAlert(supabaseUrl, supabaseKey, ticker) {
+  try {
+    const url = `${supabaseUrl}/rest/v1/sent_alerts?ticker=eq.${encodeURIComponent(ticker)}&order=created_at.desc&limit=1&select=*`;
+    const r = await fetch(url, {
+      method: 'GET',
+      headers: {
+        apikey: supabaseKey,
+        Authorization: `Bearer ${supabaseKey}`,
+        'Content-Type': 'application/json',
+      },
+    });
+    if (!r.ok) return null;
+    const rows = JSON.parse(await r.text().catch(() => '[]'));
+    if (Array.isArray(rows) && rows.length > 0) return rows[0];
+    return null;
+  } catch (e) {
+    console.error(`[JOIN ERROR] fetchLatestSentAlert failed:`, e);
+    return null;
+  }
+}
+
+async function upsertUserPortfolio(supabaseUrl, supabaseKey, payload) {
+  const headers = {
+    apikey: supabaseKey,
+    Authorization: `Bearer ${supabaseKey}`,
+    'Content-Type': 'application/json',
+  };
+  // Preferred: merge-duplicates on UNIQUE(user_id, symbol).
+  try {
+    const r = await fetch(
+      `${supabaseUrl}/rest/v1/${USER_PORTFOLIO_TABLE}?on_conflict=user_id,symbol`,
+      {
+        method: 'POST',
+        headers: { ...headers, Prefer: 'resolution=merge-duplicates,return=minimal' },
+        body: JSON.stringify(payload),
+      },
+    );
+    if (r.status === 200 || r.status === 201 || r.status === 204) return { ok: true, already: false };
+    if (r.status === 409) return { ok: true, already: true };
+    console.error(`[JOIN ERROR] user_portfolio upsert ${r.status}: ${await r.text().catch(() => '')}`);
+  } catch (e) {
+    console.error(`[JOIN ERROR] user_portfolio upsert failed:`, e);
+  }
+  // Fallback: plain insert - 409 means the user already joined.
+  try {
+    const r2 = await fetch(`${supabaseUrl}/rest/v1/${USER_PORTFOLIO_TABLE}`, {
+      method: 'POST',
+      headers: { ...headers, Prefer: 'return=minimal' },
+      body: JSON.stringify(payload),
+    });
+    if (r2.status === 200 || r2.status === 201 || r2.status === 204) return { ok: true, already: false };
+    if (r2.status === 409) return { ok: true, already: true };
+    console.error(`[JOIN ERROR] user_portfolio insert ${r2.status}: ${await r2.text().catch(() => '')}`);
+  } catch (e) {
+    console.error(`[JOIN ERROR] user_portfolio insert failed:`, e);
+  }
+  return { ok: false, already: false };
+}
+
+function buildFullDmCard(ticker, alert) {
+  const bare = normalizeTicker(ticker).replace('.CA', '');
+  const num = (v) => parseFloat(v) || 0;
+  const sep = '------------------------------------';
+  const lines = [
+    '🟢 <b>[كارت انضمام للصفقة]</b>',
+    sep,
+    `🔹 <b>السهم:</b> <code>${bare}</code> ${shariahFlag(ticker)}`,
+    `🏷️ <b>المسار:</b> ${trackLabel(alert && alert.strategy)}`,
+    sep,
+    `💵 <b>الدخول:</b> ${num(alert && alert.entry_price).toFixed(2)} EGP`,
+    `🔴 <b>وقف الخسارة (SL):</b> <b>${num(alert && alert.current_stop_loss).toFixed(2)}</b> EGP`,
+    `🥇 الهدف الأول: <b>${num(alert && alert.target_1).toFixed(2)}</b> EGP`,
+    `🥈 الهدف الثاني: <b>${num(alert && alert.target_2).toFixed(2)}</b> EGP`,
+    `🥉 الهدف الثالث: <b>${num(alert && alert.target_3).toFixed(2)}</b> EGP`,
+    sep,
+    '<i>تداول فوري (Spot) فقط - شراء ثم بيع</i>',
+    '🔒 إشعارات الإغلاق والتقرير الأسبوعي تصلك هنا في الخاص',
+  ];
+  return lines.join('\n');
+}
+
+async function handleJoinTrade(query, botToken, supabaseUrl, supabaseKey) {
+  const diag = { ok: false, answered: false, saved: false, already: false, dm_sent: false };
+  try {
+    const parsed = parseJoinCallback(query.data || '');
+    if (!parsed) {
+      diag.error = 'bad-format';
+      return diag;
+    }
+    const userId = String(((query.from || {}).id) || '').trim();
+    const cqId = String(query.id || '');
+    if (!userId) {
+      diag.error = 'missing-user-id';
+      await tgPost(botToken, 'answerCallbackQuery', {
+        callback_query_id: cqId,
+        text: '⚠️ تعذر تحديد هويتك - حاول مرة أخرى',
+        show_alert: false,
+      });
+      return diag;
+    }
+
+    let alert = null;
+    let saved = false;
+    let already = false;
+    if (supabaseUrl && supabaseKey) {
+      alert = await fetchLatestSentAlert(supabaseUrl, supabaseKey, parsed.ticker);
+      const result = await upsertUserPortfolio(supabaseUrl, supabaseKey, {
+        user_id: userId,
+        trade_id: parsed.tradeId,
+        symbol: parsed.ticker,
+        snapshot: {
+          strategy: (alert || {}).strategy || '',
+          entry_price: (alert || {}).entry_price ?? null,
+          current_stop_loss: (alert || {}).current_stop_loss ?? null,
+          target_1: (alert || {}).target_1 ?? null,
+          target_2: (alert || {}).target_2 ?? null,
+          target_3: (alert || {}).target_3 ?? null,
+          source: 'vercel_webhook',
+        },
+        status: 'TRACKING',
+        joined_at: new Date().toISOString(),
+      });
+      saved = result.ok;
+      already = result.already;
+    } else {
+      console.warn('[JOIN] Supabase config missing - registration skipped');
+    }
+
+    // Answer immediately - kill the spinner.
+    const popup = already
+      ? 'ℹ️ أنت تتابع هذه الصفقة بالفعل'
+      : `✅ تم تسجيل متابعتك لصفقة ${parsed.ticker.replace('.CA', '')}`;
+    const ansRes = await tgPost(botToken, 'answerCallbackQuery', {
+      callback_query_id: cqId,
+      text: popup,
+      show_alert: false,
+    });
+    diag.answered = ansRes.status === 200;
+
+    // FULL detail card as a DM to the user's private chat.
+    const dmRes = await tgPost(botToken, 'sendMessage', {
+      chat_id: userId,
+      text: buildFullDmCard(parsed.ticker, alert),
+      parse_mode: 'HTML',
+    });
+    diag.dm_sent = dmRes.status === 200;
+
+    diag.saved = saved;
+    diag.already = already;
+    diag.ok = true;
+    console.log(`[JOIN] user=${userId} ticker=${parsed.ticker} diag=${JSON.stringify(diag)}`);
+    return diag;
+  } catch (e) {
+    console.error('[JOIN ERROR] handleJoinTrade crashed:', e);
+    diag.error = String(e);
+    return diag;
+  }
+}
+
 export default async function handler(req, res) {
   let httpResponded = false;
   if (req.method !== 'POST') return res.status(200).send('OK');
@@ -30,6 +247,17 @@ export default async function handler(req, res) {
       const supabaseKey = process.env.SUPABASE_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY;
 
       console.log(`[WEBHOOK] Received callback_query id=${callbackId} data=${data}`);
+
+      // ---- Multi-tenant join_trade flow: user_portfolio + private full card DM ----
+      if (typeof data === 'string' && data.startsWith(`${JOIN_CALLBACK_PREFIX}:`)) {
+        const joinDiag = await handleJoinTrade(query, botToken, supabaseUrl, supabaseKey);
+        console.log(`[WEBHOOK][JOIN] diag=${JSON.stringify(joinDiag)}`);
+        if (!httpResponded && !res.writableEnded && !res.headersSent) {
+          res.status(200).send('OK');
+          httpResponded = true;
+        }
+        return;
+      }
 
       let popupText = "تم التحديث بنجاح!";
       let newStatus = null;

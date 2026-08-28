@@ -1,0 +1,25 @@
+from main import generate_signal_hash, is_exact_duplicate_signal, register_sent_signal
+
+# 1. إشارة أولى (يجب أن تُقبل)
+sig1 = {"ticker": "COMI", "price": 105.5, "reason": "كسر EMA20"}
+hash1 = generate_signal_hash(sig1["ticker"], sig1["price"], sig1["reason"])
+
+is_dup1 = is_exact_duplicate_signal(hash1)
+print(f"1. First Signal (COMI): Duplicate? {is_dup1}") # المتوقع: False
+
+# تسجيل الإشارة الأولى في الذاكرة/قاعدة البيانات
+register_sent_signal(hash1)
+
+# 2. إشارة مطابقة تماماً حتى مع اختلاف صيغة الرمز (يجب أن تُرفض)
+sig2 = {"ticker": "COMI.CA", "price": 105.5, "reason": "كسر EMA20"}
+hash2 = generate_signal_hash(sig2["ticker"], sig2["price"], sig2["reason"])
+
+is_dup2 = is_exact_duplicate_signal(hash2)
+print(f"2. Exact Duplicate (COMI.CA): Duplicate? {is_dup2}") # المتوقع: True (منع التكرار)
+
+# 3. إشارة لنفس السهم بسعر أو سبب مختلف - تحديث (يجب أن تُقبل)
+sig3 = {"ticker": "COMI", "price": 107.0, "reason": "فرصة أفضل / كسر EMA20"}
+hash3 = generate_signal_hash(sig3["ticker"], sig3["price"], sig3["reason"])
+
+is_dup3 = is_exact_duplicate_signal(hash3)
+print(f"3. Updated Signal (New Price): Duplicate? {is_dup3}") # المتوقع: False (قبول التحديث)

@@ -1,28 +1,82 @@
 """
 Vercel Python Serverless Webhook for Telegram Callback Queries
-Handles POST from Telegram, parses callback_query (act_/dis_/cls_), fetches from sent_alerts, upserts to active_positions, and answers callback.
+Handles POST from Telegram:
+  - act_/dis_/cls_ legacy position actions (Supabase active_positions)
+  - join_trade:{TICKER}[:{TRADE_ID}] multi-tenant opt-in flow:
+      1. Registers (user_id, trade_id, symbol) in Supabase user_portfolio.
+      2. DMs the pressing user the FULL private detail card instantly.
+      3. Follow-up exits + weekly reports are delivered privately per user
+         (handled by the screener via the same user_portfolio table).
+No local `listen` required - Telegram delivers callback_query updates here
+directly in production.
 """
 import json
 import os
 import logging
-from typing import Any, Dict, Optional
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
 
 try:
     import requests
 except ImportError:
-    requests = None
+    requests = None  # type: ignore[assignment]
 
 logger = logging.getLogger("webhook-py")
-SUPABASE_TABLE = "active_positions"
-SENT_ALERTS_TABLE = "sent_alerts"
+# === Supabase Table Routing (Purged Legacy: scanner pipeline now uses trade_signals + user_portfolio exclusively) ===
+TRADE_SIGNALS_TABLE = "trade_signals"  # Read-only source for trade specs (replaces sent_alerts)
+USER_PORTFOLIO_TABLE = "user_portfolio"  # Write-only target for user joins (exclusive)
+JOIN_CALLBACK_PREFIX = "join_trade"
+# Deprecated legacy tables - writes disabled, kept as aliases for audit logging only
+LEGACY_ACTIVE_POSITIONS_TABLE = "active_positions"  # DEPRECATED: no longer written
+LEGACY_SENT_ALERTS_TABLE = "sent_alerts"  # DEPRECATED: replaced by trade_signals
+# Backward-compat aliases (do not use for new writes)
+SUPABASE_TABLE = LEGACY_ACTIVE_POSITIONS_TABLE
+SENT_ALERTS_TABLE = LEGACY_SENT_ALERTS_TABLE
+
+TELEGRAM_SEND_URL = "https://api.telegram.org/bot{token}/sendMessage"
+TELEGRAM_ANSWER_URL = "https://api.telegram.org/bot{token}/answerCallbackQuery"
+
+# Compact Shariah map (kept self-contained; serverless cannot import main.py).
+_SHARIAH_COMPLIANT_BASE = {
+    "ABUK", "AMOC", "SWDY", "TMGH", "HELI", "ORAS", "EFIH", "ADIB", "FAIT",
+    "SAUD", "ETEL", "FWRY", "JUFO", "EFID", "ISPH", "SKPC", "OLFI", "ORWE",
+}
+_SHARIAH_NON_COMPLIANT_BASE = {"COMI", "EAST"}
+
+_TRACK_LABELS: Dict[str, str] = {
+    "scalping": "⚡ مضاربة لحظية (Scalp)",
+    "swing": "📈 تداول سوينغ (Swing)",
+    "investment": "🏛️ استثمار طويل (Invest)",
+}
+
+
+def _shariah_flag(symbol: str) -> str:
+    """Compact compliance badge for a ticker (⚠️ when unlisted)."""
+    try:
+        base = normalize_ticker(symbol).replace(".CA", "")
+    except Exception:
+        base = str(symbol).replace(".CA", "").upper()
+    if base in _SHARIAH_NON_COMPLIANT_BASE:
+        return "⛔ غير متوافق (Non-Compliant)"
+    if base in _SHARIAH_COMPLIANT_BASE:
+        return "✅ متوافق (Compliant)"
+    return "⚠️ قيد المراجعة (Needs Review)"
+
+
+def _track_label(strategy: Any) -> str:
+    key = str(strategy or "").strip().lower()
+    return _TRACK_LABELS.get(key, "📈 تداول سوينغ (Swing)")
+
 
 def _get_supabase_config():
     url = (os.environ.get("SUPABASE_URL") or "").strip().rstrip("/")
-    key = (os.environ.get("SUPABASE_KEY") or os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or "").strip()
+    # Prioritize SERVICE_ROLE_KEY for privileged REST access (bypasses RLS)
+    key = (os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get("SUPABASE_KEY") or "").strip().strip('"').strip("'")
     return url, key
 
 def _supabase_headers(prefer: str = "return=minimal"):
-    key = (os.environ.get("SUPABASE_KEY") or os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or "").strip()
+    # Prioritize SERVICE_ROLE_KEY for apikey + Authorization Bearer headers
+    key = (os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get("SUPABASE_KEY") or "").strip().strip('"').strip("'")
     if not key:
         return {}
     return {
@@ -34,6 +88,46 @@ def _supabase_headers(prefer: str = "return=minimal"):
 
 
 _ALLOWED_ACTIVE_FIELDS = {"ticker", "entry_price", "current_stop_loss", "target_1", "target_2", "target_3", "trade_track", "status", "created_at"}
+
+
+def _sanitize_active_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Sanitize active_positions payload to prevent PGRST204 schema cache errors.
+
+    Handles both timestamp and created_at safely – normalizes timestamp to
+    created_at and filters to only valid table fields.
+    """
+    if not isinstance(payload, dict):
+        return {}
+    try:
+        sanitized: Dict[str, Any] = {}
+        has_ts = "timestamp" in payload and payload.get("timestamp") is not None
+        has_ca = "created_at" in payload and payload.get("created_at") is not None
+        if has_ts and not has_ca:
+            sanitized["created_at"] = payload.get("timestamp")
+        elif has_ca:
+            sanitized["created_at"] = payload.get("created_at")
+        for k in _ALLOWED_ACTIVE_FIELDS:
+            if k == "created_at":
+                continue
+            if k in payload and payload.get(k) is not None:
+                if k == "ticker":
+                    try:
+                        sanitized[k] = normalize_ticker(payload[k])
+                    except Exception:
+                        sanitized[k] = payload[k]
+                else:
+                    sanitized[k] = payload[k]
+        if "ticker" not in sanitized and "ticker" in payload:
+            try:
+                sanitized["ticker"] = normalize_ticker(payload["ticker"])
+            except Exception:
+                pass
+        return sanitized
+    except Exception:
+        try:
+            return {k: v for k, v in payload.items() if k in _ALLOWED_ACTIVE_FIELDS and k != "timestamp"}
+        except Exception:
+            return {}
 
 
 def normalize_ticker(symbol: str) -> str:
@@ -52,47 +146,488 @@ def normalize_ticker(symbol: str) -> str:
             return ""
 
 
-def _sanitize_active_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Sanitize active_positions payload to prevent PGRST204 schema cache errors.
+# --------------------------------------------------------------------------
+# join_trade CallbackQuery flow (multi-tenant opt-in)
+# --------------------------------------------------------------------------
+# join_trade CallbackQuery flow (multi-tenant opt-in)
+# --------------------------------------------------------------------------
 
-    Handles both timestamp and created_at safely – normalizes timestamp to created_at
-    and filters to only valid table fields.
+
+def parse_join_callback(data: str) -> Optional[Tuple[str, int]]:
+    """Parse 'join_trade:{TICKER}[:{TRADE_ID}]' -> (normalized_ticker, trade_id).
+
+    Returns None for malformed payloads. Never raises.
     """
-    if not isinstance(payload, dict):
-        return {}
     try:
-        sanitized: Dict[str, Any] = {}
-        # Normalize timestamp -> created_at
-        has_ts = "timestamp" in payload and payload.get("timestamp") is not None
-        has_ca = "created_at" in payload and payload.get("created_at") is not None
-        if has_ts and not has_ca:
-            sanitized["created_at"] = payload.get("timestamp")
-        elif has_ca:
-            sanitized["created_at"] = payload.get("created_at")
-        for k in _ALLOWED_ACTIVE_FIELDS:
-            if k == "created_at":
-                continue
-            if k in payload and payload.get(k) is not None:
-                # Normalize ticker if present
-                if k == "ticker":
-                    try:
-                        sanitized[k] = normalize_ticker(payload[k])
-                    except Exception:
-                        sanitized[k] = payload[k]
-                else:
-                    sanitized[k] = payload[k]
-        # Ensure ticker is normalized if we set created_at but not ticker
-        if "ticker" not in sanitized and "ticker" in payload:
+        raw = str(data or "").strip()
+        if not raw.startswith(JOIN_CALLBACK_PREFIX + ":"):
+            return None
+        parts = raw.split(":")
+        if len(parts) < 2:
+            return None
+        ticker = normalize_ticker(parts[1])
+        if not ticker:
+            return None
+        trade_id = 0
+        if len(parts) >= 3 and parts[2].strip():
+            trade_id = int(parts[2])
+            if trade_id < 0:
+                trade_id = 0
+        return ticker, trade_id
+    except (ValueError, TypeError):
+        return None
+
+
+def _fetch_trade_signal(supabase_url: str, supabase_key: str, ticker: str, trade_id: int = 0) -> Optional[Dict[str, Any]]:
+    """Fetch trade specs from public.trade_signals (exclusive read source). Never raises.
+
+    Priority: if trade_id > 0, query by trade_id; else latest by symbol/ticker_bare.
+    Maps trade_signals columns (stop_loss) to webhook card fields (current_stop_loss) for compatibility.
+    """
+    if requests is None:
+        logger.warning("[JOIN][ENV AUDIT] requests library unavailable - cannot fetch trade_signals")
+        return None
+    if not supabase_url or not supabase_key:
+        logger.warning("[JOIN][ENV AUDIT] SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY missing - trade_signals fetch skipped (ticker=%s)", ticker)
+        print(f"[JOIN][ENV AUDIT] SUPABASE_URL or key missing - skipping fetch for {ticker}")
+        return None
+    headers = {
+        "apikey": supabase_key,
+        "Authorization": f"Bearer {supabase_key}",
+        "Content-Type": "application/json",
+    }
+    # 1) Try by trade_id if provided (most precise) - live schema uses id, fallback to trade_id
+    if trade_id and trade_id > 0:
+        for id_col in ("id", "trade_id"):
             try:
-                sanitized["ticker"] = normalize_ticker(payload["ticker"])
-            except Exception:
-                pass
-        return sanitized
-    except Exception:
+                url = f"{supabase_url}/rest/v1/{TRADE_SIGNALS_TABLE}?{id_col}=eq.{int(trade_id)}&limit=1&select=*"
+                resp = requests.get(url, headers=headers, timeout=10)
+                if resp.status_code == 200:
+                    rows = resp.json()
+                    if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+                        row = dict(rows[0])
+                        if "stop_loss" in row and "current_stop_loss" not in row:
+                            row["current_stop_loss"] = row.get("stop_loss")
+                        return row
+                    # No row for this id column - try next
+                    continue
+                elif resp.status_code == 400 and ("PGRST204" in (resp.text or "") or "42703" in (resp.text or "") or "column" in (resp.text or "").lower()):
+                    continue
+                else:
+                    body = (resp.text or "")[:300]
+                    if 400 <= resp.status_code < 500:
+                        logger.warning("[JOIN][SUPABASE 4xx] trade_signals by %s failed %s: %s", id_col, resp.status_code, body)
+                    elif resp.status_code >= 500:
+                        logger.warning("[JOIN][SUPABASE 5xx] trade_signals by %s failed %s: %s", id_col, resp.status_code, body)
+            except Exception as exc:
+                logger.warning("[JOIN] trade_signals by %s error for %s: %s", id_col, ticker, exc)
+                continue
+    # 2) Latest by symbol / ticker_bare (covers join_trade:{TICKER} without trade_id)
+    for col in ("symbol", "ticker_bare", "ticker"):
         try:
-            return {k: v for k, v in payload.items() if k in _ALLOWED_ACTIVE_FIELDS and k != "timestamp"}
+            url = f"{supabase_url}/rest/v1/{TRADE_SIGNALS_TABLE}?{col}=eq.{ticker}&order=created_at.desc&limit=1&select=*"
+            resp = requests.get(url, headers=headers, timeout=10)
+            if resp.status_code == 200:
+                rows = resp.json()
+                if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+                    row = dict(rows[0])
+                    if "stop_loss" in row and "current_stop_loss" not in row:
+                        row["current_stop_loss"] = row.get("stop_loss")
+                    return row
+                # No row for this column - try next column
+                continue
+            elif resp.status_code == 400 and ("PGRST204" in (resp.text or "") or "column" in (resp.text or "").lower()):
+                continue  # column not exists, try next
+            else:
+                body = (resp.text or "")[:300]
+                if 400 <= resp.status_code < 500:
+                    logger.warning("[JOIN][SUPABASE 4xx] trade_signals fetch by %s failed %s: %s", col, resp.status_code, body)
+                elif resp.status_code >= 500:
+                    logger.warning("[JOIN][SUPABASE 5xx] trade_signals fetch by %s failed %s: %s", col, resp.status_code, body)
+        except Exception as exc:
+            logger.warning("[JOIN] trade_signals fetch by %s error for %s: %s", col, ticker, exc)
+            continue
+    return None
+
+
+def _fetch_latest_sent_alert(supabase_url: str, supabase_key: str, ticker: str) -> Optional[Dict[str, Any]]:
+    """Legacy fallback: queries sent_alerts (deprecated, replaced by trade_signals). Never raises."""
+    if requests is None:
+        return None
+    if not supabase_url or not supabase_key:
+        return None
+    try:
+        url = f"{supabase_url}/rest/v1/{LEGACY_SENT_ALERTS_TABLE}?ticker=eq.{ticker}&order=created_at.desc&limit=1&select=*"
+        resp = requests.get(
+            url,
+            headers={
+                "apikey": supabase_key,
+                "Authorization": f"Bearer {supabase_key}",
+                "Content-Type": "application/json",
+            },
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            return None
+        rows = resp.json()
+        if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+            return rows[0]
+        return None
+    except Exception:
+        return None
+
+
+def _upsert_user_portfolio(
+    supabase_url: str,
+    supabase_key: str,
+    user_id: str,
+    trade_id: int,
+    symbol: str,
+    snapshot: Dict[str, Any],
+) -> Tuple[bool, bool]:
+    """Idempotently register a user against a symbol in user_portfolio.
+
+    Uses upsert with on_conflict=user_id,symbol to prevent crash on duplicate
+    button clicks. Returns (registered_or_exists, already_joined). Never raises.
+    
+    Logs explicit warnings for missing env or HTTP 4xx/5xx.
+    """
+    if requests is None:
+        logger.warning("[JOIN][ENV AUDIT] requests unavailable - cannot write user_portfolio")
+        return False, False
+    if not supabase_url or not supabase_key:
+        logger.warning("[JOIN][ENV AUDIT] SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY missing - user_portfolio upsert skipped (user=%s symbol=%s)", user_id, symbol)
+        print(f"[JOIN][ENV AUDIT] SUPABASE_URL or key missing - skipping upsert for user={user_id} symbol={symbol}")
+        return False, False
+    payload: Dict[str, Any] = {
+        "user_id": str(user_id),
+        "trade_id": int(trade_id),
+        "symbol": normalize_ticker(symbol),
+        "snapshot": snapshot,
+        "status": "TRACKING",
+        "joined_at": datetime.now(timezone.utc).isoformat(),
+    }
+    headers = {
+        "apikey": supabase_key,
+        "Authorization": f"Bearer {supabase_key}",
+        "Content-Type": "application/json",
+    }
+    # Preferred path: merge-duplicates on the UNIQUE(user_id, symbol) constraint.
+    # Ensures duplicate button clicks are idempotent via on_conflict.
+    try:
+        upsert_headers = dict(headers)
+        upsert_headers["Prefer"] = "resolution=merge-duplicates,return=minimal"
+        resp = requests.post(
+            f"{supabase_url}/rest/v1/{USER_PORTFOLIO_TABLE}?on_conflict=user_id,symbol",
+            json=payload,
+            headers=upsert_headers,
+            timeout=10,
+        )
+        if resp.status_code in (200, 201, 204):
+            return True, False
+        if resp.status_code == 409:
+            logger.info("[JOIN] user_portfolio upsert 409 - already joined (user=%s symbol=%s)", user_id, symbol)
+            return True, True
+        body = (resp.text or "")[:300]
+        if 400 <= resp.status_code < 500:
+            logger.warning("[JOIN][SUPABASE 4xx] user_portfolio upsert %s (%s) - check SUPABASE_SERVICE_ROLE_KEY / RLS", resp.status_code, body)
+            print(f"[JOIN][SUPABASE 4xx] user_portfolio upsert {resp.status_code}: {body[:200]}")
+        elif resp.status_code >= 500:
+            logger.warning("[JOIN][SUPABASE 5xx] user_portfolio upsert %s (%s)", resp.status_code, body)
+            print(f"[JOIN][SUPABASE 5xx] user_portfolio upsert {resp.status_code}: {body[:200]}")
+        else:
+            logger.warning("[JOIN] user_portfolio upsert %s (%s)", resp.status_code, body)
+    except Exception as exc:
+        logger.warning("[JOIN] user_portfolio upsert request failed: %s", exc)
+    # Fallback: plain insert - 409 here means the user already joined.
+    try:
+        plain_headers = dict(headers)
+        plain_headers["Prefer"] = "return=minimal"
+        resp2 = requests.post(
+            f"{supabase_url}/rest/v1/{USER_PORTFOLIO_TABLE}",
+            json=payload,
+            headers=plain_headers,
+            timeout=10,
+        )
+        if resp2.status_code in (200, 201, 204):
+            return True, False
+        if resp2.status_code == 409:
+            logger.info("[JOIN] user_portfolio insert 409 - already joined (user=%s symbol=%s)", user_id, symbol)
+            return True, True
+        body2 = (resp2.text or "")[:300]
+        if 400 <= resp2.status_code < 500:
+            logger.warning("[JOIN][SUPABASE 4xx] user_portfolio insert failed %s: %s", resp2.status_code, body2)
+            print(f"[JOIN][SUPABASE 4xx] user_portfolio insert {resp2.status_code}: {body2[:200]}")
+        elif resp2.status_code >= 500:
+            logger.warning("[JOIN][SUPABASE 5xx] user_portfolio insert failed %s: %s", resp2.status_code, body2)
+            print(f"[JOIN][SUPABASE 5xx] user_portfolio insert {resp2.status_code}: {body2[:200]}")
+        else:
+            logger.warning("[JOIN] user_portfolio insert failed %s: %s", resp2.status_code, body2)
+    except Exception as exc:
+        logger.warning("[JOIN] user_portfolio insert request failed: %s", exc)
+    return False, False
+
+
+def build_full_dm_card(ticker: str, alert: Optional[Dict[str, Any]]) -> str:
+    """FULL private detail card DM'd to a user right after they join."""
+    bare = normalize_ticker(ticker).replace(".CA", "")
+    strategy = str((alert or {}).get("strategy") or "")
+    entry = float((alert or {}).get("entry_price") or 0.0)
+    # trade_signals uses stop_loss, legacy sent_alerts uses current_stop_loss - handle both
+    sl_raw = (alert or {}).get("current_stop_loss")
+    if sl_raw is None:
+        sl_raw = (alert or {}).get("stop_loss")
+    sl = float(sl_raw or 0.0)
+    t1 = float((alert or {}).get("target_1") or 0.0)
+    t2 = float((alert or {}).get("target_2") or 0.0)
+    t3 = float((alert or {}).get("target_3") or 0.0)
+    sep = "------------------------------------"
+    lines: List[str] = [
+        "🟢 <b>[كارت انضمام للصفقة]</b>",
+        sep,
+        f"🔹 <b>السهم:</b> <code>{bare}</code> {_shariah_flag(ticker)}",
+        f"🏷️ <b>المسار:</b> {_track_label(strategy)}",
+        sep,
+        f"💵 <b>الدخول:</b> {entry:.2f} EGP",
+        f"🔴 <b>وقف الخسارة (SL):</b> <b>{sl:.2f}</b> EGP",
+        f"🥇 الهدف الأول: <b>{t1:.2f}</b> EGP",
+        f"🥈 الهدف الثاني: <b>{t2:.2f}</b> EGP",
+        f"🥉 الهدف الثالث: <b>{t3:.2f}</b> EGP",
+        sep,
+        "<i>تداول فوري (Spot) فقط - شراء ثم بيع</i>",
+        "🔒 إشعارات الإغلاق والتقرير الأسبوعي تصلك هنا في الخاص",
+    ]
+    return "\n".join(lines)
+
+
+def send_private_dm(bot_token: str, chat_id: str, text: str) -> bool:
+    """Deliver an HTML card to one private chat. Never raises.
+
+    Wrapped in try/except catching Telegram 403 Forbidden (bot can't initiate
+    conversation) so caller can fallback to answerCallbackQuery alert.
+    """
+    if requests is None or not bot_token or not chat_id:
+        return False
+    try:
+        resp = requests.post(
+            TELEGRAM_SEND_URL.format(token=bot_token),
+            json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
+            timeout=10,
+        )
+        ok = resp.status_code == 200
+        if not ok:
+            body = (resp.text or "")[:300]
+            # 403 Forbidden guard: user has not started bot
+            if resp.status_code == 403 or "Forbidden" in body or "can't initiate conversation" in body or "bot can't initiate" in body.lower():
+                logger.warning("[JOIN][403 GUARD] DM to %s forbidden (403): %s - user has not started bot", str(chat_id)[:8], body[:160])
+            else:
+                logger.warning("[JOIN] DM to %s failed (%s): %s", str(chat_id)[:8], resp.status_code, body[:160])
+        return ok
+    except Exception as exc:
+        # Catch 403 in exception path as well (some clients raise for 403)
+        msg = str(exc)
+        if "403" in msg or "Forbidden" in msg or "can't initiate" in msg.lower():
+            logger.warning("[JOIN][403 GUARD] DM request 403 to %s: %s", str(chat_id)[:8], exc)
+        else:
+            logger.warning("[JOIN] DM request failed for %s: %s", str(chat_id)[:8], exc)
+        return False
+
+
+def _is_telegram_forbidden(resp: Any) -> bool:
+    """Detect Telegram 403 Forbidden 'bot can't initiate conversation' from response or exception."""
+    try:
+        if resp is None:
+            return False
+        status = getattr(resp, "status_code", 0) or 0
+        text = str(getattr(resp, "text", "") or "")
+        if status == 403:
+            return True
+        low = text.lower()
+        if "forbidden" in low and ("can't initiate" in low or "bot can't initiate" in low or "have not started" in low):
+            return True
+        if "forbidden: bot can't initiate conversation" in low:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def handle_join_trade(
+    query: Dict[str, Any],
+    data: str,
+    bot_token: str,
+    supabase_url: str,
+    supabase_key: str,
+) -> Tuple[bool, str]:
+    """Full join_trade flow: register in user_portfolio + DM the full card.
+
+    Guarantees Telegram spinner is killed IMMEDIATELY (answerCallbackQuery
+    before any network), handles Supabase upserts idempotently, and never
+    raises into the Vercel handler.
+    """
+    callback_query_id = ""
+    try:
+        try:
+            callback_query_id = str((query or {}).get("id", "")).strip()
         except Exception:
-            return {}
+            callback_query_id = ""
+        # Instant feedback: stop spinner right away regardless of downstream outcome.
+        if callback_query_id and bot_token:
+            try:
+                _answer_callback(callback_query_id, bot_token, "⏳ جاري تسجيل متابعتك...")
+            except Exception as _immediate_exc:
+                logger.warning("[JOIN] Immediate answerCallbackQuery failed: %s", _immediate_exc)
+
+        parsed = parse_join_callback(data)
+        if parsed is None:
+            logger.warning("[JOIN] Unrecognized join payload ignored: %r", str(data)[:60])
+            if callback_query_id and bot_token:
+                try:
+                    _answer_callback(callback_query_id, bot_token, "⚠️ صيغة غير صحيحة - حاول مرة أخرى")
+                except Exception:
+                    pass
+            return False, "unrecognized-payload"
+        ticker_bare, trade_id = parsed
+
+        from_user = query.get("from") or {}
+        user_id = str(from_user.get("id", "")).strip()
+        if not user_id:
+            if callback_query_id and bot_token:
+                try:
+                    _answer_callback(callback_query_id, bot_token, "⚠️ تعذر تحديد هويتك - حاول مرة أخرى")
+                except Exception:
+                    pass
+            return False, "missing-user-id"
+
+        # Environment audit: explicit warnings if Supabase credentials are absent.
+        if not supabase_url:
+            logger.warning("[JOIN][ENV AUDIT] SUPABASE_URL is missing - user_portfolio write will be skipped")
+            print("[JOIN][ENV AUDIT] SUPABASE_URL is missing - user_portfolio write will be skipped")
+        if not supabase_key:
+            logger.warning("[JOIN][ENV AUDIT] SUPABASE_SERVICE_ROLE_KEY / SUPABASE_KEY is missing - user_portfolio write will be skipped")
+            print("[JOIN][ENV AUDIT] SUPABASE_SERVICE_ROLE_KEY / SUPABASE_KEY is missing - user_portfolio write will be skipped")
+
+        registered = False
+        already = False
+        alert: Optional[Dict[str, Any]] = None
+        if supabase_url and supabase_key:
+            # Exclusive read from trade_signals (scanner pipeline sync)
+            alert = _fetch_trade_signal(supabase_url, supabase_key, ticker_bare, trade_id=trade_id)
+            # Fallback to legacy sent_alerts only if trade_signals yields nothing (backward compat, logs warning)
+            if alert is None:
+                logger.info("[JOIN] trade_signals miss for %s id=%s, trying legacy sent_alerts fallback", ticker_bare, trade_id)
+                alert = _fetch_latest_sent_alert(supabase_url, supabase_key, ticker_bare)
+            # Normalize stop_loss column naming (trade_signals uses stop_loss, webhook card uses current_stop_loss)
+            sl_value = (alert or {}).get("current_stop_loss")
+            if sl_value is None:
+                sl_value = (alert or {}).get("stop_loss")
+            snapshot = {
+                "strategy": str((alert or {}).get("strategy") or ""),
+                "entry_price": (alert or {}).get("entry_price"),
+                "current_stop_loss": sl_value,
+                "target_1": (alert or {}).get("target_1"),
+                "target_2": (alert or {}).get("target_2"),
+                "target_3": (alert or {}).get("target_3"),
+                "source": "vercel_webhook",
+            }
+            registered, already = _upsert_user_portfolio(
+                supabase_url=supabase_url,
+                supabase_key=supabase_key,
+                user_id=user_id,
+                trade_id=trade_id,
+                symbol=ticker_bare,
+                snapshot=snapshot,
+            )
+            if not registered and not already:
+                logger.warning("[JOIN] Supabase upsert returned no success for user=%s symbol=%s (check logs for 4xx/5xx)", user_id, ticker_bare)
+        else:
+            logger.warning("[JOIN] Supabase config missing - registration skipped (check SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY)")
+
+        card = build_full_dm_card(ticker_bare, alert)
+        # === DM dispatch with 403 Forbidden guard ===
+        delivered = False
+        is_forbidden = False
+        try:
+            if requests is None or not bot_token or not user_id:
+                delivered = False
+            else:
+                # Direct POST wrapped in try/except to catch 403 specifically
+                resp_dm = requests.post(
+                    TELEGRAM_SEND_URL.format(token=bot_token),
+                    json={"chat_id": user_id, "text": card, "parse_mode": "HTML"},
+                    timeout=10,
+                )
+                if resp_dm.status_code == 200:
+                    delivered = True
+                elif _is_telegram_forbidden(resp_dm):
+                    is_forbidden = True
+                    delivered = False
+                    logger.warning("[JOIN][403 GUARD] DM forbidden for user %s (403) - needs /start @EGX.signals", str(user_id)[:8])
+                else:
+                    body = (resp_dm.text or "")[:160]
+                    logger.warning("[JOIN] DM to %s failed (%s): %s", str(user_id)[:8], resp_dm.status_code, body)
+                    delivered = False
+        except Exception as exc:
+            txt = str(exc).lower()
+            if "403" in txt or "forbidden" in txt or "can't initiate" in txt:
+                is_forbidden = True
+                logger.warning("[JOIN][403 GUARD] DM exception 403 for user %s: %s", str(user_id)[:8], exc)
+            else:
+                logger.warning("[JOIN] DM request failed for %s: %s", str(user_id)[:8], exc)
+            delivered = False
+
+        # 403 fallback: user has not started bot -> show alert popup
+        if is_forbidden:
+            try:
+                _answer_callback(
+                    callback_query_id,
+                    bot_token,
+                    "⚠️ يرجى بدء المحادثة مع البوت أولاً عبر إرسال /start إلى @EGX.signals ثم إعادة الضغط.",
+                    show_alert=True,
+                )
+                print(f"[JOIN][403 GUARD] Fallback alert sent to {str(user_id)[:8]}")
+            except Exception as e:
+                logger.warning("[JOIN][403 GUARD] Fallback alert failed: %s", e)
+            logger.info("[JOIN] user=%s trade=%s id=%s -> dm_forbidden (403) needs /start", user_id, ticker_bare, trade_id)
+            return True, f"dm_forbidden trade={ticker_bare} id={trade_id} already={already} registered={registered}"
+
+        if already:
+            _answer_callback(callback_query_id, bot_token, "ℹ️ أنت تتابع هذه الصفقة بالفعل")
+            detail = f"already-joined dm={delivered}"
+        elif registered:
+            _answer_callback(callback_query_id, bot_token, f"✅ تم تسجيل متابعتك لصفقة {ticker_bare.replace('.CA', '')}")
+            detail = f"registered dm={delivered}"
+        else:
+            _answer_callback(callback_query_id, bot_token, "✅ أُرسل لك كارت الصفقة بالخاص")
+            detail = f"unregistered dm={delivered}"
+        logger.info("[JOIN] user=%s trade=%s id=%s -> %s", user_id, ticker_bare, trade_id, detail)
+        return True, detail
+    except Exception as exc:
+        logger.error("[JOIN] handle_join_trade crashed: %s", exc, exc_info=True)
+        # Ensure spinner is killed even on crash.
+        try:
+            if callback_query_id and bot_token:
+                _answer_callback(callback_query_id, bot_token, "⚠️ حدث خطأ - حاول مرة أخرى")
+        except Exception:
+            pass
+        return False, f"error:{exc}"
+
+
+def _answer_callback(callback_query_id: str, bot_token: str, text: str, show_alert: bool = False) -> bool:
+    """AnswerCallbackQuery wrapper used by the join flow. Never raises."""
+    if requests is None or not bot_token or not callback_query_id:
+        return False
+    try:
+        resp = requests.post(
+            TELEGRAM_ANSWER_URL.format(token=bot_token),
+            json={"callback_query_id": callback_query_id, "text": text[:200], "show_alert": show_alert},
+            timeout=10,
+        )
+        return resp.status_code == 200
+    except Exception as exc:
+        logger.warning("[JOIN] answerCallbackQuery failed: %s", exc)
+        return False
+
 
 def handler(request, *args, **kwargs):
     """Vercel Python handler - handles POST from Telegram."""
@@ -141,347 +676,122 @@ def handler(request, *args, **kwargs):
         query = update.get("callback_query") if isinstance(update, dict) else None
         if query and isinstance(query, dict):
             callback_id = query.get("id")
-            data = query.get("data") or ""
+            data = str(query.get("data") or "")
             bot_token = (os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
+
+            # === ZERO-LATENCY answerCallbackQuery: absolute FIRST op before any DB/complex logic ===
+            _immediate_done = False
+            if bot_token and callback_id and requests:
+                try:
+                    print(f"[WEBHOOK][JOIN] Immediate answerCallbackQuery id={callback_id} (zero-latency)")
+                    logger.info("[WEBHOOK][JOIN] Immediate answerCallbackQuery id=%s (zero-latency first op)", callback_id)
+                    _ans = requests.post(
+                        TELEGRAM_ANSWER_URL.format(token=bot_token),
+                        json={"callback_query_id": callback_id, "text": "⏳ جاري تسجيل متابعتك...", "show_alert": False},
+                        timeout=5,
+                    )
+                    _immediate_done = _ans.status_code == 200
+                    print(f"[WEBHOOK][JOIN] Immediate answer -> {_ans.status_code}")
+                except Exception as _e:
+                    print(f"[WEBHOOK][JOIN] Immediate answer failed: {_e}")
+                    logger.warning("[WEBHOOK][JOIN] Immediate answer failed: %s", _e)
+
+            # DB config fetched AFTER instant answer to guarantee spinner stops
             supabase_url, supabase_key = _get_supabase_config()
 
             print(f"[WEBHOOK] callback_query id={callback_id} data={data}")
             logger.info(f"[WEBHOOK] callback_query id={callback_id} data={data}")
 
-            popup_text = "تم التحديث بنجاح!"
-            new_status = None
-            ticker = None
-            parsed_trade = None
-
-            try:
-                if isinstance(data, str):
-                    if data.startswith("act_"):
-                        payload = data.replace("act_", "", 1)
-                        parts = payload.split("|")
-                        ticker = normalize_ticker(parts[0] if parts and parts[0] else "")
-                        new_status = "ACTIVE"
-                        # Required popup per spec
-                        popup_text = "✅ تم تفعيل الصفقة بنجاح وحفظها في Supabase!"
-                        # Also parse fallback pipe data – normalize ticker
-                        if len(parts) >= 6:
-                            try:
-                                parsed_trade = {
-                                    "ticker": normalize_ticker(parts[0]),
-                                    "entry_price": float(parts[1]) if parts[1] else None,
-                                    "current_stop_loss": float(parts[2]) if parts[2] else None,
-                                    "target_1": float(parts[3]) if parts[3] else None,
-                                    "target_2": float(parts[4]) if parts[4] else None,
-                                    "target_3": float(parts[5]) if parts[5] else None,
-                                }
-                            except Exception as e:
-                                print(f"[WEBHOOK ERROR] Fallback parse failed: {e}")
-                                parsed_trade = None
-                        print(f"[WEBHOOK] Act activation for ticker={ticker}")
-                    elif data.startswith("dis_"):
-                        raw = data.replace("dis_", "", 1)
-                        ticker = normalize_ticker(raw.split("|")[0] if "|" in raw else raw)
-                        new_status = "DISMISSED"
-                        popup_text = "❌ تم إلغاء متابعة الصفقة."
-                    elif data.startswith("cls_"):
-                        raw = data.replace("cls_", "", 1)
-                        ticker = normalize_ticker(raw.split("|")[0] if "|" in raw else raw)
-                        new_status = "CLOSED"
-                        popup_text = "🏁 تم إغلاق الصفقة يدوياً."
-            except Exception as e:
-                print(f"[WEBHOOK ERROR] Failed to parse callback_data: {e}")
-                logger.warning(f"Failed to parse callback_data: {e}")
-
-            # Answer Telegram callback query immediately so Telegram doesn't show loading spinner timeout (per requirement)
-            _already_answered = False
-            if bot_token and callback_id and requests:
+            # ---- Multi-tenant join_trade branch: user_portfolio + private full card DM ----
+            if data.startswith(JOIN_CALLBACK_PREFIX):
+                # Wrapped execution so any downstream exception still returns 200 OK.
+                handled, join_detail = False, "not-executed"
                 try:
-                    print(f"[TELEGRAM] Immediate answerCallbackQuery id={callback_id} text={popup_text}")
-                    logger.info(f"[TELEGRAM] Immediate answerCallbackQuery id={callback_id} text={popup_text}")
-                    _ans_resp = requests.post(
-                        f"https://api.telegram.org/bot{bot_token}/answerCallbackQuery",
-                        json={
-                            "callback_query_id": callback_id,
-                            "text": popup_text,
-                            "show_alert": True,
-                        },
+                    handled, join_detail = handle_join_trade(
+                        query=query,
+                        data=data,
+                        bot_token=bot_token,
+                        supabase_url=supabase_url,
+                        supabase_key=supabase_key,
+                    )
+                except Exception as exc:
+                    print(f"[WEBHOOK][JOIN][ERROR] handle_join_trade crashed: {exc}")
+                    logger.error("[WEBHOOK][JOIN] handle_join_trade crashed: %s", exc, exc_info=True)
+                    # Fallback answer if immediate didn't succeed
+                    if not _immediate_done and bot_token and callback_id:
+                        try:
+                            _answer_callback(str(callback_id), bot_token, "⚠️ حدث خطأ - حاول مرة أخرى")
+                        except Exception:
+                            pass
+                    join_detail = f"error:{exc}"
+                print(f"[WEBHOOK][JOIN] handled={handled} detail={join_detail} immediate={_immediate_done}")
+                logger.info("[WEBHOOK][JOIN] handled=%s detail=%s immediate=%s", handled, join_detail, _immediate_done)
+                try:
+                    if hasattr(request, "status_code"):
+                        request.status_code = 200
+                        return "OK"
+                except Exception:
+                    pass
+                return {"statusCode": 200, "body": "OK"}
+
+            # === Legacy 3-button path DISABLED ===
+            # All public broadcasts now strictly use build_channel_short_card + single join_trade button.
+            # Any act_/dis_/cls_ payload is deprecated and will NOT touch Supabase.
+            if isinstance(data, str) and data.startswith(("act_", "dis_", "cls_")):
+                logger.warning("[DEPRECATED] Legacy callback %r received - 3-button path purged; no DB write", str(data)[:60])
+                print(f"[DEPRECATED] Legacy callback {str(data)[:60]!r} ignored (use join_trade)")
+                if bot_token and callback_id and requests:
+                    try:
+                        legacy_text = "⚠️ هذا الزر قديم - استخدم زر الانضمام الجديد 📥"
+                        _ans = requests.post(
+                            TELEGRAM_ANSWER_URL.format(token=bot_token),
+                            json={"callback_query_id": callback_id, "text": legacy_text[:200], "show_alert": False},
+                            timeout=10,
+                        )
+                        print(f"[TELEGRAM] Legacy deprecation answer -> {_ans.status_code}")
+                        logger.info("[TELEGRAM] Legacy deprecation answer -> %s", _ans.status_code)
+                    except Exception as exc:
+                        print(f"[TELEGRAM ERROR] Legacy answer failed: {exc}")
+                        logger.warning("Legacy answer failed: %s", exc)
+                try:
+                    if hasattr(request, "status_code"):
+                        request.status_code = 200
+                        return "OK"
+                except Exception:
+                    pass
+                return {"statusCode": 200, "body": "OK"}
+
+            # No legacy DB handling - webhook writes exclusively to user_portfolio / reads from trade_signals.
+            # Any unrecognized callback (non join_trade) is acknowledged without DB side-effects.
+            if bot_token and callback_id and requests and data:
+                try:
+                    print(f"[TELEGRAM] answerCallbackQuery unrecognized id={callback_id} data={data[:40]}")
+                    logger.info("[TELEGRAM] answerCallbackQuery unrecognized id=%s", callback_id)
+                    _ans2 = requests.post(
+                        TELEGRAM_ANSWER_URL.format(token=bot_token),
+                        json={"callback_query_id": callback_id, "text": "تم الاستلام", "show_alert": False},
                         timeout=10,
                     )
-                    try:
-                        _ans_body = _ans_resp.text[:500] if _ans_resp.text else "(empty)"
-                    except Exception:
-                        _ans_body = "(no body)"
-                    print(f"[TELEGRAM] Immediate answerCallbackQuery -> {_ans_resp.status_code} {_ans_body[:300]}")
-                    logger.info(f"[TELEGRAM] Immediate answerCallbackQuery -> {_ans_resp.status_code} {_ans_body[:200]}")
-                    _already_answered = True
-                except requests.exceptions.RequestException as e:
-                    print(f"[TELEGRAM ERROR] Immediate answerCallbackQuery request failed: {e}")
-                    logger.warning(f"Immediate answerCallbackQuery request failed: {e}")
-                except Exception as e:
-                    print(f"[TELEGRAM ERROR] Immediate answerCallbackQuery unexpected: {e}")
-                    logger.warning(f"Immediate answerCallbackQuery unexpected: {e}")
-
-            # Handle explicit DELETE for إغلاق الصفقة / غير مهتم (dis/cls) and insert for act
-            # When dis/cls, execute explicit DELETE FROM active_positions WHERE ticker = 'TICKER' (normalized)
-            if new_status and ticker and supabase_url and supabase_key and requests:
+                    print(f"[TELEGRAM] Unrecognized answer -> {_ans2.status_code}")
+                except Exception as exc:
+                    print(f"[TELEGRAM ERROR] Unrecognized answer failed: {exc}")
                 try:
-                    print(f"[SUPABASE] Starting activation flow for {ticker} -> {new_status}")
-                    logger.info(f"[SUPABASE] Starting activation flow for {ticker} -> {new_status}")
-
-                    if new_status == "ACTIVE" and data.startswith("act_"):
-                        trade_details: Optional[Dict[str, Any]] = None
-
-                        # 1) Fetch latest alert details for that ticker from sent_alerts
-                        try:
-                            headers = _supabase_headers()
-                            sent_url = f"{supabase_url}/rest/v1/{SENT_ALERTS_TABLE}?ticker=eq.{ticker}&order=created_at.desc&limit=1&select=*"
-                            print(f"[SUPABASE] GET sent_alerts URL: {sent_url}")
-                            resp = requests.get(sent_url, headers=headers, timeout=10)
-                            try:
-                                body = resp.text[:1000] if resp.text else "(empty)"
-                            except Exception:
-                                body = "(no body)"
-                            print(f"[SUPABASE] GET sent_alerts {ticker} -> {resp.status_code} {body[:500]}")
-                            logger.info(f"[SUPABASE] GET sent_alerts {ticker} -> {resp.status_code} {body[:200]}")
-
-                            if resp.status_code == 200:
-                                try:
-                                    data_json = resp.json()
-                                    if isinstance(data_json, list) and len(data_json) > 0:
-                                        latest = data_json[0]
-                                        trade_details = {
-                                            "ticker": latest.get("ticker") or ticker,
-                                            "entry_price": latest.get("entry_price"),
-                                            "current_stop_loss": latest.get("current_stop_loss"),
-                                            "target_1": latest.get("target_1"),
-                                            "target_2": latest.get("target_2"),
-                                            "target_3": latest.get("target_3"),
-                                        }
-                                        print(f"[SUPABASE] Found sent_alert: {trade_details}")
-                                        logger.info(f"[SUPABASE] Found sent_alert for {ticker}: {trade_details}")
-                                    else:
-                                        print(f"[SUPABASE] No sent_alert found for {ticker}, will use fallback")
-                                except Exception as e:
-                                    print(f"[SUPABASE ERROR] JSON parse failed for sent_alerts: {e}")
-                                    logger.warning(f"sent_alerts JSON parse failed: {e}")
-                            else:
-                                print(f"[SUPABASE ERROR] GET sent_alerts non-200 {resp.status_code}: {body[:300]}")
-                                logger.warning(f"GET sent_alerts failed {resp.status_code}: {body[:300]}")
-                        except requests.exceptions.RequestException as e:
-                            print(f"[SUPABASE ERROR] Request failed fetching sent_alerts for {ticker}: {e}")
-                            logger.warning(f"sent_alerts fetch request failed: {e}")
-                        except Exception as e:
-                            print(f"[SUPABASE ERROR] Unexpected fetch error for {ticker}: {e}")
-                            logger.warning(f"sent_alerts fetch unexpected: {e}")
-
-                        # Fallback to parsed_trade from callback_data pipes
-                        if (not trade_details or trade_details.get("entry_price") is None) and parsed_trade and parsed_trade.get("entry_price") is not None:
-                            trade_details = parsed_trade
-                            print(f"[SUPABASE] Using fallback tradeDetails from callback_data: {trade_details}")
-
-                        # 2) Insert retrieved trade details into active_positions (sanitized, graceful handling for PGRST204/42P10)
-                        if trade_details and trade_details.get("entry_price") is not None:
-                            try:
-                                headers_upsert = _supabase_headers(prefer="resolution=merge-duplicates,return=representation")
-                                raw_payload: Dict[str, Any] = {
-                                    "ticker": trade_details.get("ticker") or ticker,
-                                    "entry_price": float(trade_details.get("entry_price")),
-                                    "current_stop_loss": float(trade_details.get("current_stop_loss") or trade_details.get("entry_price")),
-                                    "target_1": float(trade_details.get("target_1") or trade_details.get("entry_price")),
-                                    "target_2": float(trade_details.get("target_2") or trade_details.get("entry_price")),
-                                    "target_3": float(trade_details.get("target_3") or trade_details.get("entry_price")),
-                                    "trade_track": "Scalp",
-                                    "status": "ACTIVE",
-                                    "created_at": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(),
-                                }
-                                payload_insert = _sanitize_active_payload(raw_payload)
-                                print(f"[SUPABASE] POST active_positions payload (sanitized): {payload_insert}")
-                                post_resp = requests.post(
-                                    f"{supabase_url}/rest/v1/{SUPABASE_TABLE}?on_conflict=ticker,trade_track",
-                                    headers=headers_upsert,
-                                    json=payload_insert,
-                                    timeout=10,
-                                )
-                                try:
-                                    pbody = post_resp.text[:1000] if post_resp.text else "(empty)"
-                                except Exception:
-                                    pbody = "(no body)"
-                                print(f"[SUPABASE] POST active_positions {ticker} -> {post_resp.status_code} {pbody[:500]}")
-                                logger.info(f"[SUPABASE] POST active_positions {ticker} -> {post_resp.status_code} {pbody[:200]}")
-                                # Graceful fallback for PGRST204 schema cache and 42P10 missing unique constraint
-                                if post_resp.status_code == 400 and ("PGRST204" in pbody or "42P10" in pbody or "ON CONFLICT" in pbody or "schema cache" in pbody):
-                                    print(f"[SUPABASE] Fallback: retrying without on_conflict for {ticker}")
-                                    plain_resp = requests.post(
-                                        f"{supabase_url}/rest/v1/{SUPABASE_TABLE}",
-                                        headers=_supabase_headers(prefer="return=representation"),
-                                        json=payload_insert,
-                                        timeout=10,
-                                    )
-                                    try:
-                                        plain_body = plain_resp.text[:1000] if plain_resp.text else "(empty)"
-                                    except Exception:
-                                        plain_body = "(no body)"
-                                    print(f"[SUPABASE] Plain POST fallback {ticker} -> {plain_resp.status_code} {plain_body[:300]}")
-                                    if plain_resp.status_code in (200, 201, 204):
-                                        post_resp = plain_resp
-                                        pbody = plain_body
-                                    elif plain_resp.status_code == 409:
-                                        # Try PATCH if exists
-                                        try:
-                                            patch_resp = requests.patch(
-                                                f"{supabase_url}/rest/v1/{SUPABASE_TABLE}?ticker=eq.{ticker}&trade_track=eq.Scalp",
-                                                headers=_supabase_headers(),
-                                                json=payload_insert,
-                                                timeout=10,
-                                            )
-                                            print(f"[SUPABASE] PATCH fallback {ticker} -> {patch_resp.status_code}")
-                                            if patch_resp.status_code in (200, 204):
-                                                post_resp = patch_resp
-                                                pbody = patch_resp.text[:300] if patch_resp.text else ""
-                                        except Exception:
-                                            pass
-                                if post_resp.status_code not in (200, 201, 204):
-                                    print(f"[SUPABASE ERROR] Insert failed {post_resp.status_code}: {pbody[:300]}")
-                                    logger.warning(f"Insert active_positions failed {post_resp.status_code}: {pbody[:300]}")
-                            except requests.exceptions.RequestException as e:
-                                print(f"[SUPABASE ERROR] POST active_positions request failed: {e}")
-                                logger.warning(f"POST active_positions request failed: {e}")
-                            except Exception as e:
-                                print(f"[SUPABASE ERROR] POST active_positions unexpected: {e}")
-                                logger.warning(f"POST active_positions unexpected: {e}")
-                        else:
-                            print(f"[SUPABASE ERROR] No tradeDetails available for {ticker}, trying minimal insert")
-                            try:
-                                headers_upsert = _supabase_headers(prefer="resolution=merge-duplicates,return=representation")
-                                raw_minimal = {
-                                    "ticker": ticker,
-                                    "entry_price": 0,
-                                    "current_stop_loss": 0,
-                                    "target_1": 0,
-                                    "target_2": 0,
-                                    "target_3": 0,
-                                    "trade_track": "Scalp",
-                                    "status": "ACTIVE",
-                                    "created_at": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(),
-                                }
-                                minimal = _sanitize_active_payload(raw_minimal)
-                                mresp = requests.post(
-                                    f"{supabase_url}/rest/v1/{SUPABASE_TABLE}?on_conflict=ticker,trade_track",
-                                    headers=headers_upsert,
-                                    json=minimal,
-                                    timeout=10,
-                                )
-                                print(f"[SUPABASE] Minimal POST {ticker} -> {mresp.status_code} {mresp.text[:300] if mresp.text else ''}")
-                                if mresp.status_code == 400 and ("PGRST204" in (mresp.text or "") or "42P10" in (mresp.text or "")):
-                                    plain_m = requests.post(
-                                        f"{supabase_url}/rest/v1/{SUPABASE_TABLE}",
-                                        headers=_supabase_headers(prefer="return=representation"),
-                                        json=minimal,
-                                        timeout=10,
-                                    )
-                                    print(f"[SUPABASE] Plain minimal fallback {ticker} -> {plain_m.status_code} {plain_m.text[:200] if plain_m.text else ''}")
-                            except Exception as e:
-                                print(f"[SUPABASE ERROR] Minimal insert failed: {e}")
-
-                    # For dis/cls (إغلاق الصفقة / غير مهتم) -> explicit DELETE FROM active_positions WHERE ticker = 'TICKER'
-                    if new_status in ("DISMISSED", "CLOSED"):
-                        try:
-                            print(f"[SUPABASE] Explicit DELETE for {ticker} (action {new_status})")
-                            logger.info(f"[SUPABASE] Explicit DELETE for {ticker}")
-                            # Build normalized variants (upper/lower, with/without .CA)
-                            raw_ticker = str(ticker).strip()
-                            variants = set()
-                            try:
-                                variants.add(raw_ticker)
-                                variants.add(raw_ticker.upper())
-                                variants.add(raw_ticker.lower())
-                                # Handle .CA suffix
-                                if ".CA" in raw_ticker.upper():
-                                    base = raw_ticker.upper().replace(".CA", "")
-                                    variants.add(base)
-                                    variants.add(f"{base}.CA")
-                                    variants.add(base.lower())
-                                    variants.add(f"{base.lower()}.CA")
-                                    orig_base = raw_ticker.replace(".CA", "").replace(".ca", "")
-                                    variants.add(orig_base)
-                                    variants.add(f"{orig_base}.CA")
-                                else:
-                                    variants.add(f"{raw_ticker}.CA")
-                                    variants.add(f"{raw_ticker.upper()}.CA")
-                                    variants.add(f"{raw_ticker.lower()}.CA")
-                            except Exception:
-                                variants = {raw_ticker}
-                            variants = {v.strip() for v in variants if v and v.strip()}
-                            deleted_any = False
-                            for var in list(variants)[:6]:
-                                try:
-                                    safe_var = str(var).strip()
-                                    del_url = f"{supabase_url}/rest/v1/{SUPABASE_TABLE}?ticker=eq.{safe_var}"
-                                    headers_del = _supabase_headers()
-                                    # Use Prefer return=representation to get count
-                                    resp_del = requests.delete(del_url, headers=headers_del, timeout=10)
-                                    try:
-                                        del_body = resp_del.text[:300] if resp_del.text else "(empty)"
-                                    except Exception:
-                                        del_body = "(no body)"
-                                    print(f"[SUPABASE] DELETE {safe_var} -> {resp_del.status_code} {del_body}")
-                                    logger.info(f"[SUPABASE] DELETE {safe_var} -> {resp_del.status_code} {del_body[:200]}")
-                                    if resp_del.status_code in (200, 204):
-                                        deleted_any = True
-                                except requests.exceptions.RequestException as e:
-                                    print(f"[SUPABASE ERROR] DELETE request failed for {var}: {e}")
-                                except Exception as e:
-                                    print(f"[SUPABASE ERROR] DELETE failed for {var}: {e}")
-                            if not deleted_any:
-                                print(f"[SUPABASE] DELETE completed for {ticker} (no rows matched or already deleted)")
-                            else:
-                                print(f"[SUPABASE] DELETE succeeded for {ticker}")
-                        except Exception as e:
-                            print(f"[SUPABASE ERROR] DELETE handling failed for {ticker}: {e}")
-                            logger.warning(f"DELETE handling failed for {ticker}: {e}")
-                    else:
-                        # For ACTIVE, ensure status is ACTIVE via PATCH (optional, since already inserted)
-                        try:
-                            headers = _supabase_headers()
-                            patch_url = f"{supabase_url}/rest/v1/{SUPABASE_TABLE}?ticker=eq.{ticker}"
-                            print(f"[SUPABASE] PATCH {ticker} -> {new_status} URL: {patch_url}")
-                            resp = requests.patch(patch_url, headers=headers, json={"status": new_status}, timeout=10)
-                            try:
-                                body = resp.text[:1000] if resp.text else "(empty)"
-                            except Exception:
-                                body = "(no body)"
-                            print(f"[SUPABASE] PATCH {ticker} -> {new_status} {resp.status_code} {body[:300]}")
-                            logger.info(f"[SUPABASE] PATCH {ticker} -> {new_status} {resp.status_code} {body[:200]}")
-                            if resp.status_code not in (200, 204):
-                                print(f"[SUPABASE ERROR] PATCH non-200: {body[:300]}")
-                        except requests.exceptions.RequestException as e:
-                            print(f"[SUPABASE ERROR] PATCH request failed for {ticker}: {e}")
-                            logger.warning(f"PATCH request failed: {e}")
-                        except Exception as e:
-                            print(f"[SUPABASE ERROR] PATCH unexpected for {ticker}: {e}")
-                            logger.warning(f"PATCH unexpected: {e}")
-
-                except Exception as e:
-                    print(f"[SUPABASE ERROR] Activation flow failed for {ticker}: {e}")
-                    logger.warning(f"Activation flow failed for {ticker}: {e}")
-                    import traceback; traceback.print_exc()
-            elif new_status and ticker:
-                print(f"[SUPABASE] Skipping Supabase update: missing URL/Key or requests (url={bool(supabase_url)}, key={bool(supabase_key)}, req={bool(requests)})")
-                logger.warning(f"Skipping Supabase update missing config url={bool(supabase_url)} key={bool(supabase_key)}")
-
-            # Answer callback query (already sent immediately at top – avoid duplicate)
-            if '_already_answered' in locals() and _already_answered:
-                print(f"[TELEGRAM] answerCallbackQuery already sent immediately for {callback_id}, skipping duplicate")
-                logger.info(f"[TELEGRAM] answerCallbackQuery already sent, skipping duplicate for {callback_id}")
+                    if hasattr(request, "status_code"):
+                        request.status_code = 200
+                        return "OK"
+                except Exception:
+                    pass
+                return {"statusCode": 200, "body": "OK"}
             elif bot_token and callback_id and requests:
                 try:
-                    print(f"[TELEGRAM] answerCallbackQuery id={callback_id} text={popup_text} (fallback)")
-                    logger.info(f"[TELEGRAM] answerCallbackQuery id={callback_id} text={popup_text}")
+                    print(f"[TELEGRAM] answerCallbackQuery id={callback_id} text=unhandled (fallback)")
+                    logger.info(f"[TELEGRAM] answerCallbackQuery id={callback_id} text=unhandled")
                     resp = requests.post(
                         f"https://api.telegram.org/bot{bot_token}/answerCallbackQuery",
                         json={
                             "callback_query_id": callback_id,
-                            "text": popup_text,
-                            "show_alert": True,
+                            "text": "تم الاستلام",
+                            "show_alert": False,
                         },
                         timeout=10,
                     )

@@ -268,18 +268,67 @@ STRATEGY_PLAN: Dict[str, Dict[str, Any]] = {
     },
 }
 
+# Multi-channel routing env vars (Phase: Multi-Channel Routing).
+# Primary keys per strategy type; CHANNEL_ENV legacy keys kept as fallback.
+TELEGRAM_CHANNEL_ENV: Dict[str, str] = {
+    SCALPING: "TELEGRAM_CHANNEL_SCALPING",
+    SWING: "TELEGRAM_CHANNEL_SWING",
+    INVESTMENT: "TELEGRAM_CHANNEL_INVESTMENT",
+}
+
 REQUIRED_ENV_VARS: List[str] = [
     "TELEGRAM_BOT_TOKEN",
     "GEMINI_API_KEY",
-    "CHANNEL_SCALPING",
-    "CHANNEL_SWING",
-    "CHANNEL_INVESTMENT",
 ]
+
+# Each strategy channel accepts EITHER the new TELEGRAM_CHANNEL_* name or the
+# legacy CHANNEL_* name so pre-existing deployments keep working.
+_STRATEGY_CHANNEL_VAR_GROUPS: Dict[str, List[str]] = {
+    SCALPING: [
+        "TELEGRAM_CHANNEL_SCALPING",
+        "TELEGRAM_CHANNEL_SCALP",
+        "CHANNEL_SCALPING",
+    ],
+    SWING: [
+        "TELEGRAM_CHANNEL_SWING",
+        "CHANNEL_SWING",
+    ],
+    INVESTMENT: [
+        "TELEGRAM_CHANNEL_INVESTMENT",
+        "TELEGRAM_CHANNEL_INVEST",
+        "CHANNEL_INVESTMENT",
+    ],
+}
+
+
+def get_strategy_channel_id(strategy: Any) -> Optional[str]:
+    """Resolve the target public channel for a strategy type (strategy_type routing).
+
+    Priority per strategy:
+      scalping   -> TELEGRAM_CHANNEL_SCALPING  -> TELEGRAM_CHANNEL_SCALP  -> CHANNEL_SCALPING
+      swing      -> TELEGRAM_CHANNEL_SWING                                 -> CHANNEL_SWING
+      investment -> TELEGRAM_CHANNEL_INVESTMENT -> TELEGRAM_CHANNEL_INVEST -> CHANNEL_INVESTMENT
+    Final fallback: TELEGRAM_CHAT_ID. Never raises; returns Optional[str].
+    """
+    try:
+        key = str(strategy).strip().lower() if strategy is not None else ""
+        for var in _STRATEGY_CHANNEL_VAR_GROUPS.get(key, []):
+            val = (os.environ.get(var) or "").strip()
+            if val:
+                return val
+    except Exception:
+        pass
+    fallback = (os.environ.get("TELEGRAM_CHAT_ID") or "").strip()
+    return fallback or None
 
 
 def check_required_env() -> None:
     """Exit with a clear message if any required environment variable is missing."""
     missing = [var for var in REQUIRED_ENV_VARS if not os.environ.get(var)]
+    # Channel vars are satisfied when at least ONE name per strategy is present.
+    for _vars in _STRATEGY_CHANNEL_VAR_GROUPS.values():
+        if not any((os.environ.get(v) or "").strip() for v in _vars):
+            missing.append(_vars[0])
     if missing:
         for var in missing:
             print(f"ERROR: Required environment variable '{var}' is not set.")
@@ -1000,6 +1049,258 @@ def record_sent_alert_supabase(
         logger.warning("[DEDUP] Unexpected insert error for %s/%s: %s", ticker, strategy, exc)
         print(f"[DEDUP ERROR] Unexpected: {exc}")
         return False
+
+
+# --------------------------------------------------------------------------
+# User Portfolio (Supabase) - per-user private follow-ups
+# --------------------------------------------------------------------------
+
+
+USER_PORTFOLIO_TABLE: str = "user_portfolio"
+
+
+def _user_portfolio_url() -> str:
+    """Return full Supabase table URL for user_portfolio."""
+    base = _supabase_base_url()
+    if not base:
+        return ""
+    return f"{base}/rest/v1/{USER_PORTFOLIO_TABLE}"
+
+
+def fetch_trade_subscribers_supabase(symbol: str) -> List[str]:
+    """List user_ids privately tracking a symbol (status=TRACKING).
+
+    Reads the Supabase user_portfolio table written by the Vercel webhook when
+    users tap [ 📥 انضم للصفقة | Track Signal ]. Returns [] on any failure.
+    Never raises.
+    """
+    if not _is_supabase_configured():
+        return []
+    try:
+        url = _user_portfolio_url()
+        headers = _supabase_headers()
+        if not url or not headers:
+            return []
+        sym_variants = {normalize_ticker(symbol)}
+        base = sym_variants and next(iter(sym_variants)).replace(".CA", "")
+        if base:
+            sym_variants.add(base)
+        or_filter = ",".join(f"symbol.eq.{v}" for v in sorted(sym_variants) if v)
+        resp = requests.get(
+            f"{url}?or=({or_filter})&status=eq.TRACKING&select=user_id",
+            headers=headers,
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            logger.warning("[PORTFOLIO] subscribers query failed (%s): %s", resp.status_code, (resp.text or "")[:200])
+            return []
+        data = resp.json()
+        if isinstance(data, list):
+            return [str(row.get("user_id")) for row in data if isinstance(row, dict) and row.get("user_id")]
+        return []
+    except requests.exceptions.RequestException as exc:
+        logger.warning("[PORTFOLIO] subscribers request failed for %s: %s", symbol, exc)
+        return []
+    except Exception as exc:
+        logger.warning("[PORTFOLIO] Unexpected subscribers error for %s: %s", symbol, exc)
+        return []
+
+
+def mark_subscribers_exited_supabase(symbol: str) -> int:
+    """Mark all TRACKING rows of a symbol as EXITED after its close notification.
+
+    Returns number of affected rows as reported by PostgREST headers (-1 unknown).
+    Never raises.
+    """
+    if not _is_supabase_configured():
+        return -1
+    try:
+        url = _user_portfolio_url()
+        headers = _supabase_headers()
+        if not url or not headers:
+            return -1
+        nt = normalize_ticker(symbol)
+        base = nt.replace(".CA", "")
+        or_filter = f"symbol.eq.{nt},symbol.eq.{base}" if base else f"symbol.eq.{nt}"
+        headers_patch = dict(headers)
+        headers_patch["Prefer"] = "return=representation"
+        resp = requests.patch(
+            f"{url}?or=({or_filter})&status=eq.TRACKING",
+            json={"status": "EXITED"},
+            headers=headers_patch,
+            timeout=10,
+        )
+        if resp.status_code in (200, 204):
+            try:
+                rows = resp.json()
+                count = len(rows) if isinstance(rows, list) else -1
+            except Exception:
+                count = -1
+            logger.info("[PORTFOLIO] Marked subscribers of %s EXITED (%s)", nt, count)
+            return count
+        logger.warning("[PORTFOLIO] Mark-exited failed for %s (%s): %s", nt, resp.status_code, (resp.text or "")[:200])
+        return -1
+    except Exception as exc:
+        logger.warning("[PORTFOLIO] mark_subscribers_exited failed for %s: %s", symbol, exc)
+        return -1
+
+
+def notify_trade_subscribers_dm(symbol: str, message: str, bot_token: Optional[str], mark_exited: bool = False) -> int:
+    """Deliver an update EXCLUSIVELY to the private chats of joined users.
+
+    Public channels never receive close/follow-up cards; every user registered
+    in Supabase user_portfolio gets the message as a bot DM instead.
+    Returns number of successfully delivered DMs. Never raises.
+    """
+    delivered = 0
+    try:
+        subscribers = fetch_trade_subscribers_supabase(symbol)
+        if not subscribers:
+            logger.info("[DM] No tracking subscribers for %s - nothing to notify", symbol)
+            return 0
+        for uid in subscribers:
+            try:
+                if send_telegram(uid, message, bot_token):
+                    delivered += 1
+            except Exception as exc:
+                logger.warning("[DM] Failed DM to user %s for %s: %s", uid, symbol, exc)
+        if mark_exited:
+            mark_subscribers_exited_supabase(symbol)
+    except Exception as exc:
+        logger.warning("[DM] notify_trade_subscribers_dm failed for %s: %s", symbol, exc)
+    return delivered
+
+
+def fetch_all_portfolio_users_supabase() -> List[str]:
+    """Distinct user_ids present in Supabase user_portfolio ([] on failure). Never raises."""
+    if not _is_supabase_configured():
+        return []
+    try:
+        url = _user_portfolio_url()
+        headers = _supabase_headers()
+        if not url or not headers:
+            return []
+        resp = requests.get(f"{url}?select=user_id", headers=headers, timeout=10)
+        if resp.status_code != 200:
+            return []
+        data = resp.json()
+        users: List[str] = []
+        if isinstance(data, list):
+            for row in data:
+                uid = str((row or {}).get("user_id") or "").strip()
+                if uid and uid not in users:
+                    users.append(uid)
+        return users
+    except Exception as exc:
+        logger.warning("[WEEKLY] fetch_all_portfolio_users failed: %s", exc)
+        return []
+
+
+def send_weekly_dm_reports() -> int:
+    """Send the WEEKLY REPORT privately to each user who joined any trade.
+
+    Aggregates each user's tracked symbols against Supabase active_positions
+    (entry/SL/targets/status) into a compact Arabic card and DMs it. Public
+    channels never receive weekly reports.
+    Returns number of successfully delivered reports. Never raises.
+    """
+    delivered = 0
+    try:
+        bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+        if not bot_token:
+            logger.warning("[WEEKLY] TELEGRAM_BOT_TOKEN missing - skipping weekly DM reports")
+            return 0
+        users = fetch_all_portfolio_users_supabase()
+        if not users:
+            logger.info("[WEEKLY] No portfolio users - no weekly reports to send")
+            return 0
+        # Load open positions once for cross-referencing.
+        positions_by_ticker: Dict[str, Dict[str, Any]] = {}
+        try:
+            if _is_supabase_configured():
+                resp = requests.get(f"{_supabase_table_url()}?select=*", headers=_supabase_headers(), timeout=10)
+                if resp.status_code == 200:
+                    rows = resp.json()
+                    if isinstance(rows, list):
+                        for row in rows:
+                            if isinstance(row, dict) and row.get("ticker"):
+                                positions_by_ticker[normalize_ticker(str(row["ticker"]))] = row
+        except Exception as exc:
+            logger.warning("[WEEKLY] active_positions preload failed: %s", exc)
+        sep = "------------------------------------"
+        for uid in users:
+            try:
+                url = _user_portfolio_url()
+                headers = _supabase_headers()
+                if not url or not headers:
+                    break
+                resp = requests.get(
+                    f"{url}?user_id=eq.{uid}&select=symbol,status,joined_at",
+                    headers=headers,
+                    timeout=10,
+                )
+                if resp.status_code != 200:
+                    continue
+                rows = resp.json()
+                if not isinstance(rows, list) or not rows:
+                    continue
+                tracking: List[str] = []
+                exited = 0
+                seen: Set[str] = set()
+                for row in rows:
+                    sym = normalize_ticker(str((row or {}).get("symbol") or ""))
+                    if not sym or sym in seen:
+                        continue
+                    seen.add(sym)
+                    status = str((row or {}).get("status") or "").upper()
+                    if status == "EXITED":
+                        exited += 1
+                        continue
+                    pos_row = positions_by_ticker.get(sym)
+                    pos_status = str((pos_row or {}).get("status") or "").upper()
+                    if pos_status in ("CLOSED", "DISMISSED"):
+                        exited += 1
+                        continue
+                    entry = float((pos_row or {}).get("entry_price") or 0.0)
+                    sl = float((pos_row or {}).get("current_stop_loss") or 0.0)
+                    t1 = float((pos_row or {}).get("target_1") or 0.0)
+                    tracking.append(
+                        f"• <code>{sym}</code> | دخول {entry:.2f} | 🛑 {sl:.2f} | 🎯 {t1:.2f}"
+                    )
+                lines = [
+                    "📊 [كارت التقرير الأسبوعي]",
+                    sep,
+                    f"📈 متابعاتك الخاصة هذا الأسبوع | EGX Quant",
+                    sep,
+                    f"📂 صفقات قيد المتابعة: {len(tracking)}",
+                ]
+                lines.extend(tracking or ["• لا توجد مراكز مفتوحة حالياً ✅"])
+                lines += [
+                    f"🏁 صفقات منتهية: {exited}",
+                    sep,
+                    "<i>التقارير والإغلاقات تصلك هنا دائماً في الشات الخاص 🔒</i>",
+                ]
+                payload = {
+                    "chat_id": uid,
+                    "text": "\n".join(lines),
+                    "parse_mode": "HTML",
+                }
+                resp_send = requests.post(
+                    TELEGRAM_API.format(token=bot_token), json=payload, timeout=30
+                )
+                if resp_send.status_code == 200:
+                    delivered += 1
+                    logger.info("[WEEKLY] Weekly report DM'd to user %s", uid)
+                else:
+                    logger.warning("[WEEKLY] Report DM failed for %s (%s)", uid, resp_send.status_code)
+            except requests.exceptions.RequestException as exc:
+                logger.warning("[WEEKLY] Request failed for user %s: %s", uid, exc)
+            except Exception as exc:
+                logger.warning("[WEEKLY] Report build/send failed for user %s: %s", uid, exc)
+        logger.info("[WEEKLY] Weekly DM reports delivered to %d/%d user(s)", delivered, len(users))
+    except Exception as exc:
+        logger.warning("[WEEKLY] send_weekly_dm_reports failed: %s", exc)
+    return delivered
 
 
 def load_active_positions(path: str = ACTIVE_POSITIONS_FILE) -> List[Dict[str, Any]]:
@@ -1923,34 +2224,23 @@ def remove_active_position(ticker: str, path: str = ACTIVE_POSITIONS_FILE) -> bo
 
 
 def get_channel_id_for_track(track_name: Any) -> Optional[str]:
-    """Strict multi-channel routing helper per trade track.
+    """Strict multi-channel routing helper per trade track (Dynamic Channel Routing).
 
-    Mapping:
-      - Scalp / contains 'مضاربة' -> TELEGRAM_CHANNEL_SCALP
-      - Swing / contains 'سوينغ' -> TELEGRAM_CHANNEL_SWING
-      - Invest / contains 'استثمار' -> TELEGRAM_CHANNEL_INVEST
-    Fallback: TELEGRAM_CHAT_ID (general). Also checks legacy CHANNEL_* vars for backward compatibility.
+    Mapping (strategy_type -> .env channel):
+      - Scalp / 'مضاربة' / scalping   -> TELEGRAM_CHANNEL_SCALPING
+      - Swing / 'سوينغ' / swing       -> TELEGRAM_CHANNEL_SWING
+      - Invest / 'استثمار' / investment -> TELEGRAM_CHANNEL_INVESTMENT
+    Legacy TELEGRAM_CHANNEL_* aliases and CHANNEL_* vars are checked as fallback.
+    Final fallback: TELEGRAM_CHAT_ID (general).
     """
     try:
         track_str = str(track_name) if track_name is not None else ""
         if "Scalp" in track_str or "مضاربة" in track_str:
-            return (
-                os.environ.get("TELEGRAM_CHANNEL_SCALP")
-                or os.environ.get(CHANNEL_ENV.get(SCALPING, ""), "")
-                or os.getenv("TELEGRAM_CHAT_ID", "")
-            )
+            return get_strategy_channel_id(SCALPING)
         if "Swing" in track_str or "سوينغ" in track_str:
-            return (
-                os.environ.get("TELEGRAM_CHANNEL_SWING")
-                or os.environ.get(CHANNEL_ENV.get(SWING, ""), "")
-                or os.getenv("TELEGRAM_CHAT_ID", "")
-            )
+            return get_strategy_channel_id(SWING)
         if "Invest" in track_str or "استثمار" in track_str:
-            return (
-                os.environ.get("TELEGRAM_CHANNEL_INVEST")
-                or os.environ.get(CHANNEL_ENV.get(INVESTMENT, ""), "")
-                or os.getenv("TELEGRAM_CHAT_ID", "")
-            )
+            return get_strategy_channel_id(INVESTMENT)
     except Exception:
         pass
     return os.getenv("TELEGRAM_CHAT_ID", "")
@@ -2301,15 +2591,12 @@ def manage_active_positions(path: str = ACTIVE_POSITIONS_FILE) -> int:
                         dirty = True
                         updated_count += 1
                         alert_msg = f"🔒 تم تفعيل محبس الأرباح السريع لـ {ticker} عند +0.5%."
-                        chat_id = _resolve_chat_id_for_track(trade_track)
-                        if bot_token and chat_id:
-                            try:
-                                send_telegram(chat_id, alert_msg, bot_token)
-                                logger.info("[%s] Scalp ratchet: lock +0.5%% at %.2f (gain %.2f%%)", ticker, entry_price * 1.005, gain_pct * 100)
-                            except Exception as exc:
-                                logger.warning("[%s] failed to send ratchet alert: %s", ticker, exc)
-                        else:
-                            logger.info("[TRAIL-SCALP] %s", alert_msg)
+                        # Private follow-up: DM only the users who joined this trade.
+                        try:
+                            notify_trade_subscribers_dm(ticker, alert_msg, bot_token)
+                        except Exception as exc:
+                            logger.warning("[%s] failed to DM ratchet alert: %s", ticker, exc)
+                        logger.info("[%s] Scalp ratchet: lock +0.5%% at %.2f (gain %.2f%%)", ticker, entry_price * 1.005, gain_pct * 100)
                         current_stop_loss = float(entry_price * 1.005)
                 else:
                     # --- Generic trailing for Swing/Invest (and non-Scalp) ---
@@ -2319,15 +2606,12 @@ def manage_active_positions(path: str = ACTIVE_POSITIONS_FILE) -> int:
                         dirty = True
                         updated_count += 1
                         alert_msg = f"🛡️ رفع وقف الخسارة لسهم {ticker} إلى سعر الدخول ({entry_price:.2f})."
-                        chat_id = _resolve_chat_id_for_track(trade_track)
-                        if bot_token and chat_id:
-                            try:
-                                send_telegram(chat_id, alert_msg, bot_token)
-                                logger.info("[%s] break-even stop promoted to %.2f", ticker, entry_price)
-                            except Exception as exc:
-                                logger.warning("[%s] failed to send break-even alert: %s", ticker, exc)
-                        else:
-                            logger.info("[TRAIL] %s", alert_msg)
+                        # Private follow-up: DM only the users who joined this trade.
+                        try:
+                            notify_trade_subscribers_dm(ticker, alert_msg, bot_token)
+                        except Exception as exc:
+                            logger.warning("[%s] failed to DM break-even alert: %s", ticker, exc)
+                        logger.info("[%s] break-even stop promoted to %.2f", ticker, entry_price)
                         current_stop_loss = float(entry_price)
 
                     # 2) Trail to target_1 when price >= target_2 and stop < target_1
@@ -2341,19 +2625,26 @@ def manage_active_positions(path: str = ACTIVE_POSITIONS_FILE) -> int:
                 # 3) Exit when price <= current_stop_loss (applies to all, including Scalp)
                 # Only for ACTIVE positions (PENDING already filtered above)
                 if current_price <= current_stop_loss:
-                    exit_msg = f"🚨 إغلاق صفقة {ticker} - تم ضرب وقف الخسارة عند {current_stop_loss:.2f}"
-                    chat_id = _resolve_chat_id_for_track(trade_track)
+                    exit_msg = (
+                        f"🔴 [كارت إغلاق صفقة]\n"
+                        f"------------------------------------\n"
+                        f"📌 إغلاق صفقة {ticker} - تم ضرب وقف الخسارة عند {current_stop_loss:.2f}\n"
+                        f"💵 سعر الخروج: {current_price:.2f} EGP\n"
+                        f"------------------------------------"
+                    )
                     pos["status"] = "CLOSED"
                     dirty = True
                     updated_count += 1
-                    if bot_token and chat_id:
-                        try:
-                            send_telegram(chat_id, exit_msg, bot_token)
-                            logger.info("[%s] exit alert sent: %s", ticker, exit_msg)
-                        except Exception as exc:
-                            logger.warning("[%s] failed to send exit alert: %s", ticker, exc)
-                    else:
-                        logger.info("[EXIT] %s", exit_msg)
+                    # Private follow-up: close notifications go EXCLUSIVELY to the
+                    # private chats of users who joined; never to public channels.
+                    dm_count = 0
+                    try:
+                        dm_count = notify_trade_subscribers_dm(ticker, exit_msg, bot_token, mark_exited=True)
+                        logger.info("[%s] exit alert DM'd to %d subscriber(s)", ticker, dm_count)
+                    except Exception as exc:
+                        logger.warning("[%s] failed to DM exit alert: %s", ticker, exc)
+                    if dm_count == 0:
+                        logger.info("[EXIT] %s (no subscribers notified)", exit_msg.replace("\n", " | "))
 
             except Exception as exc:
                 logger.warning("Error managing position %s: %s", pos.get("ticker", "unknown"), exc)
@@ -3127,62 +3418,116 @@ def build_trade_keyboard(
     target_3: Optional[float] = None,
     trade_track: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Build InlineKeyboardMarkup for trade signals with Activate/Dismiss/Close buttons.
+    """[DEPRECATED/DISABLED] Legacy 3-button layout (act_/dis_/cls_).
 
-    Returns dict suitable for Telegram Bot API `reply_markup`.
-    Callback data format (enhanced to include all essential trade parameters for instant Supabase upsert):
-      - Legacy: act_{ticker}, dis_{ticker}, cls_{ticker} (still supported, webhook will fetch specs)
-      - Enhanced: act_{ticker}|{entry_price}|{current_stop_loss}|{target_1}|{target_2}|{target_3}
-        Example: act_COMI.CA|85.00|83.30|87.12|89.25|91.80
-      This ensures Vercel webhook can directly upsert full trade details without needing to fetch from active_positions.json
-      which may not be synced due to GitHub Actions exit (fixes Supabase RLS/persistence issue).
-      All callback_data stays within Telegram's 64-byte limit (ticker 7 + 5*6 + pipes ~ 40 bytes).
-      When trade details are not provided (legacy call), falls back to ticker-only for backward compatibility.
+    This code path has been purged. Public channel broadcasts must strictly use
+    `build_channel_short_card()` + `build_join_markup()` with a single
+    `join_trade` InlineKeyboardButton. This function now delegates to
+    `build_join_markup` to prevent any legacy active_positions flow.
+    """
+    logger.warning("[DEPRECATED] build_trade_keyboard called for %s - legacy 3-button layout disabled; delegating to build_join_markup", ticker)
+    try:
+        # Strictly enforce single join_trade button; ignore legacy args
+        return build_join_markup(ticker)
+    except Exception as exc:
+        logger.warning("Failed to delegate build_trade_keyboard for %s: %s", ticker, exc)
+        return {"inline_keyboard": []}
+
+
+def build_join_markup(ticker: str) -> Dict[str, Any]:
+    """Inline keyboard with the unified [ 📥 انضم للصفقة | Track Signal ] button.
+
+    callback_data format: join_trade:{TICKER} (kept well under Telegram's
+    64-byte limit). The Vercel webhook resolves the latest sent_alert specs for
+    the ticker, registers the pressing user in Supabase user_portfolio and DMs
+    them the FULL detail card privately.
     """
     try:
-        safe_ticker = str(ticker).strip() if ticker else "UNKNOWN"
-        # Build enhanced callback_data with full trade specs if provided
-        if entry_price is not None and current_stop_loss is not None and target_1 is not None and target_2 is not None and target_3 is not None:
-            try:
-                # Format prices to 2 decimals to keep within 64 bytes
-                ep = f"{float(entry_price):.2f}"
-                sl = f"{float(current_stop_loss):.2f}"
-                t1 = f"{float(target_1):.2f}"
-                t2 = f"{float(target_2):.2f}"
-                t3 = f"{float(target_3):.2f}"
-                # Enhanced payload: act_{ticker}|{entry}|{stop}|{t1}|{t2}|{t3}
-                # For dis/cls we keep ticker-only (no need for full specs, status update only)
-                act_data = f"act_{safe_ticker}|{ep}|{sl}|{t1}|{t2}|{t3}"
-                # Ensure within 64 bytes (Telegram limit) - if too long, fallback to ticker-only
-                if len(act_data.encode("utf-8")) > 64:
-                    act_data = f"act_{safe_ticker}"
-                else:
-                    # Also include trade_track in dis/cls? No, keep simple
-                    pass
-                return {
-                    "inline_keyboard": [
-                        [
-                            {"text": "✅ تم الدخول (Activate)", "callback_data": act_data},
-                            {"text": "❌ غير مهتم (Dismiss)", "callback_data": f"dis_{safe_ticker}"},
-                            {"text": "🏁 إغلاق يدوياً (Close)", "callback_data": f"cls_{safe_ticker}"},
-                        ]
-                    ]
-                }
-            except Exception:
-                pass
-        # Fallback legacy (ticker-only)
+        safe_ticker = normalize_ticker(ticker)
+        if not safe_ticker:
+            safe_ticker = str(ticker).strip().upper()
         return {
             "inline_keyboard": [
                 [
-                    {"text": "✅ تم الدخول (Activate)", "callback_data": f"act_{safe_ticker}"},
-                    {"text": "❌ غير مهتم (Dismiss)", "callback_data": f"dis_{safe_ticker}"},
-                    {"text": "🏁 إغلاق يدوياً (Close)", "callback_data": f"cls_{safe_ticker}"},
+                    {
+                        "text": "📥 انضم للصفقة | Track Signal",
+                        "callback_data": f"join_trade:{safe_ticker}",
+                    }
                 ]
             ]
         }
     except Exception as exc:
-        logger.warning("Failed to build trade keyboard for %s: %s", ticker, exc)
+        logger.warning("Failed to build join markup for %s: %s", ticker, exc)
         return {"inline_keyboard": []}
+
+
+def build_channel_short_card(strategy: Any, ticker: Any, ctx: Any, sentiment: Any = None) -> str:
+    """Compose the UNIFIED SHORT public-channel card (كارت مختصر فقط).
+
+    Public channels receive ONLY this compact teaser + the [Track Signal]
+    inline button - never the full detail card and never close cards.
+    Contains: ticker + Shariah tag, track label, TQI, entry, SL and target_1.
+    """
+    try:
+        if not isinstance(ctx, dict):
+            ctx = {}
+        if not isinstance(strategy, str) or strategy not in STRATEGY_PLAN:
+            strategy = SCALPING if SCALPING in STRATEGY_PLAN else next(iter(STRATEGY_PLAN), SCALPING)
+        plan = STRATEGY_PLAN.get(strategy, {}) if isinstance(STRATEGY_PLAN.get(strategy), dict) else {}
+        ticker_str = normalize_ticker(str(ticker)) if ticker else "UNKNOWN.CA"
+        clean_sym = ticker_str.replace(".CA", "")
+        stock_name_ar = STOCK_NAMES_AR.get(ticker_str, clean_sym)
+
+        try:
+            tqi_score, track_label, conviction_label = resolve_tqi(ctx, strategy, sentiment)
+        except Exception:
+            tqi_score, track_label, conviction_label = (
+                5.0,
+                get_trade_track_label(strategy),
+                get_conviction_tier(5.0),
+            )
+        try:
+            tqi_score_f = max(0.0, min(10.0, float(tqi_score)))
+        except (TypeError, ValueError):
+            tqi_score_f = 5.0
+
+        try:
+            entry_price = float(ctx.get("price") or 0.0)
+        except (TypeError, ValueError):
+            entry_price = 0.0
+        try:
+            targets = plan.get("targets_pct", (0.03, 0.05, 0.08))
+            if not isinstance(targets, (list, tuple)) or len(targets) < 3:
+                targets = (0.03, 0.05, 0.08)
+            p1 = float(targets[0])
+            sl_pct = float(plan.get("sl_pct", -0.03))
+            target_1 = entry_price * (1 + p1)
+            stop_loss = entry_price * (1 + sl_pct)
+        except Exception:
+            target_1 = stop_loss = entry_price
+
+        return (
+            f"🚀 **إشارة جديدة | {stock_name_ar} {clean_sym}**\n"
+            f"{get_sharia_status_tag(ticker_str)}\n"
+            f"\n"
+            f"🏷️ المسار: {track_label}\n"
+            f"🎯 تقييم الجودة (TQI): {tqi_score_f:.1f}/10\n"
+            f"\n"
+            f"💵 سعر الدخول : {entry_price:.2f} 🏷\n"
+            f"🛑 وقف الخسارة : {stop_loss:.2f} ⛔️\n"
+            f"🥇 الهدف الأول : {target_1:.2f} 🎯\n"
+            f"\n"
+            f"⭐ التصنيف: {conviction_label}\n"
+            f"\n"
+            f"👇 اضغط الزر للمتابعة الخاصة بالصفقة:"
+        )
+    except Exception as exc:
+        logger.warning("build_channel_short_card failed (%s); using minimal card", exc)
+        try:
+            sym = str(ticker).replace(".CA", "") if ticker else "UNKNOWN"
+        except Exception:
+            sym = "UNKNOWN"
+        return f"🚀 **إشارة جديدة | {sym}**\n👇 اضغط الزر للمتابعة الخاصة بالصفقة:"
 
 
 def send_telegram(chat_id: Optional[str], message: str, bot_token: Optional[str], reply_markup: Optional[Dict[str, Any]] = None) -> bool:
@@ -4673,17 +5018,21 @@ def process_ticker(ticker: str, state: Dict[str, Any]) -> None:
         if tqi_for_filter < TQI_MIN_THRESHOLD:
             logger.info("[FILTERED] Signal for %s skipped (TQI: %.1f/10 < 5.0)", ticker, tqi_for_filter)
             continue
-        message = build_message(strategy, normalized_ticker, ctx, sentiment)
-        # Strict multi-channel routing via trade track (Scalp/Swing/Invest)
+        # Public channels receive the UNIFIED SHORT CARD ONLY + [Track Signal] join
+        # button - full detail cards are NEVER posted to public channels.
+        short_card = build_channel_short_card(strategy, normalized_ticker, ctx, sentiment)
+        join_keyboard = build_join_markup(normalized_ticker)
+        # Dynamic Channel Routing: pick channel by strategy_type FIRST
+        # (TELEGRAM_CHANNEL_SCALPING / _SWING / _INVESTMENT), then fall back to
+        # trade-track routing and finally the general TELEGRAM_CHAT_ID.
         try:
-            chat_id = get_channel_id_for_track(track_for_filter)
+            chat_id = get_strategy_channel_id(strategy) or ""
+            if not chat_id:
+                chat_id = get_channel_id_for_track(track_for_filter) or ""
             if not chat_id:
                 chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
-            # Legacy fallback to strategy mapping if track routing empty
-            if not chat_id:
-                chat_id = os.environ.get(CHANNEL_ENV.get(strategy, ""), "") or os.getenv("TELEGRAM_CHAT_ID", "")
         except Exception:
-            chat_id = os.environ.get(CHANNEL_ENV.get(strategy, ""), "") or os.getenv("TELEGRAM_CHAT_ID", "")
+            chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
         # Pre-compute trade details for keyboard and persistence (ensures webhook gets full payload)
         try:
             plan_for_pos = STRATEGY_PLAN.get(strategy, {})
@@ -4717,15 +5066,9 @@ def process_ticker(ticker: str, state: Dict[str, Any]) -> None:
                 entry_price_pos = 0.0
                 t1_pos = t2_pos = t3_pos = sl_price_pos = 0.0
                 trade_track_pos = TQI_TRACK_LABELS.get(strategy, str(strategy))
-        # Build inline keyboard with full trade specs for instant Supabase upsert in webhook – use normalized ticker
-        try:
-            keyboard = build_trade_keyboard(normalized_ticker, entry_price_pos, sl_price_pos, t1_pos, t2_pos, t3_pos, trade_track_pos)
-        except Exception:
-            try:
-                keyboard = build_trade_keyboard(normalized_ticker)
-            except Exception:
-                keyboard = None
-        if send_telegram(chat_id, message, bot_token, reply_markup=keyboard):
+        # Publish the SHORT card + [ 📥 انضم للصفقة | Track Signal ] button only.
+        # act_/dis_/cls keyboards and full detail cards never reach public channels.
+        if send_telegram(chat_id, short_card, bot_token, reply_markup=join_keyboard):
             # Atomic / Pre-Send State Update – update local sent_alerts memory set IMMEDIATELY
             # so subsequent iterations in same loop skip it instantly (prevents duplicate loop for ELWA.CA/COMI/CERA.CA)
             try:
@@ -4914,6 +5257,16 @@ def run_news_watchlist(mode: str) -> int:
         manage_active_positions()
     except Exception as exc:
         logger.warning("Active position trailing check failed (%s); continuing watchlist", exc)
+
+    # Weekly per-user reports: EGX work week ends Thursday - after the post-market
+    # run on weekday 3 (Thursday), DM every joined user their private weekly card.
+    if mode == POST_MARKET:
+        try:
+            if now_cairo().weekday() == 3:
+                logger.info("Thursday post-market run - dispatching per-user weekly DM reports")
+                send_weekly_dm_reports()
+        except Exception as exc:
+            logger.warning("Weekly DM reports pass failed: %s", exc)
 
     try:
         title = PRE_MARKET_TITLE if mode == PRE_MARKET else POST_MARKET_TITLE
