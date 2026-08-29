@@ -1,0 +1,67 @@
+name: Weekly Market & Portfolio Summary
+
+on:
+  schedule:
+    # Every Saturday, 18:00 Cairo = 16:00 UTC (Cairo UTC+2 winter, UTC+3 summer -> use 16:00 UTC to cover 18:00 Cairo year-round)
+    - cron: "0 16 * * 6"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: egx-weekly
+  cancel-in-progress: false
+
+jobs:
+  weekly:
+    name: Weekly Review & Outlook
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run weekly summary bulletin
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_CHANNEL_NEWS: ${{ secrets.TELEGRAM_CHANNEL_NEWS }}
+          TELEGRAM_NEWS_CHANNEL_ID: ${{ secrets.TELEGRAM_NEWS_CHANNEL_ID }}
+          TELEGRAM_CHAT_ID_NEWS: ${{ secrets.TELEGRAM_CHAT_ID_NEWS }}
+          TELEGRAM_CHANNEL_SCALP: ${{ secrets.TELEGRAM_CHANNEL_SCALP }}
+          TELEGRAM_CHANNEL_SWING: ${{ secrets.TELEGRAM_CHANNEL_SWING }}
+          TELEGRAM_CHANNEL_INVEST: ${{ secrets.TELEGRAM_CHANNEL_INVEST }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          CHANNEL_SCALPING: ${{ secrets.CHANNEL_SCALPING }}
+          CHANNEL_SWING: ${{ secrets.CHANNEL_SWING }}
+          CHANNEL_INVESTMENT: ${{ secrets.CHANNEL_INVESTMENT }}
+        run: |
+          echo "Running EGX Weekly Review & Outlook (Saturday 18:00 Cairo)"
+          python -m egx_quant.news.weekly_summary || python egx_quant/news/weekly_summary.py
+
+      - name: Persist news publish log (local fallback)
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add news_publish_log.json || true
+          if git diff --staged --quiet; then
+            echo "No changes in news_publish_log.json"
+          else
+            git commit -m "chore: update weekly news publish log [skip ci]" || true
+            git pull origin main --rebase || true
+            git push origin main || true
+          fi
