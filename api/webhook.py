@@ -1,13 +1,12 @@
 import json
 import os
 import logging
-import threading
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 try:
     import requests
 except ImportError:
-    requests = None
+    requests = None  # type: ignore[assignment]
 from http.server import BaseHTTPRequestHandler
 
 try:
@@ -307,15 +306,19 @@ try:
         try:
             upsert_headers = dict(headers)
             upsert_headers["Prefer"] = "resolution=merge-duplicates,return=minimal"
+            print(f"[SUPABASE] POST user_portfolio upsert payload={json.dumps(payload)[:500]}")
             resp = requests.post(
                 f"{supabase_url}/rest/v1/{USER_PORTFOLIO_TABLE}?on_conflict=user_id,symbol",
                 json=payload,
                 headers=upsert_headers,
                 timeout=10,
             )
+            print(f"[SUPABASE] Response code={resp.status_code} body={resp.text[:500]}")
             if resp.status_code in (200, 201, 204):
+                print(f"[SUPABASE] Upsert SUCCESS code={resp.status_code} user={user_id} symbol={symbol}")
                 return True, False
             if resp.status_code == 409:
+                print(f"[SUPABASE] Upsert 409 ALREADY JOINED code=409 user={user_id} symbol={symbol}")
                 logger.info("[JOIN] user_portfolio upsert 409 - already joined (user=%s symbol=%s)", user_id, symbol)
                 return True, True
             body = (resp.text or "")[:300]
@@ -333,15 +336,19 @@ try:
         try:
             plain_headers = dict(headers)
             plain_headers["Prefer"] = "return=minimal"
+            print(f"[SUPABASE] Fallback POST user_portfolio plain insert payload={json.dumps(payload)[:500]}")
             resp2 = requests.post(
                 f"{supabase_url}/rest/v1/{USER_PORTFOLIO_TABLE}",
                 json=payload,
                 headers=plain_headers,
                 timeout=10,
             )
+            print(f"[SUPABASE] Fallback Response code={resp2.status_code} body={resp2.text[:500]}")
             if resp2.status_code in (200, 201, 204):
+                print(f"[SUPABASE] Plain insert SUCCESS code={resp2.status_code} user={user_id} symbol={symbol}")
                 return True, False
             if resp2.status_code == 409:
+                print(f"[SUPABASE] Plain insert 409 ALREADY JOINED user={user_id} symbol={symbol}")
                 logger.info("[JOIN] user_portfolio insert 409 - already joined (user=%s symbol=%s)", user_id, symbol)
                 return True, True
             body2 = (resp2.text or "")[:300]
@@ -539,22 +546,28 @@ try:
             is_forbidden = False
             try:
                 if requests is None or not bot_token or not user_id:
+                    print(f"[DM][SKIP] requests={bool(requests)} bot_token={bool(bot_token)} user_id={user_id}")
                     delivered = False
                 else:
                     # Direct POST wrapped in try/except to catch 403 specifically
+                    print(f"[DM] Sending DM to user_id={user_id} card_len={len(card)}")
                     resp_dm = requests.post(
                         TELEGRAM_SEND_URL.format(token=bot_token),
                         json={"chat_id": user_id, "text": card, "parse_mode": "HTML"},
                         timeout=10,
                     )
+                    print(f"[DM] Response code={resp_dm.status_code} body={resp_dm.text[:500]}")
                     if resp_dm.status_code == 200:
+                        print(f"[DM] SUCCESS DM delivered to {user_id} code=200")
                         delivered = True
                     elif _is_telegram_forbidden(resp_dm):
                         is_forbidden = True
                         delivered = False
+                        print(f"[DM][403] Forbidden for user {str(user_id)[:8]} code=403 body={resp_dm.text[:300]}")
                         logger.warning("[JOIN][403 GUARD] DM forbidden for user %s (403) - needs /start @EGX.signals", str(user_id)[:8])
                     else:
                         body = (resp_dm.text or "")[:160]
+                        print(f"[DM][FAIL] code={resp_dm.status_code} body={body} user={str(user_id)[:8]}")
                         logger.warning("[JOIN] DM to %s failed (%s): %s", str(user_id)[:8], resp_dm.status_code, body)
                         delivered = False
             except Exception as exc:
@@ -606,15 +619,19 @@ try:
     def _answer_callback(callback_query_id: str, bot_token: str, text: str, show_alert: bool = False) -> bool:
         """AnswerCallbackQuery wrapper used by the join flow. Never raises."""
         if requests is None or not bot_token or not callback_query_id:
+            print(f"[CALLBACK] Skipped answerCallbackQuery missing token/cb_id requests={bool(requests)}")
             return False
         try:
+            print(f"[CALLBACK] answerCallbackQuery id={callback_query_id} text={text[:80]} alert={show_alert}")
             resp = requests.post(
                 TELEGRAM_ANSWER_URL.format(token=bot_token),
                 json={"callback_query_id": callback_query_id, "text": text[:200], "show_alert": show_alert},
                 timeout=10,
             )
+            print(f"[CALLBACK] Response code={resp.status_code} body={resp.text[:300]}")
             return resp.status_code == 200
         except Exception as exc:
+            print(f"[CALLBACK][ERROR] answerCallbackQuery failed: {exc}")
             logger.warning("[JOIN] answerCallbackQuery failed: %s", exc)
             return False
 
@@ -827,75 +844,117 @@ except Exception as e:
 class handler(BaseHTTPRequestHandler):
     def do_GET(self):
         try:
+            print("[WEBHOOK][GET] Incoming GET - health check")
             self.send_response(200)
             self.send_header("Content-type", "application/json")
             self.end_headers()
             self.wfile.write(json.dumps({"statusCode": 200, "body": "OK"}).encode())
-        except Exception:
-            pass
+            print("[WEBHOOK][GET] Response 200 OK")
+        except Exception as e:
+            print(f"[WEBHOOK][GET][ERROR] {e}")
+            try:
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"OK")
+            except:
+                pass
+        return
+
     def do_POST(self):
+        # === SYNCHRONOUS EXECUTION - Vercel kills background threads, so do work BEFORE response ===
+        raw_body = b""
         body = {}
         try:
             length = int(self.headers.get("Content-Length", 0) or 0)
-            raw = self.rfile.read(length) if length else b""
-            if raw:
+            raw_body = self.rfile.read(length) if length else b""
+            if raw_body:
                 try:
-                    body = json.loads(raw.decode("utf-8"))
-                except Exception:
+                    body = json.loads(raw_body.decode("utf-8"))
+                except Exception as je:
+                    print(f"[WEBHOOK][POST][PARSE] Failed to parse JSON: {je} raw={raw_body[:500]}")
                     body = {}
-        except Exception:
+            print(f"[WEBHOOK][POST] Incoming callback_query payload: {json.dumps(body)[:2000] if isinstance(body, dict) else str(body)[:2000]}")
+            print(f"[WEBHOOK][POST] Raw body length={len(raw_body)} headers={dict(self.headers)}")
+        except Exception as e:
+            print(f"[WEBHOOK][POST][ERROR] Failed to read body: {e}")
             body = {}
-        # Immediate 200
+
+        # Build mock request for synchronous handler
+        class _Req:
+            pass
+        req = _Req()
+        req.method = "POST"
+        req.body = body
+        req.headers = dict(self.headers)
+        req.get_json = lambda *a, **k: body
+        req.json = lambda: body
+
+        # === SYNCHRONOUS BUSINESS LOGIC BEFORE HTTP 200 ===
+        # This ensures Supabase upsert + Telegram DM complete before Vercel terminates
+        print(f"[WEBHOOK][POST] Starting synchronous handler execution")
+        result = None
+        try:
+            # Resolve target - _handler_impl is the core logic (defined inside try wrapper)
+            _target = None
+            try:
+                _target = _handler_impl  # type: ignore
+                print(f"[WEBHOOK][POST] Using _handler_impl target")
+            except NameError:
+                try:
+                    _target = _py_handler  # type: ignore
+                    print(f"[WEBHOOK][POST] Using _py_handler target")
+                except NameError:
+                    print(f"[WEBHOOK][POST][ERROR] No handler target found")
+                    _target = None
+            if _target:
+                print(f"[WEBHOOK][POST] Executing synchronous _handler_impl...")
+                result = _target(req)
+                print(f"[WEBHOOK][POST] Synchronous handler completed result={result}")
+            else:
+                print(f"[WEBHOOK][POST][WARN] No target to execute, skipping business logic")
+                result = {"statusCode": 200, "body": "OK - no target"}
+        except Exception as e:
+            print(f"[WEBHOOK][POST][ERROR] Synchronous handler crashed: {e}")
+            import traceback
+            traceback.print_exc()
+            result = {"statusCode": 200, "body": "OK - error handled"}
+
+        # === HTTP 200 AFTER synchronous work ===
         try:
             self.send_response(200)
             self.send_header("Content-type", "application/json")
             self.end_headers()
-            self.wfile.write(json.dumps({"statusCode": 200, "body": "OK"}).encode())
-        except Exception:
-            pass
-        # Background processing of Telegram/Supabase after response
-        try:
-            # Build mock request for _handler_impl
-            class _Req:
-                pass
-            req = _Req()
-            req.method = "POST"
-            req.body = body
-            req.headers = dict(self.headers)
-            req.get_json = lambda *a, **k: body
-            req.json = lambda: body
-            # Try to find _py_handler (may be inside try block)
-            _target = None
+            payload = json.dumps(result if isinstance(result, dict) else {"statusCode": 200, "body": str(result) if result else "OK"}).encode()
+            self.wfile.write(payload)
+            print(f"[WEBHOOK][POST] HTTP 200 sent synchronously after business logic, payload={payload[:500]}")
+        except Exception as e:
+            print(f"[WEBHOOK][POST][ERROR] Failed to send HTTP 200: {e}")
             try:
-                _target = _py_handler  # type: ignore
-            except NameError:
-                try:
-                    _target = _handler_impl  # type: ignore
-                except NameError:
-                    _target = None
-            if _target:
-                # Run in background thread to avoid blocking response
-                try:
-                    t = threading.Thread(target=_target, args=(req,), daemon=True)
-                    t.start()
-                except Exception:
-                    # Fallback to direct call if threading fails
-                    try:
-                        _target(req)
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-        return
-    def log_message(self, format, *args):
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"OK")
+            except:
+                pass
         return
 
-# Keep aliases for local imports
+    def log_message(self, format, *args):
+        # Suppress default http.server logging, use print for Vercel logs
+        try:
+            print(f"[VERCEL] {format % args}")
+        except:
+            pass
+
+# Keep aliases for local imports / tests
 try:
-    py_handler = _py_handler  # type: ignore
+    py_handler = _handler_impl  # type: ignore
 except NameError:
-    py_handler = None
+    try:
+        py_handler = _py_handler  # type: ignore
+    except NameError:
+        py_handler = None
 try:
     Handler = handler
 except NameError:
     pass
+# Expose function handler for non-class invocation (e.g., local tests)
+# Note: class handler shadows function handler; py_handler preserves function access
