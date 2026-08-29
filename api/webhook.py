@@ -96,9 +96,11 @@ try:
     _SHARIAH_NON_COMPLIANT_BASE = {"COMI", "EAST"}
 
     _TRACK_LABELS: Dict[str, str] = {
+        "scalp": "⚡ مضاربة لحظية (Scalp)",
         "scalping": "⚡ مضاربة لحظية (Scalp)",
         "swing": "📈 تداول سوينغ (Swing)",
         "investment": "🏛️ استثمار طويل (Invest)",
+        "invest": "🏛️ استثمار طويل (Invest)",
     }
 
 
@@ -117,6 +119,13 @@ try:
 
     def _track_label(strategy: Any) -> str:
         key = str(strategy or "").strip().lower()
+        # Normalize common variants: "Scalp ⚡" -> scalp, "Swing 📈" etc.
+        if "scalp" in key:
+            return _TRACK_LABELS["scalp"]
+        if "swing" in key:
+            return _TRACK_LABELS["swing"]
+        if "invest" in key:
+            return _TRACK_LABELS["investment"]
         return _TRACK_LABELS.get(key, "📈 تداول سوينغ (Swing)")
 
 
@@ -433,36 +442,169 @@ try:
         return False, False
 
 
+    def _check_portfolio_exists(supabase_url: str, supabase_key: str, user_id: str, symbol: str) -> bool:
+        """Idempotent pre-check: query public.user_portfolio for (user_id, symbol).
+
+        Returns True if record ALREADY exists (user previously joined), False otherwise.
+        Never raises. Used to prevent duplicate DM + duplicate DB writes.
+        """
+        if requests is None:
+            return False
+        if not supabase_url or not supabase_key or not user_id or not symbol:
+            return False
+        try:
+            norm_symbol = normalize_ticker(symbol)
+            url = f"{supabase_url}/rest/v1/{USER_PORTFOLIO_TABLE}?user_id=eq.{user_id}&symbol=eq.{norm_symbol}&select=*&limit=1"
+            headers = {
+                "apikey": supabase_key,
+                "Authorization": f"Bearer {supabase_key}",
+                "Content-Type": "application/json",
+            }
+            resp = requests.get(url, headers=headers, timeout=10)
+            if resp.status_code == 200:
+                try:
+                    rows = resp.json()
+                    if isinstance(rows, list) and len(rows) > 0:
+                        print(f"[IDEMPOTENT][CHECK] user={user_id} symbol={norm_symbol} EXISTS ({len(rows)} rows) - duplicate")
+                        logger.info("[IDEMPOTENT] user=%s symbol=%s already exists - duplicate join blocked", user_id, norm_symbol)
+                        return True
+                    print(f"[IDEMPOTENT][CHECK] user={user_id} symbol={norm_symbol} NOT FOUND - proceed with join")
+                    return False
+                except Exception as je:
+                    print(f"[IDEMPOTENT][CHECK] parse failed: {je} body={resp.text[:200]}")
+                    return False
+            # Non-200: treat as not exists to allow upsert path (which will log 4xx/5xx)
+            print(f"[IDEMPOTENT][CHECK] GET failed code={resp.status_code} body={resp.text[:200]} - treating as not exists")
+            if 400 <= resp.status_code < 500:
+                logger.warning("[IDEMPOTENT][SUPABASE 4xx] existence check failed %s: %s", resp.status_code, (resp.text or "")[:200])
+            elif resp.status_code >= 500:
+                logger.warning("[IDEMPOTENT][SUPABASE 5xx] existence check failed %s: %s", resp.status_code, (resp.text or "")[:200])
+            return False
+        except Exception as exc:
+            print(f"[IDEMPOTENT][CHECK][ERROR] {exc}")
+            logger.warning("[IDEMPOTENT] existence check error: %s", exc)
+            return False
+
+    def _get_first(alert: Optional[Dict[str, Any]], keys: List[str]) -> Any:
+        """Fetch first available key from alert without hardcoded fallback."""
+        if not isinstance(alert, dict):
+            return None
+        for k in keys:
+            if k in alert and alert[k] is not None and str(alert[k]).strip() != "":
+                return alert[k]
+        return None
+
+    def _format_price(val: Any) -> str:
+        """Format price without hardcoded 0.0 fallback; return '-' if missing."""
+        if val is None or val == "":
+            return "-"
+        try:
+            return f"{float(val):.2f}"
+        except:
+            return str(val)
+
     def build_full_dm_card(ticker: str, alert: Optional[Dict[str, Any]]) -> str:
-        """FULL private detail card DM'd to a user right after they join."""
+        """FULL private detail card DM'd to a user right after they join - strict template."""
         bare = normalize_ticker(ticker).replace(".CA", "")
-        strategy = str((alert or {}).get("strategy") or "")
-        entry = float((alert or {}).get("entry_price") or 0.0)
-        # trade_signals uses stop_loss, legacy sent_alerts uses current_stop_loss - handle both
-        sl_raw = (alert or {}).get("current_stop_loss")
-        if sl_raw is None:
-            sl_raw = (alert or {}).get("stop_loss")
-        sl = float(sl_raw or 0.0)
-        t1 = float((alert or {}).get("target_1") or 0.0)
-        t2 = float((alert or {}).get("target_2") or 0.0)
-        t3 = float((alert or {}).get("target_3") or 0.0)
+        # Fetch complete fields from trade_signals without hardcoded fallbacks
+        # Strategy: try strategy_type first, then strategy
+        strategy_raw = _get_first(alert, ["strategy_type", "strategy", "strategyType", "trade_track"])
+        # TQI: try tqi_score, tqi, TQI_score
+        tqi_raw = _get_first(alert, ["tqi_score", "tqi", "TQI", "tqiScore"])
+        # Shariah: try shariah_status, then fallback to flag map
+        shariah_raw = _get_first(alert, ["shariah_status", "shariahStatus", "shariah"])
+        # Prices: try multiple keys without defaulting to 0.0
+        entry_raw = _get_first(alert, ["entry_price", "entry", "price", "close"])
+        sl_raw = _get_first(alert, ["stop_loss", "current_stop_loss", "sl", "stopLoss"])
+        t1_raw = _get_first(alert, ["target_1", "target1", "tp1"])
+        t2_raw = _get_first(alert, ["target_2", "target2", "tp2"])
+        t3_raw = _get_first(alert, ["target_3", "target3", "tp3"])
+        # Ticker & Name: try company_name, name, then ticker
+        name_raw = _get_first(alert, ["company_name", "name", "company", "symbol_name"])
+        # Use alert ticker if available, else passed ticker
+        display_ticker = _get_first(alert, ["ticker", "symbol", "ticker_bare"]) or ticker
+        display_ticker = normalize_ticker(str(display_ticker)) if display_ticker else ticker
+        bare_display = normalize_ticker(str(display_ticker)).replace(".CA", "") if display_ticker else bare
+
+        # Format fields
+        strategy_label = _track_label(strategy_raw) if strategy_raw else _track_label("swing")
+        # TQI formatting: show as X.X/10 if available
+        if tqi_raw is not None:
+            try:
+                tqi_str = f"{float(tqi_raw):.1f}/10"
+            except:
+                tqi_str = f"{tqi_raw}/10"
+        else:
+            # Try to get from alert's tqi field, if still missing show '-'
+            tqi_str = "-"
+        # Shariah: prefer DB shariah_status, else flag map
+        if shariah_raw:
+            # Normalize DB value
+            sh = str(shariah_raw).strip().upper()
+            if sh in ("COMPLIANT", "COMPLIANT_BASE", "HALAL"):
+                shariah_text = "✅ متوافق (Compliant)"
+            elif sh in ("NON_COMPLIANT", "NON-COMPLIANT", "HARAM"):
+                shariah_text = "⛔ غير متوافق (Non-Compliant)"
+            else:
+                shariah_text = f"{shariah_raw}"
+            shariah_line = f"⚖️ <b>التوافق الشرعي:</b> {shariah_text}"
+        else:
+            shariah_line = f"⚖️ <b>التوافق الشرعي:</b> {_shariah_flag(display_ticker)}"
+
+        # Ticker & Name line
+        if name_raw and str(name_raw).strip() and str(name_raw).strip().upper() != bare_display.upper():
+            ticker_line = f"🔹 <b>السهم:</b> <code>{bare_display}</code> - {name_raw}"
+        else:
+            # Show ticker with bare and full
+            ticker_line = f"🔹 <b>السهم:</b> <code>{bare_display}</code> ({display_ticker})"
+
         sep = "------------------------------------"
         lines: List[str] = [
             "🟢 <b>[كارت انضمام للصفقة]</b>",
             sep,
-            f"🔹 <b>السهم:</b> <code>{bare}</code> {_shariah_flag(ticker)}",
-            f"🏷️ <b>المسار:</b> {_track_label(strategy)}",
+            ticker_line,
+            f"🧠 <b>الاستراتيجية:</b> {strategy_label}",
+            f"🎯 <b>تقييم الجودة (TQI):</b> {tqi_str}",
+            shariah_line,
             sep,
-            f"💵 <b>الدخول:</b> {entry:.2f} EGP",
-            f"🔴 <b>وقف الخسارة (SL):</b> <b>{sl:.2f}</b> EGP",
-            f"🥇 الهدف الأول: <b>{t1:.2f}</b> EGP",
-            f"🥈 الهدف الثاني: <b>{t2:.2f}</b> EGP",
-            f"🥉 الهدف الثالث: <b>{t3:.2f}</b> EGP",
+            f"💵 <b>الدخول:</b> {_format_price(entry_raw)} EGP",
+            f"🔴 <b>وقف الخسارة (SL):</b> <b>{_format_price(sl_raw)}</b> EGP",
+            f"🥇 الهدف الأول: <b>{_format_price(t1_raw)}</b> EGP",
+            f"🥈 الهدف الثاني: <b>{_format_price(t2_raw)}</b> EGP",
+            f"🥉 الهدف الثالث: <b>{_format_price(t3_raw)}</b> EGP",
             sep,
-            "<i>تداول فوري (Spot) فقط - شراء ثم بيع</i>",
-            "🔒 إشعارات الإغلاق والتقرير الأسبوعي تصلك هنا في الخاص",
+            "🔒 تداول فوري (Spot) فقط - تم إضافة الصفقة لمحفظتك للمتابعة.",
         ]
         return "\n".join(lines)
+
+    def build_dm_inline_keyboard(ticker: str, trade_id: int) -> Dict[str, Any]:
+        """Build inline keyboard for private DM with portfolio management buttons."""
+        # Normalize ticker for callback
+        try:
+            norm_ticker = normalize_ticker(ticker).replace(".CA", "") if ticker else ""
+        except:
+            norm_ticker = str(ticker).replace(".CA", "").upper() if ticker else ""
+        # Ensure trade_id is int
+        try:
+            tid = int(trade_id) if trade_id else 0
+        except:
+            tid = 0
+        return {
+            "inline_keyboard": [
+                [
+                    {
+                        "text": "📊 حالة الصفقة | Check Status",
+                        "callback_data": f"portfolio_status:{norm_ticker}"
+                    }
+                ],
+                [
+                    {
+                        "text": "🛑 خروج من الصفقة | Exit Trade",
+                        "callback_data": f"leave_trade:{norm_ticker}:{tid}"
+                    }
+                ]
+            ]
+        }
 
 
     def send_private_dm(bot_token: str, chat_id: str, text: str) -> bool:
@@ -572,6 +714,27 @@ try:
                 logger.warning("[JOIN][ENV AUDIT] SUPABASE_SERVICE_ROLE_KEY / SUPABASE_KEY is missing - user_portfolio write will be skipped")
                 print("[JOIN][ENV AUDIT] SUPABASE_SERVICE_ROLE_KEY / SUPABASE_KEY is missing - user_portfolio write will be skipped")
 
+            # === Idempotent Join Check: query public.user_portfolio for (user_id, symbol) ===
+            # If record ALREADY exists -> immediate popup (show_alert=True) with Arabic message, NO DM, NO duplicate DB write.
+            if supabase_url and supabase_key:
+                try:
+                    if _check_portfolio_exists(supabase_url, supabase_key, user_id, ticker_bare):
+                        try:
+                            _answer_callback(
+                                callback_query_id,
+                                bot_token,
+                                "ℹ️ أنت تتابع هذه الصفقة بالفعل في محفظتك! يمكنك متابعة تحديثاتها عبر المحادثة الخاصة مع البوت.",
+                                show_alert=True,
+                            )
+                            print(f"[IDEMPOTENT] Duplicate blocked for user={user_id} symbol={ticker_bare} - popup sent, no DM, no DB write")
+                        except Exception as _dup_exc:
+                            logger.warning("[JOIN] Duplicate popup failed: %s", _dup_exc)
+                        logger.info("[JOIN] user=%s trade=%s id=%s -> already-joined (pre-check) no DB write no DM", user_id, ticker_bare, trade_id)
+                        return True, "already-joined (pre-check) dm=False"
+                except Exception as _chk_exc:
+                    logger.warning("[JOIN] pre-check failed: %s - proceeding to upsert", _chk_exc)
+                    print(f"[IDEMPOTENT][ERROR] pre-check failed: {_chk_exc}")
+
             registered = False
             already = False
             alert: Optional[Dict[str, Any]] = None
@@ -605,11 +768,26 @@ try:
                 )
                 if not registered and not already:
                     logger.warning("[JOIN] Supabase upsert returned no success for user=%s symbol=%s (check logs for 4xx/5xx)", user_id, ticker_bare)
+                # Race-condition duplicate (409) -> treat as already-joined, NO DM, popup with show_alert=True
+                if already:
+                    try:
+                        _answer_callback(
+                            callback_query_id,
+                            bot_token,
+                            "ℹ️ أنت تتابع هذه الصفقة بالفعل في محفظتك! يمكنك متابعة تحديثاتها عبر المحادثة الخاصة مع البوت.",
+                            show_alert=True,
+                        )
+                        print(f"[IDEMPOTENT] 409 race duplicate for user={user_id} symbol={ticker_bare} - popup sent, no DM")
+                    except Exception as _race_exc:
+                        logger.warning("[JOIN] Race duplicate popup failed: %s", _race_exc)
+                    logger.info("[JOIN] user=%s trade=%s id=%s -> already-joined (409) no DM", user_id, ticker_bare, trade_id)
+                    return True, "already-joined (409) dm=False"
             else:
                 logger.warning("[JOIN] Supabase config missing - registration skipped (check SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY)")
 
+            # Proceed only for NEW joins -> build DM card + send private DM with keyboard
             card = build_full_dm_card(ticker_bare, alert)
-            # === DM dispatch with 403 Forbidden guard ===
+            # === DM dispatch with 403 Forbidden guard (only for new joins) ===
             delivered = False
             is_forbidden = False
             try:
@@ -617,16 +795,26 @@ try:
                     print(f"[DM][SKIP] requests={bool(requests)} bot_token={bool(bot_token)} user_id={user_id}")
                     delivered = False
                 else:
-                    # Direct POST wrapped in try/except to catch 403 specifically
-                    print(f"[DM] Sending DM to user_id={user_id} card_len={len(card)}")
+                    # Build inline portfolio management buttons per spec
+                    try:
+                        dm_keyboard = build_dm_inline_keyboard(ticker_bare, trade_id)
+                        print(f"[DM] Built inline keyboard: {json.dumps(dm_keyboard)[:300]}")
+                    except Exception as kb_e:
+                        print(f"[DM][WARN] Failed to build keyboard: {kb_e}")
+                        dm_keyboard = None
+                    dm_payload: Dict[str, Any] = {"chat_id": user_id, "text": card, "parse_mode": "HTML"}
+                    if dm_keyboard:
+                        dm_payload["reply_markup"] = dm_keyboard
+                    print(f"[DM] Sending DM to user_id={user_id} card_len={len(card)} with keyboard={bool(dm_keyboard)}")
+                    print(f"[DM] Payload reply_markup={json.dumps(dm_payload.get('reply_markup', {}))[:500]}")
                     resp_dm = requests.post(
                         TELEGRAM_SEND_URL.format(token=bot_token),
-                        json={"chat_id": user_id, "text": card, "parse_mode": "HTML"},
+                        json=dm_payload,
                         timeout=10,
                     )
                     print(f"[DM] Response code={resp_dm.status_code} body={resp_dm.text[:500]}")
                     if resp_dm.status_code == 200:
-                        print(f"[DM] SUCCESS DM delivered to {user_id} code=200")
+                        print(f"[DM] SUCCESS DM delivered to {user_id} code=200 with buttons")
                         delivered = True
                     elif _is_telegram_forbidden(resp_dm):
                         is_forbidden = True
@@ -662,14 +850,13 @@ try:
                 logger.info("[JOIN] user=%s trade=%s id=%s -> dm_forbidden (403) needs /start", user_id, ticker_bare, trade_id)
                 return True, f"dm_forbidden trade={ticker_bare} id={trade_id} already={already} registered={registered}"
 
-            if already:
-                _answer_callback(callback_query_id, bot_token, "ℹ️ أنت تتابع هذه الصفقة بالفعل")
-                detail = f"already-joined dm={delivered}"
-            elif registered:
-                _answer_callback(callback_query_id, bot_token, f"✅ تم تسجيل متابعتك لصفقة {ticker_bare.replace('.CA', '')}")
+            # Success path: upsert succeeded, DM sent (or attempted), now show success popup
+            if registered:
+                _answer_callback(callback_query_id, bot_token, "✅ تم تسجيل الصفقة بنجاح! راجع المحادثة الخاصة.")
                 detail = f"registered dm={delivered}"
             else:
-                _answer_callback(callback_query_id, bot_token, "✅ أُرسل لك كارت الصفقة بالخاص")
+                # Fallback when supabase missing or upsert not confirmed but DM still sent
+                _answer_callback(callback_query_id, bot_token, "✅ تم تسجيل الصفقة بنجاح! راجع المحادثة الخاصة.")
                 detail = f"unregistered dm={delivered}"
             logger.info("[JOIN] user=%s trade=%s id=%s -> %s", user_id, ticker_bare, trade_id, detail)
             return True, detail
