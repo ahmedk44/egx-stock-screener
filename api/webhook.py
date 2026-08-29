@@ -1,23 +1,32 @@
-def handler(request, *args, **kwargs):
-    return {"statusCode": 200, "body": "OK - minimal py"}
+from http.server import BaseHTTPRequestHandler
+import json
 
-def app(request, *args, **kwargs):
-    return handler(request, *args, **kwargs)
+class handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps({"statusCode": 200, "body": "OK - GET"}).encode())
+        return
 
-# Vercel Python class handler fallback
-try:
-    from http.server import BaseHTTPRequestHandler
-    class Handler(BaseHTTPRequestHandler):
-        def do_GET(self):
+    def do_POST(self):
+        try:
+            length = int(self.headers.get("Content-Length", 0) or 0)
+            raw = self.rfile.read(length) if length else b""
+            # Always return 200 regardless of body
             self.send_response(200)
+            self.send_header("Content-type", "application/json")
             self.end_headers()
-            self.wfile.write(b"OK")
-        def do_POST(self):
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b"OK")
-        def log_message(self, format, *args):
-            pass
-    handler_class = Handler
-except Exception:
-    pass
+            self.wfile.write(json.dumps({"statusCode": 200, "body": "OK - POST"}).encode())
+        except Exception:
+            try:
+                self.send_response(200)
+                self.send_header("Content-type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"statusCode":200,"body":"OK"}')
+            except Exception:
+                pass
+        return
+
+    def log_message(self, format, *args):
+        return
