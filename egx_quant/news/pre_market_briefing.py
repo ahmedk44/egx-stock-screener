@@ -44,6 +44,34 @@ try:
 except ImportError:
     feedparser = None
 
+# Idempotency + Active Signals helpers
+try:
+    from egx_quant.news.common import (
+        check_already_published,
+        mark_published,
+        fetch_active_signals,
+        enrich_active_signals_with_prices,
+        format_active_signals_section,
+        get_cairo_date_str,
+    )
+except ImportError:
+    try:
+        from common import (  # type: ignore
+            check_already_published,
+            mark_published,
+            fetch_active_signals,
+            enrich_active_signals_with_prices,
+            format_active_signals_section,
+            get_cairo_date_str,
+        )
+    except:
+        check_already_published = lambda x: False  # type: ignore
+        mark_published = lambda x: True  # type: ignore
+        fetch_active_signals = lambda limit=10: []  # type: ignore
+        enrich_active_signals_with_prices = lambda x: []  # type: ignore
+        format_active_signals_section = lambda x: "🎯 **متابعة أسهم المنظومة والمحفظة | Active Signals Tracker:**\nلا توجد صفقات مفتوحة حالياً في المنظومة."  # type: ignore
+        get_cairo_date_str = lambda: datetime.now().strftime("%Y-%m-%d")  # type: ignore
+
 logger = logging.getLogger("egx_news.pre_market")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-7s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 
@@ -323,6 +351,7 @@ def format_pre_market_card(
     corporate_news: List[Dict[str, Any]],
     ai_summary: str,
     date_str: Optional[str] = None,
+    active_signals: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
     if not date_str:
         try:
@@ -361,6 +390,15 @@ def format_pre_market_card(
     if "الإشارات العالمية" not in ai_block:
         ai_block = f"• **الإشارات العالمية:** مستقر\n{ai_block}"
 
+    # Active Signals Tracker section
+    try:
+        if active_signals is None:
+            active_signals = []
+        active_section = format_active_signals_section(active_signals)
+    except Exception as e:
+        logger.warning(f"Active signals section failed: {e}")
+        active_section = "🎯 **متابعة أسهم المنظومة والمحفظة | Active Signals Tracker:**\nلا توجد صفقات مفتوحة حالياً في المنظومة."
+
     card = (
         f"{PRE_MARKET_TITLE}\n"
         f"📅 **التاريخ:** {date_str} | ⏰ **قبل الافتتاح:** 09:00 بتوقيت القاهرة\n"
@@ -376,6 +414,8 @@ def format_pre_market_card(
         f"\n"
         f"🤖 **نظرة الذكاء الاصطناعي:**\n"
         f"{ai_block}\n"
+        f"\n"
+        f"{active_section}\n"
         f"\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"⚠️ *للاسترشاد فقط - تابع إدارة المخاطر*\n"
@@ -424,17 +464,39 @@ def publish_to_news_channel(text: str, parse_mode: str = "Markdown", dry_run: bo
 
 def main(dry_run: bool = False, broadcast: bool = True) -> int:
     logger.info("Starting pre-market briefing pipeline")
+    # Idempotency guard
+    if broadcast and not dry_run:
+        try:
+            if check_already_published("PRE_MARKET"):
+                logger.info("Already published today. Skipping. (PRE_MARKET %s)", get_cairo_date_str())
+                print(f"[IDEMPOTENT] Already published today. Skipping. (PRE_MARKET {get_cairo_date_str()})")
+                return 0
+        except Exception as e:
+            logger.warning(f"Idempotency check failed (proceeding): {e}")
     try:
         global_cues = fetch_global_cues()
         commodities = fetch_commodities()
         corporate_news = fetch_corporate_actions_and_news()
         ai_summary = generate_pre_market_ai_summary(global_cues, commodities, corporate_news)
-        card = format_pre_market_card(global_cues, commodities, corporate_news, ai_summary)
+        # Fetch active signals tracker
+        try:
+            raw_signals = fetch_active_signals(limit=10)
+            active_enriched = enrich_active_signals_with_prices(raw_signals)
+            logger.info(f"Active signals fetched: {len(active_enriched)}")
+        except Exception as e:
+            logger.warning(f"Active signals fetch failed: {e}")
+            active_enriched = []
+        card = format_pre_market_card(global_cues, commodities, corporate_news, ai_summary, active_signals=active_enriched)
         print(card)
         if broadcast:
             ok = publish_to_news_channel(card, dry_run=dry_run)
             if not ok and not dry_run:
                 return 1
+            if ok and not dry_run:
+                try:
+                    mark_published("PRE_MARKET")
+                except Exception as e:
+                    logger.warning(f"Mark published failed: {e}")
         logger.info("Pre-market briefing completed")
         return 0
     except Exception as e:

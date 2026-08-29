@@ -41,6 +41,34 @@ try:
 except ImportError:
     requests = None
 
+# Idempotency + Active Signals helpers
+try:
+    from egx_quant.news.common import (
+        check_already_published,
+        mark_published,
+        fetch_active_signals,
+        enrich_active_signals_with_prices,
+        format_active_signals_section,
+        get_cairo_date_str,
+    )
+except ImportError:
+    try:
+        from common import (  # type: ignore
+            check_already_published,
+            mark_published,
+            fetch_active_signals,
+            enrich_active_signals_with_prices,
+            format_active_signals_section,
+            get_cairo_date_str,
+        )
+    except:
+        check_already_published = lambda x: False  # type: ignore
+        mark_published = lambda x: True  # type: ignore
+        fetch_active_signals = lambda limit=10: []  # type: ignore
+        enrich_active_signals_with_prices = lambda x: []  # type: ignore
+        format_active_signals_section = lambda x: "🎯 **متابعة أسهم المنظومة والمحفظة | Active Signals Tracker:**\nلا توجد صفقات مفتوحة حالياً في المنظومة."  # type: ignore
+        get_cairo_date_str = lambda: datetime.now().strftime("%Y-%m-%d")  # type: ignore
+
 logger = logging.getLogger("egx_news.post_market")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-7s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 
@@ -305,8 +333,9 @@ def format_post_market_card(
     turnover: List[Dict[str, Any]],
     ai_summary: str,
     date_str: Optional[str] = None,
+    active_signals: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
-    """Format card with required title and sections."""
+    """Format card with required title and sections, including Active Signals Tracker."""
     if not date_str:
         try:
             from zoneinfo import ZoneInfo
@@ -356,6 +385,15 @@ def format_post_market_card(
     if "اتجاه السوق" not in ai_block:
         ai_block = f"• **اتجاه السوق:** مستقر\n{ai_block}"
 
+    # Active Signals Tracker section
+    try:
+        if active_signals is None:
+            active_signals = []
+        active_section = format_active_signals_section(active_signals)
+    except Exception as e:
+        logger.warning(f"Active signals section failed: {e}")
+        active_section = "🎯 **متابعة أسهم المنظومة والمحفظة | Active Signals Tracker:**\nلا توجد صفقات مفتوحة حالياً في المنظومة."
+
     card = (
         f"{POST_MARKET_TITLE}\n"
         f"📅 **التاريخ:** {date_str} | ⏰ **الإغلاق:** 14:30 بتوقيت القاهرة\n"
@@ -374,6 +412,8 @@ def format_post_market_card(
         f"\n"
         f"🤖 **تحليل السوق بالذكاء الاصطناعي:**\n"
         f"{ai_block}\n"
+        f"\n"
+        f"{active_section}\n"
         f"\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"⚠️ *التحليل استرشادي فقط - القرار الاستثماري مسؤوليتك*\n"
@@ -425,16 +465,39 @@ def publish_to_news_channel(text: str, parse_mode: str = "Markdown", dry_run: bo
 def main(dry_run: bool = False, broadcast: bool = True) -> int:
     """Run full post-market pipeline: fetch -> AI -> format -> publish."""
     logger.info("Starting post-market summary pipeline")
+    # Idempotency guard - check before heavy fetching if already published today
+    if broadcast and not dry_run:
+        try:
+            if check_already_published("POST_MARKET"):
+                logger.info("Already published today. Skipping. (POST_MARKET %s)", get_cairo_date_str())
+                print(f"[IDEMPOTENT] Already published today. Skipping. (POST_MARKET {get_cairo_date_str()})")
+                return 0
+        except Exception as e:
+            logger.warning(f"Idempotency check failed (proceeding): {e}")
     try:
         indices = fetch_indices_performance()
         gainers, losers, turnover = fetch_top_movers()
         ai_summary = generate_ai_sentiment(indices, gainers, losers, turnover)
-        card = format_post_market_card(indices, gainers, losers, turnover, ai_summary)
+        # Fetch active signals tracker
+        try:
+            raw_signals = fetch_active_signals(limit=10)
+            active_enriched = enrich_active_signals_with_prices(raw_signals)
+            logger.info(f"Active signals fetched: {len(active_enriched)}")
+        except Exception as e:
+            logger.warning(f"Active signals fetch failed: {e}")
+            active_enriched = []
+        card = format_post_market_card(indices, gainers, losers, turnover, ai_summary, active_signals=active_enriched)
         print(card)
         if broadcast:
             ok = publish_to_news_channel(card, dry_run=dry_run)
             if not ok and not dry_run:
                 return 1
+            # Log publish for idempotency if broadcast succeeded and not dry-run
+            if ok and not dry_run:
+                try:
+                    mark_published("POST_MARKET")
+                except Exception as e:
+                    logger.warning(f"Mark published failed: {e}")
         logger.info("Post-market summary completed")
         return 0
     except Exception as e:

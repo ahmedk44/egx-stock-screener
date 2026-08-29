@@ -4,3 +4,7 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+
+news_publish_log.json
+active_positions.json
+state.json
