@@ -1,0 +1,65 @@
+name: Real-Time Target & SL Monitor
+
+on:
+  schedule:
+    # Every 5 minutes during market hours (Sun-Thu 10:00 AM - 02:30 PM Cairo = UTC+3)
+    # 10:00 Cairo = 07:00 UTC, 14:30 Cairo = 11:30 UTC
+    - cron: "*/5 7-11 * * 0-4"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: egx-trade-monitor
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    name: Target & SL Monitor
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run target & SL monitor
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHANNEL_NEWS: ${{ secrets.TELEGRAM_CHANNEL_NEWS }}
+          TELEGRAM_CHANNEL_SCALP: ${{ secrets.TELEGRAM_CHANNEL_SCALP }}
+          TELEGRAM_CHANNEL_SWING: ${{ secrets.TELEGRAM_CHANNEL_SWING }}
+          TELEGRAM_CHANNEL_INVEST: ${{ secrets.TELEGRAM_CHANNEL_INVEST }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          CHANNEL_SCALPING: ${{ secrets.CHANNEL_SCALPING }}
+          CHANNEL_SWING: ${{ secrets.CHANNEL_SWING }}
+          CHANNEL_INVESTMENT: ${{ secrets.CHANNEL_INVESTMENT }}
+        run: |
+          echo "Running EGX Trade Monitor - Target & SL Check"
+          python -m egx_quant.engine.trade_monitor || python egx_quant/engine/trade_monitor.py
+
+      - name: Persist monitor state
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add sent_alerts.json || true
+          if git diff --staged --quiet; then
+            echo "No changes in sent_alerts.json"
+          else
+            git commit -m "chore: update sent alerts state [skip ci]"
+            git pull origin main --rebase || true
+            git push origin main || true
+          fi
