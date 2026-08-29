@@ -41,7 +41,7 @@ try:
 except ImportError:
     requests = None
 
-# Idempotency + Active Signals helpers
+# Idempotency + Active Signals helpers (Context-Aware)
 try:
     from egx_quant.news.common import (
         check_already_published,
@@ -50,6 +50,8 @@ try:
         enrich_active_signals_with_prices,
         format_active_signals_section,
         get_cairo_date_str,
+        build_context_aware_categories,
+        format_context_aware_section,
     )
 except ImportError:
     try:
@@ -60,6 +62,8 @@ except ImportError:
             enrich_active_signals_with_prices,
             format_active_signals_section,
             get_cairo_date_str,
+            build_context_aware_categories,
+            format_context_aware_section,
         )
     except:
         check_already_published = lambda x: False  # type: ignore
@@ -67,6 +71,8 @@ except ImportError:
         fetch_active_signals = lambda limit=10: []  # type: ignore
         enrich_active_signals_with_prices = lambda x: []  # type: ignore
         format_active_signals_section = lambda x: "🎯 **متابعة أسهم المنظومة والمحفظة | Active Signals Tracker:**\nلا توجد صفقات مفتوحة حالياً في المنظومة."  # type: ignore
+        build_context_aware_categories = lambda x, **kw: {"active": [], "watchlist": [], "avoid": []}  # type: ignore
+        format_context_aware_section = lambda x: "🎯 **متابعة أسهم المنظومة والفرص | System Signals & Opportunities**\nلا توجد صفقات مفتوحة حالياً في المنظومة."  # type: ignore
         get_cairo_date_str = lambda: datetime.now().strftime("%Y-%m-%d")  # type: ignore
 
 logger = logging.getLogger("egx_news.post_market")
@@ -385,14 +391,20 @@ def format_post_market_card(
     if "اتجاه السوق" not in ai_block:
         ai_block = f"• **اتجاه السوق:** مستقر\n{ai_block}"
 
-    # Active Signals Tracker section
+    # Context-Aware Signal Watchlist & News Impact Analysis (3-bucket)
     try:
         if active_signals is None:
             active_signals = []
-        active_section = format_active_signals_section(active_signals)
+        # Build dynamic categories: Active Trades Impact, Incoming Setups, Avoid Watchlist
+        try:
+            categories = build_context_aware_categories(active_signals)
+            active_section = format_context_aware_section(categories)
+        except Exception as e:
+            logger.warning(f"Context-aware categories failed: {e}, falling back to legacy tracker")
+            active_section = format_active_signals_section(active_signals)
     except Exception as e:
         logger.warning(f"Active signals section failed: {e}")
-        active_section = "🎯 **متابعة أسهم المنظومة والمحفظة | Active Signals Tracker:**\nلا توجد صفقات مفتوحة حالياً في المنظومة."
+        active_section = "🎯 **متابعة أسهم المنظومة والفرص | System Signals & Opportunities**\nلا توجد صفقات مفتوحة حالياً في المنظومة."
 
     card = (
         f"{POST_MARKET_TITLE}\n"
