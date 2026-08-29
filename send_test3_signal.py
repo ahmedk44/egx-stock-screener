@@ -152,12 +152,11 @@ def main():
         print(f"\nResults: {PASS} passed, {FAIL} failed")
         return 0 if FAIL==0 else 1
 
-    # 3. Supabase insert
-    print("\n=== Step 3: Supabase Insert trade_signals ===")
+    # 3. Supabase insert - UPSERT with dedup check (prevents duplicate rows per ticker)
+    print("\n=== Step 3: Supabase UPSERT trade_signals (dedup check) ===")
     if not url or not key:
         print("[FATAL] Supabase env missing")
         return 2
-    # Build payload for insert (only columns that exist, handle target_4 missing)
     insert_payload={
         "ticker":"TEST3.CA",
         "strategy_type":"Scalp",
@@ -169,42 +168,125 @@ def main():
         "tqi_score":9.4,
         "shariah_status":"COMPLIANT",
     }
-    # Try with target_4 first, fallback if PGRST204
-    headers={"apikey":key,"Authorization": f"Bearer {key}","Content-Type":"application/json","Prefer":"return=representation"}
-    endpoint=f"{url}/rest/v1/trade_signals"
+    # Dedup UPSERT: check if active signal for same ticker already exists
+    headers_base={"apikey":key,"Authorization": f"Bearer {key}","Content-Type":"application/json"}
     trade_id=None
     tried_with_target4=False
-    for attempt_payload in [ {**insert_payload, "target_4":235.0}, insert_payload ]:
-        print(f"[SUPABASE] POST {endpoint} payload={json.dumps(attempt_payload, ensure_ascii=False)}")
-        try:
-            resp=requests.post(endpoint, json=attempt_payload, headers=headers, timeout=15)
-            print(f"[SUPABASE] status {resp.status_code} body {resp.text[:800]}")
-            if resp.status_code in (200,201):
-                try:
-                    data=resp.json()
-                    if isinstance(data, list) and data:
-                        trade_id=int(data[0].get("id") or data[0].get("trade_id") or 0)
-                    elif isinstance(data, dict):
-                        trade_id=int(data.get("id") or 0)
-                    print(f"[SUPABASE] Generated trade_id={trade_id}")
+    existing_id=None
+    try:
+        check_resp=requests.get(f"{url}/rest/v1/trade_signals?ticker=eq.TEST3.CA&order=created_at.desc&limit=1&select=id", headers=headers_base, timeout=10)
+        print(f"[UPSERT] Check existing TEST3.CA -> HTTP {check_resp.status_code} {check_resp.text[:300]}")
+        if check_resp.status_code==200:
+            rows=check_resp.json()
+            if isinstance(rows, list) and rows and rows[0].get("id") is not None:
+                existing_id=int(rows[0].get("id"))
+                print(f"[UPSERT] Existing row found for TEST3.CA id={existing_id} -> will PATCH (update) instead of INSERT")
+    except Exception as exc:
+        print(f"[UPSERT][WARN] dedup check failed: {exc}")
+    if existing_id is not None:
+        # PATCH existing row (UPSERT update) - handle target_4 missing column gracefully
+        for attempt_payload in [ {**insert_payload, "target_4":235.0}, insert_payload ]:
+            try:
+                patch_headers={**headers_base, "Prefer":"return=representation"}
+                patch_url=f"{url}/rest/v1/trade_signals?id=eq.{existing_id}"
+                patch_resp=requests.patch(patch_url, json=attempt_payload, headers=patch_headers, timeout=15)
+                print(f"[UPSERT] PATCH {patch_url} payload={json.dumps(attempt_payload, ensure_ascii=False)} -> HTTP {patch_resp.status_code} {patch_resp.text[:400]}")
+                if patch_resp.status_code in (200,204):
+                    trade_id=existing_id
                     tried_with_target4 = "target_4" in attempt_payload
+                    print(f"[UPSERT] PATCH success -> trade_id={trade_id} (no duplicate created)")
                     break
-                except Exception as e:
-                    print(f"[WARN] parse trade_id failed {e}")
-                    break
-            elif resp.status_code==400 and "PGRST204" in resp.text and "target_4" in resp.text:
-                print("[SUPABASE] target_4 column missing (PGRST204), retry without it")
-                continue
-            else:
-                print(f"[FAIL] insert failed {resp.status_code}")
-                if "target_4" in attempt_payload:
+                elif patch_resp.status_code==400 and "PGRST204" in patch_resp.text and "target_4" in patch_resp.text:
+                    print("[UPSERT] target_4 column missing (PGRST204), retry PATCH without it")
                     continue
+                else:
+                    print(f"[UPSERT] PATCH failed {patch_resp.status_code}, falling back to on_conflict")
+                    break
+            except Exception as e:
+                print(f"[UPSERT][ERROR] PATCH failed: {e}")
                 break
-        except Exception as e:
-            print(f"[ERROR] {e}")
-            break
+        if trade_id is None:
+            # Fallback try on_conflict=ticker UPSERT
+            try:
+                upsert_headers={**headers_base, "Prefer":"resolution=merge-duplicates,return=representation"}
+                for attempt_payload in [ {**insert_payload, "target_4":235.0}, insert_payload ]:
+                    upsert_resp=requests.post(f"{url}/rest/v1/trade_signals?on_conflict=ticker", json=attempt_payload, headers=upsert_headers, timeout=15)
+                    print(f"[UPSERT] POST on_conflict=ticker -> HTTP {upsert_resp.status_code} {upsert_resp.text[:400]}")
+                    if upsert_resp.status_code in (200,201,204):
+                        trade_id=existing_id
+                        tried_with_target4 = "target_4" in attempt_payload
+                        break
+                    elif upsert_resp.status_code==400 and "PGRST204" in upsert_resp.text and "target_4" in upsert_resp.text:
+                        continue
+                    else:
+                        break
+            except Exception as e:
+                print(f"[UPSERT] on_conflict fallback failed: {e}")
+    if trade_id is None:
+        # No existing row - insert with on_conflict try first, fallback to plain POST
+        headers={"apikey":key,"Authorization": f"Bearer {key}","Content-Type":"application/json","Prefer":"return=representation"}
+        endpoint=f"{url}/rest/v1/trade_signals"
+        for attempt_payload in [ {**insert_payload, "target_4":235.0}, insert_payload ]:
+            # Try on_conflict first (handles race condition)
+            try:
+                upsert_headers={**headers_base, "Prefer":"resolution=merge-duplicates,return=representation"}
+                upsert_resp=requests.post(f"{url}/rest/v1/trade_signals?on_conflict=ticker", json=attempt_payload, headers=upsert_headers, timeout=15)
+                print(f"[UPSERT] POST on_conflict=ticker (new) -> HTTP {upsert_resp.status_code} {upsert_resp.text[:400]}")
+                if upsert_resp.status_code in (200,201):
+                    try:
+                        data=upsert_resp.json()
+                        if isinstance(data, list) and data:
+                            trade_id=int(data[0].get("id") or 0)
+                        elif isinstance(data, dict) and data.get("id"):
+                            trade_id=int(data.get("id"))
+                        tried_with_target4 = "target_4" in attempt_payload
+                        print(f"[UPSERT] upsert success -> trade_id={trade_id}")
+                        break
+                    except:
+                        pass
+                elif upsert_resp.status_code==204:
+                    # Query latest
+                    q=requests.get(f"{url}/rest/v1/trade_signals?ticker=eq.TEST3.CA&order=created_at.desc&limit=1&select=id", headers=headers_base, timeout=10)
+                    if q.status_code==200 and q.json():
+                        trade_id=int(q.json()[0].get("id") or 0)
+                        tried_with_target4 = "target_4" in attempt_payload
+                        break
+                elif upsert_resp.status_code==400 and "PGRST204" in upsert_resp.text and "target_4" in upsert_resp.text:
+                    print("[UPSERT] target_4 missing, retry without it")
+                    continue
+            except Exception as e:
+                print(f"[UPSERT] on_conflict new failed: {e}")
+            # Plain POST fallback
+            print(f"[SUPABASE] POST {endpoint} payload={json.dumps(attempt_payload, ensure_ascii=False)}")
+            try:
+                resp=requests.post(endpoint, json=attempt_payload, headers=headers, timeout=15)
+                print(f"[SUPABASE] status {resp.status_code} body {resp.text[:800]}")
+                if resp.status_code in (200,201):
+                    try:
+                        data=resp.json()
+                        if isinstance(data, list) and data:
+                            trade_id=int(data[0].get("id") or data[0].get("trade_id") or 0)
+                        elif isinstance(data, dict):
+                            trade_id=int(data.get("id") or 0)
+                        print(f"[SUPABASE] Generated trade_id={trade_id}")
+                        tried_with_target4 = "target_4" in attempt_payload
+                        break
+                    except Exception as e:
+                        print(f"[WARN] parse trade_id failed {e}")
+                        break
+                elif resp.status_code==400 and "PGRST204" in resp.text and "target_4" in resp.text:
+                    print("[SUPABASE] target_4 column missing (PGRST204), retry without it")
+                    continue
+                else:
+                    print(f"[FAIL] insert failed {resp.status_code}")
+                    if "target_4" in attempt_payload:
+                        continue
+                    break
+            except Exception as e:
+                print(f"[ERROR] {e}")
+                break
     if not trade_id:
-        # fallback query latest
+        # final fallback query latest
         try:
             q=requests.get(f"{url}/rest/v1/trade_signals?ticker=eq.TEST3.CA&order=created_at.desc&limit=1&select=id", headers={"apikey":key,"Authorization": f"Bearer {key}"}, timeout=10)
             print(f"[FALLBACK] GET latest TEST3.CA {q.status_code} {q.text[:500]}")
@@ -218,7 +300,9 @@ def main():
     if not trade_id:
         print("[FAIL] No trade_id generated")
         return 1
-    print(f"[STEP3] trade_id={trade_id} tried_with_target4={tried_with_target4}")
+    print(f"[STEP3] trade_id={trade_id} tried_with_target4={tried_with_target4} (existing_id was {existing_id})")
+    if existing_id is not None and trade_id==existing_id:
+        print(f"[DEDUP] No duplicate created - updated existing row id={trade_id} (UPSERT OK)")
     # Verify readable
     verify_url=f"{url}/rest/v1/trade_signals?id=eq.{trade_id}&select=*"
     vr=requests.get(verify_url, headers={"apikey":key,"Authorization": f"Bearer {key}"}, timeout=10)

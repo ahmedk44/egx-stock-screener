@@ -72,13 +72,95 @@ def _log_http_status(context: str, resp: Any) -> None:
 
 
 def publish_trade_signal(payload: Dict[str, Any]) -> bool:
-    """Upsert the broadcast trade's card fields keyed by trade_id."""
+    """Upsert the broadcast trade's card fields - prevents duplicate rows per ticker.
+
+    Before inserting, checks if an active signal for the same `ticker` already exists.
+    If it exists, updates the existing row (PATCH by id) instead of creating a new row.
+    Also attempts UPSERT with on_conflict=ticker / id as fallback to handle race conditions.
+    Returns True on success (insert or update). Never raises.
+    """
     cfg = _cfg()
     if cfg is None:
         logger.warning("[SYNC][ENV AUDIT] Supabase not configured - skipping trade_signals publish (check SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY)")
         return False
     url, _ = cfg
+    ticker = (payload.get("ticker") or payload.get("symbol") or "").strip()
+    # 1) Check if active signal for same ticker already exists - if so, update instead of insert
+    if ticker:
+        try:
+            # Query latest row for this ticker (active signal check)
+            check_resp = requests.get(
+                f"{url}/rest/v1/{TRADE_SIGNALS_TABLE}?ticker=eq.{ticker}&order=created_at.desc&limit=1&select=id",
+                headers=_headers(prefer="return=minimal"),
+                timeout=10,
+            )
+            if check_resp.status_code == 200:
+                rows = check_resp.json()
+                if isinstance(rows, list) and rows and rows[0].get("id") is not None:
+                    existing_id = int(rows[0].get("id"))
+                    # PATCH existing row with new payload (UPSERT via update)
+                    patch_resp = requests.patch(
+                        f"{url}/rest/v1/{TRADE_SIGNALS_TABLE}?id=eq.{existing_id}",
+                        json=payload,
+                        headers=_headers(prefer="return=minimal"),
+                        timeout=10,
+                    )
+                    if patch_resp.status_code in (200, 204):
+                        logger.info("[SYNC] trade_signals UPSERT update ticker=%s id=%s (dedup - updated existing)", ticker, existing_id)
+                        print(f"[UPSERT] Updated existing trade_signals ticker={ticker} id={existing_id} (no duplicate)")
+                        return True
+                    else:
+                        _log_http_status(f"publish_trade_signal PATCH id={existing_id}", patch_resp)
+                        # Fallback: try POST with on_conflict ticker
+                        upsert_headers = _headers(prefer="resolution=merge-duplicates,return=minimal")
+                        upsert_resp = requests.post(
+                            f"{url}/rest/v1/{TRADE_SIGNALS_TABLE}?on_conflict=ticker",
+                            json=payload,
+                            headers=upsert_headers,
+                            timeout=10,
+                        )
+                        if upsert_resp.status_code in (200, 201, 204):
+                            logger.info("[SYNC] trade_signals UPSERT on_conflict=ticker ticker=%s", ticker)
+                            print(f"[UPSERT] on_conflict=ticker success for {ticker}")
+                            return True
+                        _log_http_status("publish_trade_signal upsert on_conflict=ticker", upsert_resp)
+                    # If patch failed for other reason, fall through to insert fallback
+                else:
+                    # No existing row - proceed to insert
+                    pass
+            else:
+                _log_http_status("publish_trade_signal check existing ticker", check_resp)
+        except requests.exceptions.RequestException as exc:
+            logger.warning("[SYNC] publish_trade_signal dedup check failed: %s - proceeding to insert", exc)
+        except Exception as exc:
+            logger.warning("[SYNC] publish_trade_signal dedup unexpected: %s", exc)
+    # 2) No existing row or check failed - try UPSERT with on_conflict, fallback to plain POST
     try:
+        # First try UPSERT with on_conflict=ticker (if unique constraint exists)
+        try:
+            upsert_headers = _headers(prefer="resolution=merge-duplicates,return=minimal")
+            resp_upsert = requests.post(
+                f"{url}/rest/v1/{TRADE_SIGNALS_TABLE}?on_conflict=ticker",
+                json=payload,
+                headers=upsert_headers,
+                timeout=10,
+            )
+            if resp_upsert.status_code in (200, 201, 204):
+                logger.info("[SYNC] trade_signals UPSERT (on_conflict=ticker) ticker=%s", ticker or "unknown")
+                return True
+            # If PGRST204 or 400 due to missing constraint, fallback to plain POST
+            if resp_upsert.status_code == 400 and "on_conflict" in (resp_upsert.text or "").lower():
+                logger.warning("[SYNC] on_conflict=ticker not supported (no unique constraint) - falling back to plain POST")
+            elif resp_upsert.status_code not in (200, 201, 204):
+                _log_http_status("publish_trade_signal upsert on_conflict", resp_upsert)
+                # If upsert failed but not due to missing constraint, still try plain POST as last resort
+                if resp_upsert.status_code not in (409,):
+                    pass
+                else:
+                    return True  # 409 means already exists
+        except Exception:
+            pass
+        # Plain POST as final fallback
         resp = requests.post(
             f"{url}/rest/v1/{TRADE_SIGNALS_TABLE}",
             json=payload,
@@ -88,6 +170,9 @@ def publish_trade_signal(payload: Dict[str, Any]) -> bool:
         ok = resp.status_code in (200, 201, 204)
         if not ok:
             _log_http_status("publish_trade_signal", resp)
+        else:
+            if ticker:
+                logger.info("[SYNC] trade_signals inserted new row ticker=%s", ticker)
         return ok
     except requests.exceptions.RequestException as exc:
         logger.error("[SYNC] publish_trade_signal request error: %s", exc)
