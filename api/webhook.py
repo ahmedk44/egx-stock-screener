@@ -5,9 +5,72 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 try:
     import requests
-except ImportError:
+    print(f"[IMPORT] requests available version={getattr(requests, '__version__', 'unknown')}")
+except ImportError as _req_e:
+    print(f"[IMPORT][ERROR] requests import failed: {_req_e}")
+    import traceback
+    traceback.print_exc()
     requests = None  # type: ignore[assignment]
 from http.server import BaseHTTPRequestHandler
+# Fallback HTTP client using urllib if requests is None (Vercel pip install may fail)
+if 'requests' not in globals() or globals().get('requests') is None:
+    print("[IMPORT] requests is None, installing urllib fallback for HTTP")
+    try:
+        import urllib.request
+        import urllib.error
+        import urllib.parse
+
+        class _UrllibResponse:
+            def __init__(self, status, body, headers=None):
+                self.status_code = status
+                self.text = body
+                self.headers = headers or {}
+                self._body = body
+            def json(self):
+                import json as _j
+                return _j.loads(self.text) if self.text else {}
+
+        class _UrllibRequestsFallback:
+            @staticmethod
+            def _do(method, url, headers=None, json=None, timeout=10):
+                import json as _j
+                data = None
+                hdrs = dict(headers or {})
+                if json is not None:
+                    data = _j.dumps(json).encode('utf-8')
+                    hdrs.setdefault("Content-Type", "application/json")
+                req = urllib.request.Request(url, data=data, headers=hdrs, method=method)
+                try:
+                    with urllib.request.urlopen(req, timeout=timeout) as resp:
+                        body = resp.read().decode('utf-8', errors='replace')
+                        return _UrllibResponse(resp.status, body, dict(resp.headers))
+                except urllib.error.HTTPError as e:
+                    try:
+                        body = e.read().decode('utf-8', errors='replace')
+                    except:
+                        body = str(e)
+                    return _UrllibResponse(e.code, body, dict(e.headers) if hasattr(e, 'headers') else {})
+                except Exception as e:
+                    return _UrllibResponse(0, str(e), {})
+
+            @staticmethod
+            def get(url, headers=None, timeout=10, **kwargs):
+                return _UrllibRequestsFallback._do("GET", url, headers=headers, timeout=timeout)
+
+            @staticmethod
+            def post(url, headers=None, json=None, timeout=10, **kwargs):
+                return _UrllibRequestsFallback._do("POST", url, headers=headers, json=json, timeout=timeout)
+
+        requests = _UrllibRequestsFallback()  # type: ignore
+        print("[IMPORT] urllib fallback installed as requests")
+        # Also provide exceptions for compatibility
+        class _ReqExc(Exception):
+            pass
+        requests.exceptions = type('obj', (), {'RequestException': _ReqExc})  # type: ignore
+    except Exception as _url_e:
+        print(f"[IMPORT][ERROR] urllib fallback failed: {_url_e}")
+        import traceback
+        traceback.print_exc()
 
 try:
     logger = logging.getLogger("webhook-py")
