@@ -875,16 +875,29 @@ class handler(BaseHTTPRequestHandler):
         return
 
     def do_POST(self):
+        # Immediate 200 - read body, send response, then process in background
+        # This ensures Vercel returns 200 within <100ms even if Supabase/Telegram are slow
+        body = {}
         try:
             length = int(self.headers.get("Content-Length", 0) or 0)
             raw = self.rfile.read(length) if length else b""
-            body = {}
             if raw:
                 try:
                     body = json.loads(raw.decode("utf-8"))
                 except Exception:
                     body = {}
-            # Build mock request for _handler_impl (dict-compatible)
+        except Exception:
+            body = {}
+        # Send 200 immediately
+        try:
+            self.send_response(200)
+            self.send_header("Content-type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"statusCode": 200, "body": "OK"}).encode())
+        except Exception:
+            pass
+        # Process Telegram/Supabase after response (non-blocking for HTTP)
+        try:
             class _Req:
                 pass
             req = _Req()
@@ -893,23 +906,9 @@ class handler(BaseHTTPRequestHandler):
             req.headers = dict(self.headers)
             req.get_json = lambda *a, **k: body
             req.json = lambda: body
-            # Call core logic (handles Telegram + Supabase, always returns 200)
-            try:
-                _py_handler(req)
-            except Exception:
-                pass
-            self.send_response(200)
-            self.send_header("Content-type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps({"statusCode": 200, "body": "OK"}).encode())
+            _py_handler(req)
         except Exception:
-            try:
-                self.send_response(200)
-                self.send_header("Content-type", "application/json")
-                self.end_headers()
-                self.wfile.write(b'{"statusCode":200,"body":"OK"}')
-            except Exception:
-                pass
+            pass
         return
 
     def log_message(self, format, *args):
