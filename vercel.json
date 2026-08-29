@@ -1,6 +1,10 @@
 {
   "builds": [
     {
+      "src": "api/webhook.py",
+      "use": "@vercel/python"
+    },
+    {
       "src": "api/webhook.js",
       "use": "@vercel/node"
     }
@@ -8,11 +12,11 @@
   "routes": [
     {
       "src": "/api/webhook",
-      "dest": "api/webhook.js"
+      "dest": "/api/webhook.py"
     },
     {
       "src": "/",
-      "dest": "api/webhook.js"
+      "dest": "/api/webhook.js"
     }
   ]
 }
