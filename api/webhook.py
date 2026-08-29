@@ -849,12 +849,26 @@ except Exception as e:
 class handler(BaseHTTPRequestHandler):
     def do_GET(self):
         try:
-            print("[WEBHOOK][GET] Incoming GET - health check")
+            # Diagnostic: return env presence for verification
+            supa_url = os.environ.get("SUPABASE_URL", "")
+            supa_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get("SUPABASE_KEY", "")
+            bot_tok = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+            print(f"[WEBHOOK][GET] Incoming GET - health check env supa_url={bool(supa_url)} supa_key={bool(supa_key)} bot_tok={bool(bot_tok)}")
             self.send_response(200)
             self.send_header("Content-type", "application/json")
             self.end_headers()
-            self.wfile.write(json.dumps({"statusCode": 200, "body": "OK"}).encode())
-            print("[WEBHOOK][GET] Response 200 OK")
+            diag = {
+                "statusCode": 200,
+                "body": "OK",
+                "diag": {
+                    "supabase_url_present": bool(supa_url),
+                    "supabase_key_present": bool(supa_key),
+                    "telegram_token_present": bool(bot_tok),
+                    "supabase_url_preview": supa_url[:30] if supa_url else None,
+                }
+            }
+            self.wfile.write(json.dumps(diag).encode())
+            print(f"[WEBHOOK][GET] Response 200 OK diag={diag}")
         except Exception as e:
             print(f"[WEBHOOK][GET][ERROR] {e}")
             try:
@@ -924,14 +938,55 @@ class handler(BaseHTTPRequestHandler):
             traceback.print_exc()
             result = {"statusCode": 200, "body": "OK - error handled"}
 
-        # === HTTP 200 AFTER synchronous work ===
+        # === HTTP 200 AFTER synchronous work - include diagnostic ===
+        # Verify Supabase insertion synchronously for response visibility
+        supa_diag = {}
+        try:
+            # Check env
+            supa_url_check, supa_key_check = _get_supabase_config()  # type: ignore
+            supa_diag["supabase_url_present"] = bool(supa_url_check)
+            supa_diag["supabase_key_present"] = bool(supa_key_check)
+            print(f"[WEBHOOK][POST][DIAG] Supabase env present url={bool(supa_url_check)} key={bool(supa_key_check)}")
+            # If body was join_trade, verify DB row was written
+            if isinstance(body, dict) and body.get("callback_query"):
+                try:
+                    cq = body["callback_query"]
+                    data = str(cq.get("data",""))
+                    parsed = parse_join_callback(data)  # type: ignore
+                    if parsed:
+                        ticker, trade_id = parsed
+                        from_user = cq.get("from",{})
+                        uid = str(from_user.get("id",""))
+                        print(f"[WEBHOOK][POST][DIAG] Verifying DB insertion for user={uid} ticker={ticker}")
+                        if supa_url_check and supa_key_check and requests:
+                            # Query user_portfolio for this user+ticker
+                            try:
+                                q_url = f"{supa_url_check}/rest/v1/user_portfolio?user_id=eq.{uid}&symbol=eq.{ticker}&select=*"
+                                q_headers = {"apikey": supa_key_check, "Authorization": f"Bearer {supa_key_check}", "Content-Type": "application/json"}
+                                q_resp = requests.get(q_url, headers=q_headers, timeout=5)
+                                supa_diag["verify_query_status"] = q_resp.status_code
+                                supa_diag["verify_query_body"] = q_resp.text[:500]
+                                print(f"[SUPABASE][VERIFY] Query after upsert code={q_resp.status_code} body={q_resp.text[:500]}")
+                            except Exception as ve:
+                                supa_diag["verify_error"] = str(ve)
+                                print(f"[SUPABASE][VERIFY][ERROR] {ve}")
+                except Exception as ve:
+                    print(f"[WEBHOOK][POST][DIAG][ERROR] {ve}")
+        except Exception as de:
+            print(f"[WEBHOOK][POST][DIAG][ERROR] {de}")
+
         try:
             self.send_response(200)
             self.send_header("Content-type", "application/json")
             self.end_headers()
-            payload = json.dumps(result if isinstance(result, dict) else {"statusCode": 200, "body": str(result) if result else "OK"}).encode()
+            # Include supa_diag in response for live test visibility
+            resp_body = result if isinstance(result, dict) else {"statusCode": 200, "body": str(result) if result else "OK"}
+            if isinstance(resp_body, dict):
+                resp_body["supabase_diag"] = supa_diag
+                resp_body["callback_payload"] = body if isinstance(body, dict) else str(body)[:500]
+            payload = json.dumps(resp_body).encode()
             self.wfile.write(payload)
-            print(f"[WEBHOOK][POST] HTTP 200 sent synchronously after business logic, payload={payload[:500]}")
+            print(f"[WEBHOOK][POST] HTTP 200 sent synchronously after business logic, payload={payload[:800]}")
         except Exception as e:
             print(f"[WEBHOOK][POST][ERROR] Failed to send HTTP 200: {e}")
             try:
