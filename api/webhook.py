@@ -61,6 +61,14 @@ if 'requests' not in globals() or globals().get('requests') is None:
             def post(url, headers=None, json=None, timeout=10, **kwargs):
                 return _UrllibRequestsFallback._do("POST", url, headers=headers, json=json, timeout=timeout)
 
+            @staticmethod
+            def patch(url, headers=None, json=None, timeout=10, **kwargs):
+                return _UrllibRequestsFallback._do("PATCH", url, headers=headers, json=json, timeout=timeout)
+
+            @staticmethod
+            def delete(url, headers=None, timeout=10, **kwargs):
+                return _UrllibRequestsFallback._do("DELETE", url, headers=headers, timeout=timeout)
+
         requests = _UrllibRequestsFallback()  # type: ignore
         print("[IMPORT] urllib fallback installed as requests")
         # Also provide exceptions for compatibility
@@ -360,85 +368,152 @@ try:
             logger.warning("[JOIN][ENV AUDIT] SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY missing - user_portfolio upsert skipped (user=%s symbol=%s)", user_id, symbol)
             print(f"[JOIN][ENV AUDIT] SUPABASE_URL or key missing - skipping upsert for user={user_id} symbol={symbol}")
             return False, False
-        # Deployed user_portfolio schema (via Supabase): id, user_id, symbol, trade_id, status, joined_at
-        # No `snapshot` column (PGRST204), so omit it; keep payload minimal and schema-compatible
-        payload: Dict[str, Any] = {
+        # Base payload (always compatible)
+        base_payload: Dict[str, Any] = {
             "user_id": str(user_id),
             "trade_id": int(trade_id) if trade_id else 0,
             "symbol": normalize_ticker(symbol),
             "status": "TRACKING",
             "joined_at": datetime.now(timezone.utc).isoformat(),
         }
-        # Include snapshot only if caller provided and column exists (handled via fallback)
-        # To avoid PGRST204, we do NOT send snapshot by default; log it for visibility
+        # Custom entry price recording (optional interactive flow)
+        # Default to signal's official entry_price; stored in both entry_price and joined_at_price for precise P&L.
+        entry_price_val = None
+        if isinstance(snapshot, dict):
+            raw_entry = snapshot.get("entry_price")
+            if raw_entry is None:
+                raw_entry = snapshot.get("current_entry")
+            try:
+                if raw_entry is not None and str(raw_entry).strip() != "":
+                    entry_price_val = float(raw_entry)
+            except:
+                entry_price_val = None
+        # Build payload variants: try with entry_price cols, fallback without if PGRST204
+        payload_full: Dict[str, Any] = dict(base_payload)
+        if entry_price_val is not None:
+            payload_full["entry_price"] = float(entry_price_val)
+            payload_full["joined_at_price"] = float(entry_price_val)
         if snapshot:
-            print(f"[SUPABASE] Snapshot provided (not sent due to missing column): {json.dumps(snapshot)[:300]}")
+            print(f"[SUPABASE] Snapshot provided: {json.dumps(snapshot)[:300]} full_payload entry_price={entry_price_val}")
+        else:
+            print(f"[SUPABASE] Snapshot empty - base payload only")
         headers = {
             "apikey": supabase_key,
             "Authorization": f"Bearer {supabase_key}",
             "Content-Type": "application/json",
         }
+        # Helper to detect PGRST204 column-missing error
+        def _is_missing_column_error(resp: Any) -> bool:
+            try:
+                txt = str(getattr(resp, "text", "") or "")
+                return "PGRST204" in txt or ("column" in txt.lower() and "schema cache" in txt.lower())
+            except:
+                return False
+
         # Preferred path: merge-duplicates on the UNIQUE(user_id, symbol) constraint.
-        # Ensures duplicate button clicks are idempotent via on_conflict.
-        try:
-            upsert_headers = dict(headers)
-            upsert_headers["Prefer"] = "resolution=merge-duplicates,return=minimal"
-            print(f"[SUPABASE] POST user_portfolio upsert payload={json.dumps(payload)[:500]}")
-            resp = requests.post(
-                f"{supabase_url}/rest/v1/{USER_PORTFOLIO_TABLE}?on_conflict=user_id,symbol",
-                json=payload,
-                headers=upsert_headers,
-                timeout=10,
-            )
-            print(f"[SUPABASE] Response code={resp.status_code} body={resp.text[:500]}")
-            if resp.status_code in (200, 201, 204):
-                print(f"[SUPABASE] Upsert SUCCESS code={resp.status_code} user={user_id} symbol={symbol}")
-                return True, False
-            if resp.status_code == 409:
-                print(f"[SUPABASE] Upsert 409 ALREADY JOINED code=409 user={user_id} symbol={symbol}")
-                logger.info("[JOIN] user_portfolio upsert 409 - already joined (user=%s symbol=%s)", user_id, symbol)
-                return True, True
-            body = (resp.text or "")[:300]
-            if 400 <= resp.status_code < 500:
-                logger.warning("[JOIN][SUPABASE 4xx] user_portfolio upsert %s (%s) - check SUPABASE_SERVICE_ROLE_KEY / RLS", resp.status_code, body)
-                print(f"[JOIN][SUPABASE 4xx] user_portfolio upsert {resp.status_code}: {body[:200]}")
-            elif resp.status_code >= 500:
-                logger.warning("[JOIN][SUPABASE 5xx] user_portfolio upsert %s (%s)", resp.status_code, body)
-                print(f"[JOIN][SUPABASE 5xx] user_portfolio upsert {resp.status_code}: {body[:200]}")
-            else:
-                logger.warning("[JOIN] user_portfolio upsert %s (%s)", resp.status_code, body)
-        except Exception as exc:
-            logger.warning("[JOIN] user_portfolio upsert request failed: %s", exc)
+        # Try full payload first (with custom entry_price), fallback to base if column missing.
+        for attempt_payload in ([payload_full] if payload_full != base_payload else [base_payload]):
+            try:
+                upsert_headers = dict(headers)
+                upsert_headers["Prefer"] = "resolution=merge-duplicates,return=minimal"
+                print(f"[SUPABASE] POST user_portfolio upsert payload={json.dumps(attempt_payload)[:500]}")
+                resp = requests.post(
+                    f"{supabase_url}/rest/v1/{USER_PORTFOLIO_TABLE}?on_conflict=user_id,symbol",
+                    json=attempt_payload,
+                    headers=upsert_headers,
+                    timeout=10,
+                )
+                print(f"[SUPABASE] Response code={resp.status_code} body={resp.text[:500]}")
+                if resp.status_code in (200, 201, 204):
+                    print(f"[SUPABASE] Upsert SUCCESS code={resp.status_code} user={user_id} symbol={symbol} entry_price={entry_price_val}")
+                    return True, False
+                if resp.status_code == 409:
+                    print(f"[SUPABASE] Upsert 409 ALREADY JOINED code=409 user={user_id} symbol={symbol}")
+                    logger.info("[JOIN] user_portfolio upsert 409 - already joined (user=%s symbol=%s)", user_id, symbol)
+                    return True, True
+                # If missing column error and we sent full payload, retry with base payload
+                if _is_missing_column_error(resp) and attempt_payload is payload_full and payload_full != base_payload:
+                    print(f"[SUPABASE] PGRST204 missing entry_price/joined_at_price column - retrying without custom price cols")
+                    logger.warning("[JOIN] PGRST204 missing entry_price column - retrying without it")
+                    # Retry with base payload
+                    try:
+                        resp_retry = requests.post(
+                            f"{supabase_url}/rest/v1/{USER_PORTFOLIO_TABLE}?on_conflict=user_id,symbol",
+                            json=base_payload,
+                            headers=upsert_headers,
+                            timeout=10,
+                        )
+                        print(f"[SUPABASE] Retry Response code={resp_retry.status_code} body={resp_retry.text[:500]}")
+                        if resp_retry.status_code in (200, 201, 204):
+                            print(f"[SUPABASE] Retry SUCCESS user={user_id} symbol={symbol}")
+                            return True, False
+                        if resp_retry.status_code == 409:
+                            return True, True
+                    except Exception as re_exc:
+                        logger.warning("[JOIN] retry upsert failed: %s", re_exc)
+                    return False, False
+                body = (resp.text or "")[:300]
+                if 400 <= resp.status_code < 500:
+                    logger.warning("[JOIN][SUPABASE 4xx] user_portfolio upsert %s (%s) - check SUPABASE_SERVICE_ROLE_KEY / RLS", resp.status_code, body)
+                    print(f"[JOIN][SUPABASE 4xx] user_portfolio upsert {resp.status_code}: {body[:200]}")
+                elif resp.status_code >= 500:
+                    logger.warning("[JOIN][SUPABASE 5xx] user_portfolio upsert %s (%s)", resp.status_code, body)
+                    print(f"[JOIN][SUPABASE 5xx] user_portfolio upsert {resp.status_code}: {body[:200]}")
+                else:
+                    logger.warning("[JOIN] user_portfolio upsert %s (%s)", resp.status_code, body)
+            except Exception as exc:
+                logger.warning("[JOIN] user_portfolio upsert request failed: %s", exc)
+            # Only one attempt loop for upsert; break to fallback plain insert
+            break
         # Fallback: plain insert - 409 here means the user already joined.
-        try:
-            plain_headers = dict(headers)
-            plain_headers["Prefer"] = "return=minimal"
-            print(f"[SUPABASE] Fallback POST user_portfolio plain insert payload={json.dumps(payload)[:500]}")
-            resp2 = requests.post(
-                f"{supabase_url}/rest/v1/{USER_PORTFOLIO_TABLE}",
-                json=payload,
-                headers=plain_headers,
-                timeout=10,
-            )
-            print(f"[SUPABASE] Fallback Response code={resp2.status_code} body={resp2.text[:500]}")
-            if resp2.status_code in (200, 201, 204):
-                print(f"[SUPABASE] Plain insert SUCCESS code={resp2.status_code} user={user_id} symbol={symbol}")
-                return True, False
-            if resp2.status_code == 409:
-                print(f"[SUPABASE] Plain insert 409 ALREADY JOINED user={user_id} symbol={symbol}")
-                logger.info("[JOIN] user_portfolio insert 409 - already joined (user=%s symbol=%s)", user_id, symbol)
-                return True, True
-            body2 = (resp2.text or "")[:300]
-            if 400 <= resp2.status_code < 500:
-                logger.warning("[JOIN][SUPABASE 4xx] user_portfolio insert failed %s: %s", resp2.status_code, body2)
-                print(f"[JOIN][SUPABASE 4xx] user_portfolio insert {resp2.status_code}: {body2[:200]}")
-            elif resp2.status_code >= 500:
-                logger.warning("[JOIN][SUPABASE 5xx] user_portfolio insert failed %s: %s", resp2.status_code, body2)
-                print(f"[JOIN][SUPABASE 5xx] user_portfolio insert {resp2.status_code}: {body2[:200]}")
-            else:
-                logger.warning("[JOIN] user_portfolio insert failed %s: %s", resp2.status_code, body2)
-        except Exception as exc:
-            logger.warning("[JOIN] user_portfolio insert request failed: %s", exc)
+        for attempt_payload in ([payload_full] if payload_full != base_payload else [base_payload]):
+            try:
+                plain_headers = dict(headers)
+                plain_headers["Prefer"] = "return=minimal"
+                print(f"[SUPABASE] Fallback POST user_portfolio plain insert payload={json.dumps(attempt_payload)[:500]}")
+                resp2 = requests.post(
+                    f"{supabase_url}/rest/v1/{USER_PORTFOLIO_TABLE}",
+                    json=attempt_payload,
+                    headers=plain_headers,
+                    timeout=10,
+                )
+                print(f"[SUPABASE] Fallback Response code={resp2.status_code} body={resp2.text[:500]}")
+                if resp2.status_code in (200, 201, 204):
+                    print(f"[SUPABASE] Plain insert SUCCESS code={resp2.status_code} user={user_id} symbol={symbol}")
+                    return True, False
+                if resp2.status_code == 409:
+                    print(f"[SUPABASE] Plain insert 409 ALREADY JOINED user={user_id} symbol={symbol}")
+                    logger.info("[JOIN] user_portfolio insert 409 - already joined (user=%s symbol=%s)", user_id, symbol)
+                    return True, True
+                if _is_missing_column_error(resp2) and attempt_payload is payload_full and payload_full != base_payload:
+                    print(f"[SUPABASE] PGRST204 on plain insert - retrying without custom price")
+                    try:
+                        resp_retry2 = requests.post(
+                            f"{supabase_url}/rest/v1/{USER_PORTFOLIO_TABLE}",
+                            json=base_payload,
+                            headers=plain_headers,
+                            timeout=10,
+                        )
+                        print(f"[SUPABASE] Plain Retry code={resp_retry2.status_code} body={resp_retry2.text[:500]}")
+                        if resp_retry2.status_code in (200, 201, 204):
+                            return True, False
+                        if resp_retry2.status_code == 409:
+                            return True, True
+                    except Exception as re2_exc:
+                        logger.warning("[JOIN] plain retry failed: %s", re2_exc)
+                    return False, False
+                body2 = (resp2.text or "")[:300]
+                if 400 <= resp2.status_code < 500:
+                    logger.warning("[JOIN][SUPABASE 4xx] user_portfolio insert failed %s: %s", resp2.status_code, body2)
+                    print(f"[JOIN][SUPABASE 4xx] user_portfolio insert {resp2.status_code}: {body2[:200]}")
+                elif resp2.status_code >= 500:
+                    logger.warning("[JOIN][SUPABASE 5xx] user_portfolio insert failed %s: %s", resp2.status_code, body2)
+                    print(f"[JOIN][SUPABASE 5xx] user_portfolio insert {resp2.status_code}: {body2[:200]}")
+                else:
+                    logger.warning("[JOIN] user_portfolio insert failed %s: %s", resp2.status_code, body2)
+            except Exception as exc:
+                logger.warning("[JOIN] user_portfolio insert request failed: %s", exc)
+            break
         return False, False
 
 
@@ -606,6 +681,511 @@ try:
             ]
         }
 
+
+    # ----------------------------------------------------------------------
+    # DM Inline Button Handlers: portfolio_status & leave_trade
+    # ----------------------------------------------------------------------
+
+    def parse_portfolio_status_callback(data: str) -> Optional[str]:
+        """Parse 'portfolio_status:{TICKER}' -> normalized_ticker or None."""
+        try:
+            raw = str(data or "").strip()
+            if not raw.startswith("portfolio_status:"):
+                return None
+            parts = raw.split(":", 1)
+            if len(parts) < 2 or not parts[1].strip():
+                return None
+            ticker = normalize_ticker(parts[1].strip())
+            if not ticker:
+                return None
+            return ticker
+        except Exception:
+            return None
+
+    def parse_leave_trade_callback(data: str) -> Optional[Tuple[str, int]]:
+        """Parse 'leave_trade:{TICKER}:{trade_id}' -> (ticker, trade_id) or None."""
+        try:
+            raw = str(data or "").strip()
+            if not raw.startswith("leave_trade:"):
+                return None
+            parts = raw.split(":")
+            if len(parts) < 2:
+                return None
+            ticker = normalize_ticker(parts[1])
+            if not ticker:
+                return None
+            trade_id = 0
+            if len(parts) >= 3 and parts[2].strip():
+                try:
+                    trade_id = int(parts[2].strip())
+                    if trade_id < 0:
+                        trade_id = 0
+                except:
+                    trade_id = 0
+            return ticker, trade_id
+        except Exception:
+            return None
+
+    def _fetch_user_portfolio_row(supabase_url: str, supabase_key: str, user_id: str, symbol: str) -> Optional[Dict[str, Any]]:
+        """Fetch user_portfolio row for (user_id, symbol). Never raises."""
+        if requests is None or not supabase_url or not supabase_key or not user_id or not symbol:
+            return None
+        try:
+            norm = normalize_ticker(symbol)
+            # Try symbol exact, then bare without .CA
+            for sym in (norm, norm.replace(".CA", "")):
+                url = f"{supabase_url}/rest/v1/{USER_PORTFOLIO_TABLE}?user_id=eq.{user_id}&symbol=eq.{sym}&select=*&limit=1"
+                headers = {"apikey": supabase_key, "Authorization": f"Bearer {supabase_key}", "Content-Type": "application/json"}
+                resp = requests.get(url, headers=headers, timeout=10)
+                if resp.status_code == 200:
+                    rows = resp.json()
+                    if isinstance(rows, list) and rows:
+                        return dict(rows[0])
+                elif resp.status_code == 400 and "PGRST204" in (resp.text or ""):
+                    continue
+            # Fallback: query by user_id only and filter
+            try:
+                url2 = f"{supabase_url}/rest/v1/{USER_PORTFOLIO_TABLE}?user_id=eq.{user_id}&select=*&limit=10"
+                resp2 = requests.get(url2, headers={"apikey": supabase_key, "Authorization": f"Bearer {supabase_key}"}, timeout=10)
+                if resp2.status_code == 200:
+                    rows2 = resp2.json()
+                    if isinstance(rows2, list):
+                        for r in rows2:
+                            if isinstance(r, dict) and normalize_ticker(str(r.get("symbol") or "")) == normalize_ticker(symbol):
+                                return dict(r)
+            except:
+                pass
+            return None
+        except Exception as exc:
+            logger.warning("[PORTFOLIO_STATUS] fetch user row failed: %s", exc)
+            return None
+
+    def _fetch_current_market_price(ticker: str, fallback: Optional[float] = None) -> Optional[float]:
+        """Fetch latest market price for ticker via yfinance, fallback to provided price. Never raises."""
+        try:
+            # Try yfinance if available (serverless may not have it, but we try)
+            try:
+                import yfinance as yf  # type: ignore
+                # Use 1d period, minimal
+                data = yf.download(ticker, period="5d", interval="1d", progress=False, threads=False, auto_adjust=True)  # type: ignore
+                if data is not None and not data.empty:
+                    # Handle MultiIndex columns
+                    try:
+                        if hasattr(data.columns, "levels"):
+                            data.columns = [c[0] if isinstance(c, tuple) else c for c in data.columns]
+                    except:
+                        pass
+                    if "Close" in data.columns:
+                        vals = data["Close"].dropna()
+                        if not vals.empty:
+                            return float(vals.iloc[-1])
+            except ImportError:
+                pass
+            except Exception as e:
+                logger.info("[PORTFOLIO_STATUS] yfinance fetch failed for %s: %s", ticker, e)
+        except Exception:
+            pass
+        # Fallback to provided price or None
+        if fallback is not None:
+            try:
+                return float(fallback)
+            except:
+                return None
+        return None
+
+    def build_portfolio_status_card(ticker: str, portfolio_row: Optional[Dict[str, Any]], signal_row: Optional[Dict[str, Any]], current_price: Optional[float]) -> str:
+        """Build detailed live summary card for portfolio_status callback."""
+        bare = normalize_ticker(ticker).replace(".CA", "")
+        # Extract portfolio specific entry (custom)
+        user_entry = None
+        if isinstance(portfolio_row, dict):
+            for k in ("entry_price", "joined_at_price", "joined_price", "price"):
+                if portfolio_row.get(k) is not None:
+                    try:
+                        user_entry = float(portfolio_row.get(k))
+                        break
+                    except:
+                        continue
+        # Fallback to signal entry
+        signal_entry = None
+        signal_sl = None
+        t1 = t2 = t3 = None
+        strategy_raw = None
+        tqi_raw = None
+        if isinstance(signal_row, dict):
+            try:
+                signal_entry = float(signal_row.get("entry_price") or signal_row.get("price") or 0) if signal_row.get("entry_price") or signal_row.get("price") else None
+            except:
+                signal_entry = None
+            try:
+                signal_sl = float(signal_row.get("stop_loss") or signal_row.get("current_stop_loss") or 0) if signal_row.get("stop_loss") or signal_row.get("current_stop_loss") else None
+            except:
+                signal_sl = None
+            for k1, v in [("t1", "target_1"), ("t2", "target_2"), ("t3", "target_3")]:
+                try:
+                    if signal_row.get(v) is not None:
+                        if k1 == "t1": t1 = float(signal_row.get(v))
+                        elif k1 == "t2": t2 = float(signal_row.get(v))
+                        elif k1 == "t3": t3 = float(signal_row.get(v))
+                except:
+                    pass
+            strategy_raw = signal_row.get("strategy_type") or signal_row.get("strategy")
+            tqi_raw = signal_row.get("tqi_score") or signal_row.get("tqi")
+        # Effective entry for P&L is user's custom entry if present else signal entry
+        effective_entry = user_entry if user_entry is not None else signal_entry
+        # Current price fallback to effective_entry if none
+        cp = current_price if current_price is not None else effective_entry
+        # Compute P&L %
+        pnl_pct = None
+        pnl_str = "-"
+        if effective_entry and cp and effective_entry != 0:
+            try:
+                pnl_pct = (cp - effective_entry) / effective_entry * 100.0
+                sign = "+" if pnl_pct >= 0 else ""
+                pnl_str = f"{sign}{pnl_pct:.2f}%"
+            except:
+                pnl_str = "-"
+        # Target progression
+        progression = "⏳ لم يصل أي هدف"
+        hit_count = 0
+        if cp is not None:
+            try:
+                if t3 is not None and cp >= t3: hit_count = 3; progression = "🎯 حقق جميع الأهداف (3/3) ✅"
+                elif t2 is not None and cp >= t2: hit_count = 2; progression = "🥈 تم تحقيق الهدف الثاني (2/3) ⏳"
+                elif t1 is not None and cp >= t1: hit_count = 1; progression = "🥇 تم تحقيق الهدف الأول (1/3)"
+                else: progression = "⏳ لم يصل أي هدف بعد"
+            except:
+                progression = "⏳ -"
+        # Trailing SL (use latest signal stop_loss)
+        trailing_sl_str = _format_price(signal_sl) if signal_sl is not None else "-"
+        # Build card
+        sep = "------------------------------------"
+        lines: List[str] = [
+            f"📊 <b>[حالة الصفقة - {bare}]</b>",
+            sep,
+            f"🔹 <b>السهم:</b> <code>{bare}</code> ({normalize_ticker(ticker)})",
+        ]
+        if strategy_raw:
+            lines.append(f"🧠 <b>الاستراتيجية:</b> {_track_label(strategy_raw)}")
+        if tqi_raw is not None:
+            try:
+                lines.append(f"🎯 <b>تقييم الجودة (TQI):</b> {float(tqi_raw):.1f}/10")
+            except:
+                lines.append(f"🎯 <b>تقييم الجودة (TQI):</b> {tqi_raw}/10")
+        lines.append(sep)
+        lines.append(f"💵 <b>سعر دخولك:</b> {_format_price(effective_entry)} EGP" + (" (مخصص)" if user_entry is not None else " (رسمي)"))
+        lines.append(f"📈 <b>السعر الحالي:</b> {_format_price(cp)} EGP")
+        # P&L with color
+        if pnl_pct is not None:
+            emoji = "🟢" if pnl_pct >= 0 else "🔴"
+            lines.append(f"{emoji} <b>الربح/الخسارة غير المحققة:</b> {pnl_str}")
+        else:
+            lines.append(f"📊 <b>الربح/الخسارة:</b> {pnl_str}")
+        lines.append(f"🔴 <b>وقف الخسارة المتحرك الحالي:</b> {trailing_sl_str} EGP")
+        lines.append(sep)
+        lines.append(f"🎯 <b>تقدم الأهداف:</b> {progression}")
+        if t1 is not None: lines.append(f"🥇 الهدف الأول: {_format_price(t1)} EGP" + (" ✅" if cp and t1 and cp >= t1 else ""))
+        if t2 is not None: lines.append(f"🥈 الهدف الثاني: {_format_price(t2)} EGP" + (" ✅" if cp and t2 and cp >= t2 else ""))
+        if t3 is not None: lines.append(f"🥉 الهدف الثالث: {_format_price(t3)} EGP" + (" ✅" if cp and t3 and cp >= t3 else ""))
+        lines.append(sep)
+        if isinstance(portfolio_row, dict) and portfolio_row.get("joined_at"):
+            lines.append(f"📅 <b>تاريخ الانضمام:</b> {str(portfolio_row.get('joined_at'))[:10]}")
+        lines.append(f"💼 <b>الحالة:</b> {portfolio_row.get('status') if isinstance(portfolio_row, dict) else 'TRACKING'}")
+        lines.append(sep)
+        lines.append("ℹ️ يمكنك تعديل سعر الدخول عبر التواصل مع البوت أو استخدام زر الخروج لإغلاق الصفقة.")
+        return "\n".join(lines)
+
+    def handle_portfolio_status(
+        query: Dict[str, Any],
+        data: str,
+        bot_token: str,
+        supabase_url: str,
+        supabase_key: str,
+    ) -> Tuple[bool, str]:
+        """Handle portfolio_status:{ticker} - live summary with P&L, trailing SL, target progression."""
+        callback_query_id = ""
+        try:
+            callback_query_id = str((query or {}).get("id", "")).strip()
+        except:
+            callback_query_id = ""
+        # Immediate spinner kill
+        if callback_query_id and bot_token:
+            try:
+                _answer_callback(callback_query_id, bot_token, "⏳ جاري جلب حالة الصفقة...")
+            except:
+                pass
+        ticker = parse_portfolio_status_callback(data)
+        if ticker is None:
+            if callback_query_id and bot_token:
+                try: _answer_callback(callback_query_id, bot_token, "⚠️ صيغة غير صحيحة")
+                except: pass
+            return False, "unrecognized-portfolio_status"
+        from_user = query.get("from") or {}
+        user_id = str(from_user.get("id", "")).strip()
+        if not user_id:
+            if callback_query_id and bot_token:
+                try: _answer_callback(callback_query_id, bot_token, "⚠️ تعذر تحديد هويتك")
+                except: pass
+            return False, "missing-user-id"
+        # Fetch portfolio row
+        portfolio_row = _fetch_user_portfolio_row(supabase_url, supabase_key, user_id, ticker)
+        if not portfolio_row:
+            msg = "⚠️ لا تتابع هذه الصفقة في محفظتك."
+            if callback_query_id and bot_token:
+                try: _answer_callback(callback_query_id, bot_token, msg, show_alert=True)
+                except: pass
+            logger.info("[PORTFOLIO_STATUS] user=%s ticker=%s not found in portfolio", user_id, ticker)
+            return True, "not-tracking"
+        # Fetch signal row (by trade_id if present)
+        signal_row = None
+        trade_id = 0
+        try:
+            trade_id = int(portfolio_row.get("trade_id") or 0)
+        except:
+            trade_id = 0
+        signal_row = _fetch_trade_signal(supabase_url, supabase_key, ticker, trade_id=trade_id)
+        if signal_row is None and trade_id:
+            # Try bare fetch without trade_id as fallback
+            signal_row = _fetch_trade_signal(supabase_url, supabase_key, ticker, trade_id=0)
+        # Fetch current market price
+        fallback_price = None
+        if signal_row:
+            fallback_price = signal_row.get("entry_price") or signal_row.get("current_stop_loss")
+        # Try user entry as fallback
+        if portfolio_row and portfolio_row.get("entry_price"):
+            try:
+                fallback_price = float(portfolio_row.get("entry_price"))
+            except:
+                pass
+        current_price = _fetch_current_market_price(ticker, fallback=fallback_price)
+        # If still None, try signal targets mid
+        if current_price is None and signal_row:
+            try:
+                current_price = float(signal_row.get("entry_price") or 0)
+            except:
+                current_price = None
+        # Build status card
+        status_card = build_portfolio_status_card(ticker, portfolio_row, signal_row, current_price)
+        # Send detailed card via answerCallbackQuery + DM update
+        # First, try to send as new DM (private chat) with update
+        delivered = False
+        try:
+            if requests and bot_token and user_id:
+                # Send new message to user's private chat with live summary
+                dm_payload: Dict[str, Any] = {"chat_id": user_id, "text": status_card, "parse_mode": "HTML"}
+                # Keep same keyboard for continuity
+                try:
+                    dm_payload["reply_markup"] = build_dm_inline_keyboard(ticker, trade_id)
+                except:
+                    pass
+                resp_dm = requests.post(TELEGRAM_SEND_URL.format(token=bot_token), json=dm_payload, timeout=10)
+                delivered = resp_dm.status_code == 200
+                print(f"[PORTFOLIO_STATUS] DM send to {user_id} -> {resp_dm.status_code} delivered={delivered}")
+        except Exception as dm_exc:
+            logger.warning("[PORTFOLIO_STATUS] DM send failed: %s", dm_exc)
+        # Answer callback with concise toast + popup
+        try:
+            if pnl_available := True:
+                # Show P&L in popup toast
+                toast = "📊 تم إرسال حالة الصفقة في الخاص"
+                _answer_callback(callback_query_id, bot_token, toast, show_alert=False)
+        except:
+            try: _answer_callback(callback_query_id, bot_token, "📊 حالة الصفقة", show_alert=False)
+            except: pass
+        logger.info("[PORTFOLIO_STATUS] user=%s ticker=%s trade_id=%s dm=%s", user_id, ticker, trade_id, delivered)
+        return True, f"portfolio_status dm={delivered} pnl={current_price}"
+
+    def handle_leave_trade(
+        query: Dict[str, Any],
+        data: str,
+        bot_token: str,
+        supabase_url: str,
+        supabase_key: str,
+    ) -> Tuple[bool, str]:
+        """Handle leave_trade:{ticker}:{trade_id} - update status to CLOSED and notify."""
+        callback_query_id = ""
+        try:
+            callback_query_id = str((query or {}).get("id", "")).strip()
+        except:
+            callback_query_id = ""
+        if callback_query_id and bot_token:
+            try:
+                _answer_callback(callback_query_id, bot_token, "⏳ جاري إغلاق الصفقة...")
+            except:
+                pass
+        parsed = parse_leave_trade_callback(data)
+        if parsed is None:
+            if callback_query_id and bot_token:
+                try: _answer_callback(callback_query_id, bot_token, "⚠️ صيغة غير صحيحة")
+                except: pass
+            return False, "unrecognized-leave_trade"
+        ticker, trade_id = parsed
+        from_user = query.get("from") or {}
+        user_id = str(from_user.get("id", "")).strip()
+        if not user_id:
+            if callback_query_id and bot_token:
+                try: _answer_callback(callback_query_id, bot_token, "⚠️ تعذر تحديد هويتك")
+                except: pass
+            return False, "missing-user-id"
+        if not supabase_url or not supabase_key:
+            if callback_query_id and bot_token:
+                try: _answer_callback(callback_query_id, bot_token, "⚠️ إعدادات قاعدة البيانات غير متوفرة", show_alert=True)
+                except: pass
+            return False, "missing-supabase-config"
+        # Update status to CLOSED (also support EXITED for legacy CHECK constraint)
+        success = False
+        # Try CLOSED first, fallback to EXITED, then DELETED
+        for target_status in ("CLOSED", "EXITED"):
+            try:
+                # Use PATCH with filters user_id + symbol (and trade_id if >0)
+                # Supabase PostgREST PATCH expects query params
+                headers = {"apikey": supabase_key, "Authorization": f"Bearer {supabase_key}", "Content-Type": "application/json", "Prefer": "return=representation"}
+                # Build filter
+                # Prefer trade_id if provided (>0) to be precise
+                if trade_id and trade_id > 0:
+                    # Update by user_id + trade_id (more precise)
+                    url = f"{supabase_url}/rest/v1/{USER_PORTFOLIO_TABLE}?user_id=eq.{user_id}&trade_id=eq.{trade_id}"
+                    # Also add symbol filter as extra safety via or? But primary is user_id+trade_id
+                else:
+                    norm = normalize_ticker(ticker)
+                    url = f"{supabase_url}/rest/v1/{USER_PORTFOLIO_TABLE}?user_id=eq.{user_id}&symbol=eq.{norm}"
+                resp = requests.patch(url, json={"status": target_status}, headers=headers, timeout=10)  # type: ignore
+                print(f"[LEAVE_TRADE] PATCH {url} status={target_status} -> {resp.status_code} {resp.text[:300]}")
+                if resp.status_code in (200, 204):
+                    # Verify at least one row affected (if representation, check body)
+                    try:
+                        if resp.text and "CLOSED" in resp.text or "EXITED" in resp.text:
+                            success = True
+                        else:
+                            # 204 no content is also success
+                            success = True
+                    except:
+                        success = True
+                    if success:
+                        break
+                elif resp.status_code == 400 and ("PGRST" in (resp.text or "") or "CHECK" in (resp.text or "")):
+                    # CHECK constraint violation (e.g., CLOSED not allowed, try next)
+                    print(f"[LEAVE_TRADE] CHECK violation for {target_status}, trying next")
+                    continue
+                else:
+                    # Other error, try next status
+                    body = (resp.text or "")[:200]
+                    if 400 <= resp.status_code < 500:
+                        logger.warning("[LEAVE_TRADE][4xx] PATCH %s %s", resp.status_code, body)
+                    continue
+            except Exception as exc:
+                logger.warning("[LEAVE_TRADE] PATCH failed for %s: %s", target_status, exc)
+                continue
+        if not success:
+            # Final fallback: try updating by symbol bare variant
+            try:
+                norm_bare = normalize_ticker(ticker).replace(".CA", "")
+                headers = {"apikey": supabase_key, "Authorization": f"Bearer {supabase_key}", "Content-Type": "application/json", "Prefer": "return=representation"}
+                url2 = f"{supabase_url}/rest/v1/{USER_PORTFOLIO_TABLE}?user_id=eq.{user_id}&symbol=eq.{norm_bare}"
+                resp2 = requests.patch(url2, json={"status": "EXITED"}, headers=headers, timeout=10)  # type: ignore
+                print(f"[LEAVE_TRADE] Fallback PATCH bare {url2} -> {resp2.status_code}")
+                if resp2.status_code in (200, 204):
+                    success = True
+            except:
+                pass
+        if success:
+            msg = "🔴 تم إغلاق الصفقة وإزالتها من محفظتك النشطة."
+            try:
+                _answer_callback(callback_query_id, bot_token, msg, show_alert=True)
+            except:
+                pass
+            # Also send private DM confirmation
+            try:
+                if requests and bot_token and user_id:
+                    dm_payload = {"chat_id": user_id, "text": msg, "parse_mode": "HTML"}
+                    resp_dm = requests.post(TELEGRAM_SEND_URL.format(token=bot_token), json=dm_payload, timeout=10)
+                    print(f"[LEAVE_TRADE] Confirmation DM to {user_id} -> {resp_dm.status_code}")
+            except Exception as dm_exc:
+                logger.warning("[LEAVE_TRADE] confirmation DM failed: %s", dm_exc)
+            logger.info("[LEAVE_TRADE] user=%s ticker=%s trade_id=%s -> CLOSED success", user_id, ticker, trade_id)
+            return True, "closed"
+        else:
+            # Not found or failed
+            msg = "⚠️ لم يتم العثور على الصفقة في محفظتك."
+            try:
+                _answer_callback(callback_query_id, bot_token, msg, show_alert=True)
+            except:
+                pass
+            logger.info("[LEAVE_TRADE] user=%s ticker=%s trade_id=%s not found or update failed", user_id, ticker, trade_id)
+            return True, "not-found"
+
+    # Live signal updates propagation to tracking users
+    def push_live_update_to_subscribers(
+        supabase_url: str,
+        supabase_key: str,
+        trade_id: int,
+        symbol: str,
+        update_text: str,
+        bot_token: str,
+    ) -> int:
+        """Push broadcast update (Trailing SL / Target hit) to all users tracking trade_id. Returns delivered count. Never raises."""
+        if not supabase_url or not supabase_key or not bot_token or not trade_id:
+            print(f"[PUSH_UPDATE] Skipped missing config trade_id={trade_id}")
+            return 0
+        try:
+            # Query user_portfolio for trade_id where status=TRACKING
+            headers = {"apikey": supabase_key, "Authorization": f"Bearer {supabase_key}", "Content-Type": "application/json"}
+            # Try by trade_id; fallback to symbol if trade_id not matching
+            candidates: List[str] = []
+            # Primary: by trade_id
+            try:
+                url = f"{supabase_url}/rest/v1/{USER_PORTFOLIO_TABLE}?trade_id=eq.{int(trade_id)}&status=eq.TRACKING&select=user_id"
+                resp = requests.get(url, headers=headers, timeout=10)
+                if resp.status_code == 200:
+                    rows = resp.json()
+                    if isinstance(rows, list):
+                        for r in rows:
+                            if isinstance(r, dict) and r.get("user_id"):
+                                candidates.append(str(r.get("user_id")))
+                        print(f"[PUSH_UPDATE] Found {len(candidates)} subscribers for trade_id={trade_id}")
+                    else:
+                        print(f"[PUSH_UPDATE] No rows for trade_id={trade_id}")
+                else:
+                    print(f"[PUSH_UPDATE] GET trade_id failed {resp.status_code} {resp.text[:200]}")
+            except Exception as e:
+                print(f"[PUSH_UPDATE] GET by trade_id error: {e}")
+            # Fallback by symbol if trade_id gave 0 results
+            if not candidates and symbol:
+                try:
+                    norm = normalize_ticker(symbol)
+                    url2 = f"{supabase_url}/rest/v1/{USER_PORTFOLIO_TABLE}?symbol=eq.{norm}&status=eq.TRACKING&select=user_id"
+                    resp2 = requests.get(url2, headers=headers, timeout=10)
+                    if resp2.status_code == 200:
+                        rows2 = resp2.json()
+                        if isinstance(rows2, list):
+                            for r in rows2:
+                                if isinstance(r, dict) and r.get("user_id"):
+                                    uid = str(r.get("user_id"))
+                                    if uid not in candidates:
+                                        candidates.append(uid)
+                            print(f"[PUSH_UPDATE] Fallback symbol {norm} found {len(candidates)} subscribers")
+                except Exception as e2:
+                    print(f"[PUSH_UPDATE] fallback symbol error: {e2}")
+            if not candidates:
+                logger.info("[PUSH_UPDATE] No subscribers for trade %s id=%s", symbol, trade_id)
+                return 0
+            delivered = 0
+            for uid in candidates:
+                try:
+                    payload = {"chat_id": uid, "text": update_text, "parse_mode": "HTML"}
+                    r = requests.post(TELEGRAM_SEND_URL.format(token=bot_token), json=payload, timeout=10)
+                    if r.status_code == 200:
+                        delivered += 1
+                        print(f"[PUSH_UPDATE] Delivered to {uid} -> 200")
+                    else:
+                        print(f"[PUSH_UPDATE] Failed to {uid} -> {r.status_code} {r.text[:200]}")
+                except Exception as send_exc:
+                    print(f"[PUSH_UPDATE] send error to {uid}: {send_exc}")
+            logger.info("[PUSH_UPDATE] trade_id=%s symbol=%s delivered %d/%d", trade_id, symbol, delivered, len(candidates))
+            return delivered
+        except Exception as exc:
+            logger.warning("[PUSH_UPDATE] failed for trade_id=%s: %s", trade_id, exc)
+            return 0
 
     def send_private_dm(bot_token: str, chat_id: str, text: str) -> bool:
         """Deliver an HTML card to one private chat. Never raises.
@@ -993,6 +1573,65 @@ try:
                             request.status_code = 200
                             return "OK"
                     except Exception:
+                        pass
+                    return {"statusCode": 200, "body": "OK"}
+
+                # === DM Inline Button Handlers: portfolio_status & leave_trade ===
+                if data.startswith("portfolio_status:"):
+                    handled_ps, detail_ps = False, "not-executed"
+                    try:
+                        handled_ps, detail_ps = handle_portfolio_status(
+                            query=query,
+                            data=data,
+                            bot_token=bot_token,
+                            supabase_url=supabase_url,
+                            supabase_key=supabase_key,
+                        )
+                    except Exception as exc:
+                        print(f"[WEBHOOK][PORTFOLIO_STATUS][ERROR] {exc}")
+                        logger.error("[WEBHOOK][PORTFOLIO_STATUS] crashed: %s", exc, exc_info=True)
+                        if not _immediate_done and bot_token and callback_id:
+                            try:
+                                _answer_callback(str(callback_id), bot_token, "⚠️ حدث خطأ - حاول مرة أخرى")
+                            except:
+                                pass
+                        detail_ps = f"error:{exc}"
+                    print(f"[WEBHOOK][PORTFOLIO_STATUS] handled={handled_ps} detail={detail_ps}")
+                    logger.info("[WEBHOOK][PORTFOLIO_STATUS] handled=%s detail=%s", handled_ps, detail_ps)
+                    try:
+                        if hasattr(request, "status_code"):
+                            request.status_code = 200
+                            return "OK"
+                    except:
+                        pass
+                    return {"statusCode": 200, "body": "OK"}
+
+                if data.startswith("leave_trade:"):
+                    handled_lt, detail_lt = False, "not-executed"
+                    try:
+                        handled_lt, detail_lt = handle_leave_trade(
+                            query=query,
+                            data=data,
+                            bot_token=bot_token,
+                            supabase_url=supabase_url,
+                            supabase_key=supabase_key,
+                        )
+                    except Exception as exc:
+                        print(f"[WEBHOOK][LEAVE_TRADE][ERROR] {exc}")
+                        logger.error("[WEBHOOK][LEAVE_TRADE] crashed: %s", exc, exc_info=True)
+                        if not _immediate_done and bot_token and callback_id:
+                            try:
+                                _answer_callback(str(callback_id), bot_token, "⚠️ حدث خطأ - حاول مرة أخرى")
+                            except:
+                                pass
+                        detail_lt = f"error:{exc}"
+                    print(f"[WEBHOOK][LEAVE_TRADE] handled={handled_lt} detail={detail_lt}")
+                    logger.info("[WEBHOOK][LEAVE_TRADE] handled=%s detail=%s", handled_lt, detail_lt)
+                    try:
+                        if hasattr(request, "status_code"):
+                            request.status_code = 200
+                            return "OK"
+                    except:
                         pass
                     return {"statusCode": 200, "body": "OK"}
 

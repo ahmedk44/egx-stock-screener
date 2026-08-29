@@ -243,3 +243,101 @@ def portfolio_users() -> List[str]:
     except requests.exceptions.RequestException as exc:
         logger.error("[SYNC] portfolio_users error: %s", exc)
         return []
+
+
+def broadcast_trade_update(trade_id: int, symbol: str, update_text: str) -> int:
+    """Push live update (Trailing SL / Target hit) to all users tracking trade_id.
+
+    Queries user_portfolio for trade_id and sends Telegram DM to each tracking user.
+    Used by scanner daemon after broadcasting channel update. Returns delivered count. Never raises.
+    """
+    cfg = _cfg()
+    if cfg is None:
+        logger.warning("[SYNC][ENV AUDIT] Supabase not configured - broadcast_trade_update skipped")
+        return 0
+    if not trade_id:
+        logger.warning("[SYNC] broadcast_trade_update missing trade_id")
+        return 0
+    token = (os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
+    if not token:
+        logger.warning("[SYNC] TELEGRAM_BOT_TOKEN missing - cannot push updates")
+        return 0
+    url, _ = cfg
+    # Resolve subscribers (prefer trade_id, fallback to symbol)
+    subscribers = list_subscribers(int(trade_id))
+    if not subscribers and symbol:
+        try:
+            # Fallback by symbol (normalize variants)
+            import egx_quant.utils.supabase_sync as _self  # avoid circular
+            # Direct query by symbol
+            headers = _headers(prefer="return=minimal")
+            # Try normalized symbol
+            sym_norm = str(symbol).strip().upper()
+            if not sym_norm.endswith(".CA"):
+                sym_norm = f"{sym_norm}.CA"
+            resp = requests.get(
+                f"{url}/rest/v1/{USER_PORTFOLIO_TABLE}?symbol=eq.{sym_norm}&status=eq.TRACKING&select=user_id",
+                headers=headers,
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                rows = resp.json() or []
+                subscribers = sorted({str(r["user_id"]) for r in rows if r.get("user_id")})
+        except Exception:
+            pass
+    if not subscribers:
+        logger.info("[SYNC] broadcast_trade_update no subscribers for trade_id=%s symbol=%s", trade_id, symbol)
+        return 0
+    delivered = 0
+    for uid in subscribers:
+        try:
+            tg_url = f"https://api.telegram.org/bot{token}/sendMessage"
+            payload = {"chat_id": uid, "text": update_text, "parse_mode": "HTML"}
+            r = requests.post(tg_url, json=payload, timeout=10)
+            if r.status_code == 200:
+                delivered += 1
+                logger.info("[SYNC][PUSH] Delivered update to %s for trade %s", uid, trade_id)
+            else:
+                _log_http_status(f"broadcast to {uid}", r)
+        except Exception as exc:
+            logger.warning("[SYNC] broadcast to %s failed: %s", uid, exc)
+    logger.info("[SYNC] broadcast_trade_update trade_id=%s delivered %d/%d", trade_id, delivered, len(subscribers))
+    return delivered
+
+
+def notify_trailing_sl_update(trade_id: int, symbol: str, new_sl: float, current_price: float) -> int:
+    """Convenience: format trailing SL update and push to subscribers."""
+    try:
+        text = (
+            f"📈 <b>تحديث وقف الخسارة المتحرك</b>\n"
+            f"------------------------------------\n"
+            f"🔹 <b>السهم:</b> {symbol}\n"
+            f"💵 <b>السعر الحالي:</b> {float(current_price):.2f} EGP\n"
+            f"🔴 <b>وقف الخسارة الجديد:</b> {float(new_sl):.2f} EGP\n"
+            f"------------------------------------\n"
+            f"ℹ️ تم رفع وقف الخسارة لحماية الأرباح."
+        )
+        return broadcast_trade_update(int(trade_id), str(symbol), text)
+    except Exception as exc:
+        logger.warning("[SYNC] notify_trailing_sl_update failed: %s", exc)
+        return 0
+
+
+def notify_target_hit(trade_id: int, symbol: str, target_level: int, target_price: float, current_price: float) -> int:
+    """Convenience: format target-hit update and push to subscribers."""
+    try:
+        medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+        medal = medals.get(int(target_level), "🎯")
+        text = (
+            f"{medal} <b>تحقق الهدف {target_level}</b>\n"
+            f"------------------------------------\n"
+            f"🔹 <b>السهم:</b> {symbol}\n"
+            f"🎯 <b>الهدف {target_level}:</b> {float(target_price):.2f} EGP\n"
+            f"💵 <b>السعر الحالي:</b> {float(current_price):.2f} EGP\n"
+            f"------------------------------------\n"
+            f"✅ تهانينا! تم تحقيق الهدف."
+        )
+        return broadcast_trade_update(int(trade_id), str(symbol), text)
+    except Exception as exc:
+        logger.warning("[SYNC] notify_target_hit failed: %s", exc)
+        return 0
