@@ -943,37 +943,80 @@ class handler(BaseHTTPRequestHandler):
         supa_diag = {}
         try:
             # Check env
-            supa_url_check, supa_key_check = _get_supabase_config()  # type: ignore
+            try:
+                supa_url_check, supa_key_check = _get_supabase_config()  # type: ignore
+            except Exception as ge:
+                supa_url_check, supa_key_check = "", ""
+                print(f"[WEBHOOK][POST][DIAG] get_supabase_config failed: {ge}")
+                supa_diag["config_error"] = str(ge)
             supa_diag["supabase_url_present"] = bool(supa_url_check)
             supa_diag["supabase_key_present"] = bool(supa_key_check)
-            print(f"[WEBHOOK][POST][DIAG] Supabase env present url={bool(supa_url_check)} key={bool(supa_key_check)}")
-            # If body was join_trade, verify DB row was written
+            supa_diag["requests_available"] = bool(requests)
+            print(f"[WEBHOOK][POST][DIAG] Supabase env present url={bool(supa_url_check)} key={bool(supa_key_check)} requests={bool(requests)}")
+            print(f"[WEBHOOK][POST][DIAG] Body type={type(body)} has_callback={bool(isinstance(body, dict) and body.get('callback_query'))}")
+            # If body was join_trade, verify DB row was written and test direct insert
             if isinstance(body, dict) and body.get("callback_query"):
                 try:
                     cq = body["callback_query"]
                     data = str(cq.get("data",""))
-                    parsed = parse_join_callback(data)  # type: ignore
+                    print(f"[WEBHOOK][POST][DIAG] callback data={data}")
+                    try:
+                        parsed = parse_join_callback(data)  # type: ignore
+                        print(f"[WEBHOOK][POST][DIAG] parsed={parsed}")
+                    except Exception as pe:
+                        parsed = None
+                        print(f"[WEBHOOK][POST][DIAG] parse failed: {pe}")
+                        supa_diag["parse_error"] = str(pe)
                     if parsed:
                         ticker, trade_id = parsed
                         from_user = cq.get("from",{})
                         uid = str(from_user.get("id",""))
-                        print(f"[WEBHOOK][POST][DIAG] Verifying DB insertion for user={uid} ticker={ticker}")
+                        print(f"[WEBHOOK][POST][DIAG] Verifying DB insertion for user={uid} ticker={ticker} trade_id={trade_id}")
                         if supa_url_check and supa_key_check and requests:
                             # Query user_portfolio for this user+ticker
                             try:
                                 q_url = f"{supa_url_check}/rest/v1/user_portfolio?user_id=eq.{uid}&symbol=eq.{ticker}&select=*"
                                 q_headers = {"apikey": supa_key_check, "Authorization": f"Bearer {supa_key_check}", "Content-Type": "application/json"}
+                                print(f"[SUPABASE][VERIFY] GET {q_url}")
                                 q_resp = requests.get(q_url, headers=q_headers, timeout=5)
                                 supa_diag["verify_query_status"] = q_resp.status_code
-                                supa_diag["verify_query_body"] = q_resp.text[:500]
-                                print(f"[SUPABASE][VERIFY] Query after upsert code={q_resp.status_code} body={q_resp.text[:500]}")
+                                supa_diag["verify_query_body"] = q_resp.text[:800]
+                                print(f"[SUPABASE][VERIFY] Query after upsert code={q_resp.status_code} body={q_resp.text[:800]}")
                             except Exception as ve:
                                 supa_diag["verify_error"] = str(ve)
                                 print(f"[SUPABASE][VERIFY][ERROR] {ve}")
+                            # Also try direct test insert to see if Vercel can write at all
+                            try:
+                                test_payload = {"user_id": uid, "symbol": ticker, "trade_id": int(trade_id) if trade_id else 0, "status": "TRACKING", "joined_at": datetime.now(timezone.utc).isoformat()}
+                                test_url = f"{supa_url_check}/rest/v1/user_portfolio?on_conflict=user_id,symbol"
+                                test_headers = {"apikey": supa_key_check, "Authorization": f"Bearer {supa_key_check}", "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates,return=representation"}
+                                print(f"[SUPABASE][DIRECT] POST test insert payload={test_payload}")
+                                test_resp = requests.post(test_url, headers=test_headers, json=test_payload, timeout=5)
+                                supa_diag["direct_insert_status"] = test_resp.status_code
+                                supa_diag["direct_insert_body"] = test_resp.text[:800]
+                                print(f"[SUPABASE][DIRECT] POST code={test_resp.status_code} body={test_resp.text[:800]}")
+                            except Exception as de:
+                                supa_diag["direct_error"] = str(de)
+                                print(f"[SUPABASE][DIRECT][ERROR] {de}")
+                        else:
+                            print(f"[WEBHOOK][POST][DIAG] Skipping verify - missing env or requests")
+                            supa_diag["skip_reason"] = f"url={bool(supa_url_check)} key={bool(supa_key_check)} requests={bool(requests)}"
+                    else:
+                        print(f"[WEBHOOK][POST][DIAG] Parsed is None, not verifying")
+                        supa_diag["parsed"] = str(parsed)
                 except Exception as ve:
-                    print(f"[WEBHOOK][POST][DIAG][ERROR] {ve}")
+                    print(f"[WEBHOOK][POST][DIAG][ERROR] inner {ve}")
+                    import traceback
+                    traceback.print_exc()
+                    supa_diag["inner_error"] = str(ve)
+            else:
+                print(f"[WEBHOOK][POST][DIAG] No callback_query in body, not verifying")
+                supa_diag["no_callback"] = True
         except Exception as de:
-            print(f"[WEBHOOK][POST][DIAG][ERROR] {de}")
+            print(f"[WEBHOOK][POST][DIAG][ERROR] outer {de}")
+            import traceback
+            traceback.print_exc()
+            supa_diag["outer_error"] = str(de)
 
         try:
             self.send_response(200)
