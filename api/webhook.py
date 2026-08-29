@@ -1,6 +1,7 @@
 import json
 import os
 import logging
+import threading
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 try:
@@ -829,22 +830,72 @@ class handler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-type", "application/json")
             self.end_headers()
-            self.wfile.write(json.dumps({"statusCode": 200, "body": "OK - wrapped"}).encode())
+            self.wfile.write(json.dumps({"statusCode": 200, "body": "OK"}).encode())
         except Exception:
             pass
     def do_POST(self):
+        body = {}
         try:
             length = int(self.headers.get("Content-Length", 0) or 0)
-            if length:
-                self.rfile.read(length)
+            raw = self.rfile.read(length) if length else b""
+            if raw:
+                try:
+                    body = json.loads(raw.decode("utf-8"))
+                except Exception:
+                    body = {}
         except Exception:
-            pass
+            body = {}
+        # Immediate 200
         try:
             self.send_response(200)
             self.send_header("Content-type", "application/json")
             self.end_headers()
-            self.wfile.write(b'{"statusCode":200,"body":"OK - wrapped"}')
+            self.wfile.write(json.dumps({"statusCode": 200, "body": "OK"}).encode())
         except Exception:
             pass
+        # Background processing of Telegram/Supabase after response
+        try:
+            # Build mock request for _handler_impl
+            class _Req:
+                pass
+            req = _Req()
+            req.method = "POST"
+            req.body = body
+            req.headers = dict(self.headers)
+            req.get_json = lambda *a, **k: body
+            req.json = lambda: body
+            # Try to find _py_handler (may be inside try block)
+            _target = None
+            try:
+                _target = _py_handler  # type: ignore
+            except NameError:
+                try:
+                    _target = _handler_impl  # type: ignore
+                except NameError:
+                    _target = None
+            if _target:
+                # Run in background thread to avoid blocking response
+                try:
+                    t = threading.Thread(target=_target, args=(req,), daemon=True)
+                    t.start()
+                except Exception:
+                    # Fallback to direct call if threading fails
+                    try:
+                        _target(req)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        return
     def log_message(self, format, *args):
         return
+
+# Keep aliases for local imports
+try:
+    py_handler = _py_handler  # type: ignore
+except NameError:
+    py_handler = None
+try:
+    Handler = handler
+except NameError:
+    pass
