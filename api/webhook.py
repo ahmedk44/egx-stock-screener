@@ -2020,8 +2020,37 @@ try:
                         import traceback; traceback.print_exc()
                 else:
                     print(f"[TELEGRAM] Skipping answerCallbackQuery missing token/callback_id/requests (token={bool(bot_token)}, id={bool(callback_id)})")
-            else:
-                print("[WEBHOOK] No callback_query in update")
+                # === SLASH COMMANDS: /portfolio, /close, /update ===
+                elif isinstance(update, dict) and update.get("message"):
+                    message = update["message"]
+                    if isinstance(message, dict) and message.get("text", "").strip().startswith("/"):
+                        try:
+                            from egx_quant.admin.commands import handle_slash_command  # type: ignore
+                            text = str(message.get("text", ""))
+                            from_user = message.get("from") or {}
+                            chat_id = str(message.get("chat", {}).get("id", ""))
+                            success, response_text = handle_slash_command(text, from_user, bot_token)
+                            if response_text and bot_token and requests:
+                                try:
+                                    requests.post(
+                                        TELEGRAM_SEND_URL.format(token=bot_token),
+                                        json={"chat_id": chat_id, "text": response_text, "parse_mode": "HTML"},
+                                        timeout=10,
+                                    )
+                                    print(f"[SLASH] Command {text.split()[0]} response sent to {chat_id}")
+                                except Exception as _se:
+                                    print(f"[SLASH] Send failed: {_se}")
+                        except Exception as _sc:
+                            print(f"[SLASH] Command handler error: {_sc}")
+                    try:
+                        if hasattr(request, "status_code"):
+                            request.status_code = 200
+                            return "OK"
+                    except Exception:
+                        pass
+                    return {"statusCode": 200, "body": "OK"}
+                else:
+                    print("[WEBHOOK] No callback_query in update")
         except Exception as e:
             print(f"[WEBHOOK ERROR] Top-level handler error: {e}")
             logger.warning(f"Webhook handler top-level error: {e}")
