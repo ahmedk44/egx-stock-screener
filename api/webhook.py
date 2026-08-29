@@ -875,38 +875,19 @@ class handler(BaseHTTPRequestHandler):
         return
 
     def do_POST(self):
-        # Immediate 200 - read body, send response, then process in background
-        # This ensures Vercel returns 200 within <100ms even if Supabase/Telegram are slow
-        body = {}
+        # Immediate 200 - no business logic for now (diagnostic)
+        # If this returns 200, then helper imports are OK and _py_handler is the culprit
         try:
             length = int(self.headers.get("Content-Length", 0) or 0)
-            raw = self.rfile.read(length) if length else b""
-            if raw:
-                try:
-                    body = json.loads(raw.decode("utf-8"))
-                except Exception:
-                    body = {}
+            if length:
+                self.rfile.read(length)
         except Exception:
-            body = {}
-        # Send 200 immediately
+            pass
         try:
             self.send_response(200)
             self.send_header("Content-type", "application/json")
             self.end_headers()
-            self.wfile.write(json.dumps({"statusCode": 200, "body": "OK"}).encode())
-        except Exception:
-            pass
-        # Process Telegram/Supabase after response (non-blocking for HTTP)
-        try:
-            class _Req:
-                pass
-            req = _Req()
-            req.method = "POST"
-            req.body = body
-            req.headers = dict(self.headers)
-            req.get_json = lambda *a, **k: body
-            req.json = lambda: body
-            _py_handler(req)
+            self.wfile.write(json.dumps({"statusCode": 200, "body": "OK - no logic"}).encode())
         except Exception:
             pass
         return
