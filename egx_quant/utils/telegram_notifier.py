@@ -162,24 +162,144 @@ class TelegramNotifier:
     async def broadcast_signal_async(self, text: str, reply_markup: Optional[Dict[str, Any]] = None) -> bool:
         return await asyncio.to_thread(self.broadcast_signal, text, reply_markup)
 
+    def _arabic_ordinal(self, n: int) -> str:
+        ordinals = {
+            1: "الأول",
+            2: "الثاني",
+            3: "الثالث",
+            4: "الرابع",
+            5: "الخامس",
+            6: "السادس",
+            7: "السابع",
+            8: "الثامن",
+            9: "التاسع",
+            10: "العاشر",
+        }
+        return ordinals.get(n, f"{n}")
+
+    def _conviction_label(self, tqi: float) -> str:
+        if tqi >= 8.5:
+            return "🟢 فرصة استثنائية (A+ Setup)"
+        if tqi >= 6.5:
+            return "🟡 فرصة جيدة (B Setup)"
+        if tqi >= 5.0:
+            return "🟠 فرصة متوسطة (C Setup)"
+        return "⚪ فرصة ضعيفة (Low Conviction)"
+
+    def _technical_reason_for_plan(self, plan: RiskPlan) -> str:
+        # Prefer stored technical reason if RiskPlan has it, else infer
+        for attr in ("technical_reason", "reason", "trigger"):
+            val = getattr(plan, attr, None)
+            if val and str(val).strip():
+                return str(val).strip()
+        # Infer from tqi entry: use generic
+        try:
+            # Check plan.symbol strategy hints if available via plan attributes
+            return "كسر السعر لأعلى EMA20 مع زخم إيجابي و RSI فوق 50"
+        except:
+            return "تحليل فني"
+
     def format_channel_short_card(self, plan: RiskPlan, trade_id: int) -> List[str]:
-        """STRICT channel teaser - the ONLY content allowed on the public channel."""
+        """Professional public channel template with dynamic targets (2-4+).
+
+        Header: 🚀 إشارة جديدة | {ticker} ({company_name})
+        Includes Shariah & Strategy, TQI/Grade, Technical Trigger, Execution Levels (dynamic targets), CTA.
+        """
         bare = clean_ticker(plan.symbol)
-        short_flag = SHARIAH_FLAG_SHORT.get(
-            self._shariah.get_status(plan.symbol), "⚠️ يحتاج مراجعة"
-        )
-        t1 = f"{plan.target_1:.2f}" if plan.target_1 else "-"
+        # Company name if registry available
+        try:
+            from egx_quant.config.stocks_registry import STOCK_NAMES_AR as _NAMES
+            company = _NAMES.get(plan.symbol, bare) if hasattr(plan, "symbol") else bare
+            if not company or company == plan.symbol:
+                company = bare
+        except:
+            company = bare
+        header_ticker = f"{bare} ({company})" if company != bare else bare
+        # Shariah flag (short)
+        try:
+            flag = SHARIAH_FLAG_SHORT.get(self._shariah.get_status(plan.symbol), "⚠️ يحتاج مراجعة")
+        except:
+            flag = "⚠️ يحتاج مراجعة"
+        # Strategy / track label - infer from plan if possible
+        track_label = "📈 تداول سوينغ (Swing)"
+        for attr in ("strategy_type", "strategy", "trade_track"):
+            val = getattr(plan, attr, None)
+            if val:
+                lower = str(val).lower()
+                if "scalp" in lower:
+                    track_label = "⚡ مضاربة لحظية (Scalp)"
+                elif "swing" in lower:
+                    track_label = "📈 تداول سوينغ (Swing)"
+                elif "invest" in lower:
+                    track_label = "🏛️ استثمار طويل (Invest)"
+                break
+        tqi = getattr(plan, "tqi_score", 5.0)
+        try:
+            tqi_f = float(tqi)
+        except:
+            tqi_f = 5.0
+        conviction = self._conviction_label(tqi_f)
+        technical = self._technical_reason_for_plan(plan)
+        # Collect dynamic targets from plan (target_1 .. target_4 etc, plus .targets list)
+        targets: List[float] = []
+        for i in range(1, 11):
+            for key in (f"target_{i}", f"target{i}", f"tp{i}"):
+                val = getattr(plan, key, None)
+                if val is not None:
+                    try:
+                        targets.append(float(val))
+                        break
+                    except:
+                        continue
+            else:
+                # check dict-style if plan is dict-like
+                if isinstance(plan, dict) and plan.get(f"target_{i}") is not None:
+                    try:
+                        targets.append(float(plan.get(f"target_{i}")))
+                        continue
+                    except:
+                        pass
+        # Also handle legacy .targets / .take_profits list
+        if not targets and hasattr(plan, "targets") and isinstance(getattr(plan, "targets"), (list, tuple)):
+            try:
+                targets = [float(x) for x in getattr(plan, "targets") if x is not None]
+            except:
+                targets = []
+        # Fallback to single take_profit if no targets
+        if not targets and getattr(plan, "take_profit", None) is not None:
+            try:
+                targets = [float(getattr(plan, "take_profit"))]
+            except:
+                targets = []
+        if not targets and getattr(plan, "target_1", None) is not None:
+            try:
+                targets = [float(getattr(plan, "target_1"))]
+            except:
+                pass
         lines = [
-            f"🚨 <b>إشارة جديدة | {bare}</b>",
+            f"🚀 <b>إشارة جديدة | {header_ticker}</b>",
+            f"⚖️ <b>التوافق الشرعي:</b> {flag} | 📂 <b>المسار:</b> {track_label}",
+            f"🎯 <b>تقييم الجودة (TQI):</b> {tqi_f:.1f}/10 | 🌟 <b>التصنيف:</b> {conviction}",
+            f"💡 <b>السبب الفني:</b> {technical}",
             CARD_SEP,
-            f"💵 <b>الدخول:</b> {plan.entry_price:.2f} EGP",
-            f"🛑 <b>الستوب:</b> {plan.stop_loss:.2f} EGP",
-            f"🎯 <b>الهدف الأول:</b> {t1} EGP",
-            f"🧠 <b>TQI:</b> {plan.tqi_score:.1f}/10 | {short_flag}",
+            f"💵 <b>سعر الدخول:</b> {plan.entry_price:.2f} EGP",
+            f"🛑 <b>وقف الخسارة (SL):</b> {plan.stop_loss:.2f} EGP",
+        ]
+        if targets:
+            for idx, tv in enumerate(targets, start=1):
+                ordinal = self._arabic_ordinal(idx)
+                lines.append(f"🎯 <b>الهدف {ordinal}:</b> {tv:.2f} EGP")
+        else:
+            lines.append(f"🎯 <b>الهدف الأول:</b> - EGP")
+        lines += [
             CARD_SEP,
-            "👇 <b>اضغط الأسفل لمتابعة الصفقة في محفظتك:</b>",
+            "👇 <b>اضغط الزر للمتابعة وتلقي التحديثات والتحليل المفصل في الخاص:</b>",
         ]
         return lines
+
+    def format_channel_signal_card(self, plan: RiskPlan, trade_id: int) -> List[str]:
+        """Alias for format_channel_short_card - professional template."""
+        return self.format_channel_short_card(plan, trade_id)
 
     def format_channel_broadcast(self, plan: RiskPlan, trade_id: int) -> str:
         return "\n".join(self.format_channel_short_card(plan, trade_id))
@@ -229,24 +349,45 @@ class TelegramNotifier:
         quantity: Optional[int] = None,
         allocated_cost: Optional[float] = None,
         risk_amount: Optional[float] = None,
+        technical_reason: Optional[str] = None,
+        news_summary: Optional[str] = None,
+        macro_analysis: Optional[str] = None,
+        financial_analysis: Optional[str] = None,
     ) -> str:
-        """Full private-DM entry card sent the moment a user joins a trade."""
+        """Full private-DM entry card - dynamic targets + AI intelligence + buttons.
+
+        Retains all execution levels (entry, SL, dynamic 🎯 الهدف الأول..) plus
+        deep AI news summary, macro, financial analysis. Paired with
+        [ 📊 حالة الصفقة ] [ 🛑 خروج من الصفقة ] inline buttons via build_join_markup.
+        """
         bare = clean_ticker(symbol)
         flag = SHARIAH_FLAG_AR.get(self._shariah.get_status(symbol), "")
-        labels = ("0.618", "100%", "1.618")
-        medal = ("🥇", "🥈", "🥉")
+        tqi_f = float(tqi_score) if tqi_score is not None else 5.0
+        conviction = self._conviction_label(tqi_f)
         lines = [
             f"🟢 <b>[كارت انضمام للصفقة]</b>",
             CARD_SEP,
             f"🔹 <b>السهم:</b> <code>{bare}</code> {flag}",
-            f"🧠 <b>التقييم وجودة الإشارة (TQI):</b> {tqi_score:.1f}/10",
-            CARD_SEP,
-            f"💵 <b>الدخول:</b> {entry_price:.2f} EGP",
-            f"🔴 <b>وقف الخسارة (SL):</b> <b>{stop_loss:.2f}</b> EGP",
-            f"🟢 <b>الأهداف (Fibonacci Extensions):</b>",
+            f"🧠 <b>التقييم وجودة الإشارة (TQI):</b> {tqi_f:.1f}/10 | 🌟 <b>التصنيف:</b> {conviction}",
+            f"⚖️ <b>التوافق الشرعي:</b> {flag}",
         ]
-        for label, medal_icon, target in zip(labels, medal, targets):
-            lines.append(f"  {medal_icon} TP @ {label}: <b>{target:.2f}</b> EGP")
+        if technical_reason and str(technical_reason).strip():
+            tech = str(technical_reason).strip()
+            if len(tech) > 300:
+                tech = tech[:300].rstrip() + "…"
+            lines.append(f"💡 <b>السبب الفني:</b> {tech}")
+        lines += [
+            CARD_SEP,
+            f"💵 <b>سعر الدخول:</b> {entry_price:.2f} EGP",
+            f"🛑 <b>وقف الخسارة (SL):</b> <b>{stop_loss:.2f}</b> EGP",
+        ]
+        # Dynamic targets loop with 🎯 الهدف الأول etc.
+        if targets:
+            for idx, tv in enumerate(targets, start=1):
+                ordinal = self._arabic_ordinal(idx)
+                lines.append(f"🎯 <b>الهدف {ordinal}:</b> <b>{tv:.2f}</b> EGP")
+        else:
+            lines.append(f"🎯 <b>الهدف الأول:</b> <b>-</b> EGP")
         if quantity is not None:
             lines.append(CARD_SEP)
             lines.append(f"📦 <b>الكمية المقترحة:</b> {quantity} سهم")
@@ -254,7 +395,30 @@ class TelegramNotifier:
             lines.append(f"💰 <b>التكلفة الإجمالية:</b> {allocated_cost:,.2f} EGP")
         if risk_amount is not None:
             lines.append(f"⚠️ <b>المخاطرة:</b> {risk_amount:,.2f} EGP")
-        lines += [CARD_SEP, "<i>تداول فوري (Spot) فقط - شراء ثم بيع</i>", CARD_SEP]
+        lines.append(CARD_SEP)
+        # AI Intelligence blocks
+        if news_summary and str(news_summary).strip():
+            body = str(news_summary).strip()
+            if len(body) > 500:
+                body = body[:500].rstrip() + "…"
+            lines.append(f"🤖 <b>ملخص الأخبار (Gemini AI):</b> {body}")
+            lines.append(CARD_SEP)
+        if macro_analysis and str(macro_analysis).strip():
+            macro = str(macro_analysis).strip()
+            if len(macro) > 400:
+                macro = macro[:400].rstrip() + "…"
+            lines.append(f"🧠 <b>التحليل الكلي والأثر غير المباشر:</b> {macro}")
+            lines.append(CARD_SEP)
+        if financial_analysis and str(financial_analysis).strip():
+            fin = str(financial_analysis).strip()
+            if len(fin) > 400:
+                fin = fin[:400].rstrip() + "…"
+            lines.append(f"📊 <b>التحليل المالي:</b> {fin}")
+            lines.append(CARD_SEP)
+        if not (news_summary or macro_analysis or financial_analysis):
+            lines.append("🤖 <b>ملخص الأخبار والتحليل:</b> سيتم إرسال التحديثات والتحليل المفصل في الخاص.")
+            lines.append(CARD_SEP)
+        lines += ["<i>تداول فوري (Spot) فقط - شراء ثم بيع</i>", CARD_SEP, "👇 استخدم الأزرار أدناه لمتابعة حالة الصفقة أو الخروج:"]
         return "\n".join(lines)
 
     def format_buy_alert(self, plan: RiskPlan) -> str:

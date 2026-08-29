@@ -202,6 +202,7 @@ class TradeSignal(BaseModel):
     target_1: Optional[float] = Field(default=None, gt=0, allow_inf_nan=False)
     target_2: Optional[float] = Field(default=None, gt=0, allow_inf_nan=False)
     target_3: Optional[float] = Field(default=None, gt=0, allow_inf_nan=False)
+    target_4: Optional[float] = Field(default=None, gt=0, allow_inf_nan=False)
     ote_in_zone: bool = False
     smc_ob_confluence: bool = False
     rsi_divergence: bool = False
@@ -229,6 +230,7 @@ class RiskPlan(BaseModel):
     target_1: Optional[float] = None
     target_2: Optional[float] = None
     target_3: Optional[float] = None
+    target_4: Optional[float] = None
     approved: bool = False
     rejection_reason_en: str = ""
     rejection_reason_ar: str = ""

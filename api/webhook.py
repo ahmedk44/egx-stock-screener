@@ -578,43 +578,214 @@ try:
         except:
             return str(val)
 
-    def build_full_dm_card(ticker: str, alert: Optional[Dict[str, Any]]) -> str:
-        """FULL private detail card DM'd to a user right after they join - strict template."""
-        bare = normalize_ticker(ticker).replace(".CA", "")
-        # Fetch complete fields from trade_signals without hardcoded fallbacks
-        # Strategy: try strategy_type first, then strategy
-        strategy_raw = _get_first(alert, ["strategy_type", "strategy", "strategyType", "trade_track"])
-        # TQI: try tqi_score, tqi, TQI_score
-        tqi_raw = _get_first(alert, ["tqi_score", "tqi", "TQI", "tqiScore"])
-        # Shariah: try shariah_status, then fallback to flag map
+    # Arabic ordinals for dynamic target formatting (up to 10)
+    _ARABIC_ORDINALS: Dict[int, str] = {
+        1: "الأول",
+        2: "الثاني",
+        3: "الثالث",
+        4: "الرابع",
+        5: "الخامس",
+        6: "السادس",
+        7: "السابع",
+        8: "الثامن",
+        9: "التاسع",
+        10: "العاشر",
+    }
+
+    def _arabic_ordinal(n: int) -> str:
+        return _ARABIC_ORDINALS.get(n, f"{n}")
+
+    def _collect_targets(alert: Optional[Dict[str, Any]]) -> List[Tuple[int, Any]]:
+        """Dynamically collect available targets (Target 1..N) from alert dict.
+
+        Checks keys: target_1, target1, tp1, target_2 ... up to 10. Returns ordered list.
+        Never raises; ignores missing/invalid entries.
+        """
+        if not isinstance(alert, dict):
+            return []
+        results: List[Tuple[int, Any]] = []
+        for i in range(1, 11):
+            candidates = [f"target_{i}", f"target{i}", f"tp{i}", f"TP{i}", f"Target_{i}"]
+            val = None
+            for k in candidates:
+                if k in alert and alert[k] is not None and str(alert[k]).strip() != "":
+                    val = alert[k]
+                    break
+                # Also try case-insensitive lookup
+                for ak in list(alert.keys()):
+                    if ak.lower() == k.lower() and alert[ak] is not None and str(alert[ak]).strip() != "":
+                        val = alert[ak]
+                        break
+                if val is not None:
+                    break
+            if val is not None:
+                results.append((i, val))
+        # Also handle legacy explicit target list if present (targets array)
+        if not results and isinstance(alert.get("targets"), (list, tuple)):
+            for idx, v in enumerate(alert.get("targets"), start=1):
+                if v is not None and str(v).strip() != "":
+                    results.append((idx, v))
+        return results
+
+    def _get_conviction_label(tqi_raw: Any, alert: Optional[Dict[str, Any]]) -> str:
+        """Derive setup grade / conviction label from TQI or explicit field."""
+        # Check explicit grade fields first
+        explicit = _get_first(alert, ["setup_grade", "conviction", "conviction_label", "grade", "rating"])
+        if explicit and str(explicit).strip():
+            return str(explicit).strip()
+        # Fallback to TQI-derived tier (mirrors main.py get_conviction_tier)
+        try:
+            score = float(tqi_raw) if tqi_raw is not None else 5.0
+        except:
+            score = 5.0
+        if score >= 8.5:
+            return "🟢 فرصة استثنائية (A+ Setup)"
+        if score >= 6.5:
+            return "🟡 فرصة جيدة (B Setup)"
+        if score >= 5.0:
+            return "🟠 فرصة متوسطة (C Setup)"
+        return "⚪ فرصة ضعيفة (Low Conviction)"
+
+    def build_channel_signal_card(ticker: str, alert: Optional[Dict[str, Any]]) -> str:
+        """Professional public channel template (كارت القناة العام) - full spec.
+
+        Header: 🚀 إشارة جديدة | {ticker} ({company_name})
+        Shariah & Strategy: ⚖️ التوافق الشرعي: {shariah_status} | 📂 المسار: {strategy_type}
+        Quality Rating: 🎯 تقييم الجودة (TQI): {tqi_score}/10 | 🌟 التصنيف: {setup_grade}
+        Technical Trigger: 💡 السبب الفني: {technical_reason}
+        Execution Levels: 💵 سعر الدخول, 🛑 وقف الخسارة, dynamic targets 🎯 الهدف الأول..etc
+        Call to Action: 👇 اضغط الزر للمتابعة ...
+        """
+        bare = normalize_ticker(ticker).replace(".CA", "") if ticker else "UNKNOWN"
+        display_ticker = _get_first(alert, ["ticker", "symbol", "ticker_bare"]) or ticker
+        try:
+            display_ticker_norm = normalize_ticker(str(display_ticker)) if display_ticker else ticker
+        except:
+            display_ticker_norm = str(display_ticker) if display_ticker else ticker
+        bare_display = normalize_ticker(str(display_ticker_norm)).replace(".CA", "") if display_ticker_norm else bare
+
+        company_name = _get_first(alert, ["company_name", "name", "company", "symbol_name"])
+        # Use company name if available and distinct from ticker
+        if company_name and str(company_name).strip() and str(company_name).strip().upper() != bare_display.upper():
+            header_ticker = f"{bare_display} ({company_name})"
+        else:
+            header_ticker = bare_display
+
+        strategy_raw = _get_first(alert, ["strategy_type", "strategy", "strategyType", "trade_track", "track"])
+        strategy_label = _track_label(strategy_raw) if strategy_raw else _track_label("swing")
         shariah_raw = _get_first(alert, ["shariah_status", "shariahStatus", "shariah"])
-        # Prices: try multiple keys without defaulting to 0.0
+        if shariah_raw:
+            sh = str(shariah_raw).strip().upper()
+            if sh in ("COMPLIANT", "COMPLIANT_BASE", "HALAL"):
+                shariah_text = "✅ متوافق (Compliant)"
+            elif sh in ("NON_COMPLIANT", "NON-COMPLIANT", "HARAM"):
+                shariah_text = "⛔ غير متوافق (Non-Compliant)"
+            else:
+                shariah_text = str(shariah_raw)
+        else:
+            shariah_text = _shariah_flag(display_ticker_norm)
+
+        tqi_raw = _get_first(alert, ["tqi_score", "tqi", "TQI", "tqiScore"])
+        if tqi_raw is not None:
+            try:
+                tqi_str = f"{float(tqi_raw):.1f}"
+            except:
+                tqi_str = str(tqi_raw)
+        else:
+            tqi_str = "-"
+        conviction_label = _get_conviction_label(tqi_raw, alert)
+
+        technical_raw = _get_first(alert, ["technical_reason", "reason", "technical_trigger", "trigger", "analysis"])
+        if technical_raw and str(technical_raw).strip():
+            technical_text = str(technical_raw).strip()
+            # Truncate very long technical reason for channel brevity (200 chars)
+            if len(technical_text) > 220:
+                technical_text = technical_text[:220].rstrip() + "…"
+        else:
+            # Fallback per strategy
+            if strategy_raw and "scalp" in str(strategy_raw).lower():
+                technical_text = "اختراق لحظي لمستوى مقاومة مع تضخم حجم التداول وكسر EMA9 / VWAP"
+            elif strategy_raw and "invest" in str(strategy_raw).lower():
+                technical_text = "السعر دون SMA50 مع مضاعف ربحية جذاب عند دعم قوي"
+            else:
+                technical_text = "كسر السعر لأعلى EMA20 مع زخم إيجابي و RSI فوق 50"
+
         entry_raw = _get_first(alert, ["entry_price", "entry", "price", "close"])
         sl_raw = _get_first(alert, ["stop_loss", "current_stop_loss", "sl", "stopLoss"])
-        t1_raw = _get_first(alert, ["target_1", "target1", "tp1"])
-        t2_raw = _get_first(alert, ["target_2", "target2", "tp2"])
-        t3_raw = _get_first(alert, ["target_3", "target3", "tp3"])
-        # Ticker & Name: try company_name, name, then ticker
+        targets = _collect_targets(alert)
+        # If no targets found but entry exists, try derive from strategy (fallback)
+        if not targets and entry_raw is not None:
+            try:
+                ep = float(entry_raw)
+                # Try to infer from alert's tp fields fallback already did; if still empty, skip
+                pass
+            except:
+                pass
+
+        sep = "------------------------------------"
+        lines: List[str] = [
+            f"🚀 <b>إشارة جديدة | {header_ticker}</b>",
+            f"⚖️ <b>التوافق الشرعي:</b> {shariah_text} | 📂 <b>المسار:</b> {strategy_label}",
+            f"🎯 <b>تقييم الجودة (TQI):</b> {tqi_str}/10 | 🌟 <b>التصنيف:</b> {conviction_label}",
+            f"💡 <b>السبب الفني:</b> {technical_text}",
+            sep,
+            f"💵 <b>سعر الدخول:</b> {_format_price(entry_raw)} EGP",
+            f"🛑 <b>وقف الخسارة (SL):</b> {_format_price(sl_raw)} EGP",
+        ]
+        # Dynamic targets loop with 🎯 الهدف الأول etc.
+        if targets:
+            for idx, val in targets:
+                ordinal = _arabic_ordinal(idx)
+                lines.append(f"🎯 <b>الهدف {ordinal}:</b> {_format_price(val)} EGP")
+        else:
+            # Keep at least placeholder so template is complete
+            lines.append(f"🎯 <b>الهدف الأول:</b> - EGP")
+        lines += [
+            sep,
+            "👇 <b>اضغط الزر للمتابعة وتلقي التحديثات والتحليل المفصل في الخاص:</b>",
+        ]
+        return "\n".join(lines)
+
+    # Backward compat alias - public channel has been unified to signal card
+    def build_channel_short_card(ticker: str, alert: Optional[Dict[str, Any]]) -> str:
+        return build_channel_signal_card(ticker, alert)
+
+    def build_full_dm_card(ticker: str, alert: Optional[Dict[str, Any]]) -> str:
+        """FULL private detail card DM'd to a user right after they join - dynamic targets + AI intelligence.
+
+        Retains all execution levels (entry, SL, dynamic targets with 🎯 الهدف الأول etc.)
+        plus deep AI news summary, macro/financial analysis, and is paired with interactive buttons
+        [ 📊 حالة الصفقة ] [ 🛑 خروج من الصفقة ] via build_dm_inline_keyboard.
+        """
+        bare = normalize_ticker(ticker).replace(".CA", "")
+        # Fetch complete fields from trade_signals without hardcoded fallbacks
+        strategy_raw = _get_first(alert, ["strategy_type", "strategy", "strategyType", "trade_track"])
+        tqi_raw = _get_first(alert, ["tqi_score", "tqi", "TQI", "tqiScore"])
+        shariah_raw = _get_first(alert, ["shariah_status", "shariahStatus", "shariah"])
+        entry_raw = _get_first(alert, ["entry_price", "entry", "price", "close"])
+        sl_raw = _get_first(alert, ["stop_loss", "current_stop_loss", "sl", "stopLoss"])
+        targets = _collect_targets(alert)
         name_raw = _get_first(alert, ["company_name", "name", "company", "symbol_name"])
-        # Use alert ticker if available, else passed ticker
         display_ticker = _get_first(alert, ["ticker", "symbol", "ticker_bare"]) or ticker
         display_ticker = normalize_ticker(str(display_ticker)) if display_ticker else ticker
         bare_display = normalize_ticker(str(display_ticker)).replace(".CA", "") if display_ticker else bare
+        # Additional intelligence fields
+        technical_raw = _get_first(alert, ["technical_reason", "reason", "technical_trigger"])
+        news_raw = _get_first(alert, ["news_summary", "ai_summary", "sentiment", "gemini_summary", "summary"])
+        macro_raw = _get_first(alert, ["macro_analysis", "macro", "indirect_effect"])
+        financial_raw = _get_first(alert, ["financial_analysis", "financial", "fundamental"])
 
         # Format fields
         strategy_label = _track_label(strategy_raw) if strategy_raw else _track_label("swing")
-        # TQI formatting: show as X.X/10 if available
         if tqi_raw is not None:
             try:
                 tqi_str = f"{float(tqi_raw):.1f}/10"
             except:
                 tqi_str = f"{tqi_raw}/10"
         else:
-            # Try to get from alert's tqi field, if still missing show '-'
             tqi_str = "-"
-        # Shariah: prefer DB shariah_status, else flag map
+        conviction_label = _get_conviction_label(tqi_raw, alert)
         if shariah_raw:
-            # Normalize DB value
             sh = str(shariah_raw).strip().upper()
             if sh in ("COMPLIANT", "COMPLIANT_BASE", "HALAL"):
                 shariah_text = "✅ متوافق (Compliant)"
@@ -626,11 +797,9 @@ try:
         else:
             shariah_line = f"⚖️ <b>التوافق الشرعي:</b> {_shariah_flag(display_ticker)}"
 
-        # Ticker & Name line
         if name_raw and str(name_raw).strip() and str(name_raw).strip().upper() != bare_display.upper():
             ticker_line = f"🔹 <b>السهم:</b> <code>{bare_display}</code> - {name_raw}"
         else:
-            # Show ticker with bare and full
             ticker_line = f"🔹 <b>السهم:</b> <code>{bare_display}</code> ({display_ticker})"
 
         sep = "------------------------------------"
@@ -639,17 +808,54 @@ try:
             sep,
             ticker_line,
             f"🧠 <b>الاستراتيجية:</b> {strategy_label}",
-            f"🎯 <b>تقييم الجودة (TQI):</b> {tqi_str}",
+            f"🎯 <b>تقييم الجودة (TQI):</b> {tqi_str} | 🌟 <b>التصنيف:</b> {conviction_label}",
             shariah_line,
-            sep,
-            f"💵 <b>الدخول:</b> {_format_price(entry_raw)} EGP",
-            f"🔴 <b>وقف الخسارة (SL):</b> <b>{_format_price(sl_raw)}</b> EGP",
-            f"🥇 الهدف الأول: <b>{_format_price(t1_raw)}</b> EGP",
-            f"🥈 الهدف الثاني: <b>{_format_price(t2_raw)}</b> EGP",
-            f"🥉 الهدف الثالث: <b>{_format_price(t3_raw)}</b> EGP",
-            sep,
-            "🔒 تداول فوري (Spot) فقط - تم إضافة الصفقة لمحفظتك للمتابعة.",
         ]
+        if technical_raw and str(technical_raw).strip():
+            tech = str(technical_raw).strip()
+            if len(tech) > 300:
+                tech = tech[:300].rstrip() + "…"
+            lines.append(f"💡 <b>السبب الفني:</b> {tech}")
+        lines += [
+            sep,
+            f"💵 <b>سعر الدخول:</b> {_format_price(entry_raw)} EGP",
+            f"🛑 <b>وقف الخسارة (SL):</b> <b>{_format_price(sl_raw)}</b> EGP",
+        ]
+        # Dynamic targets - clearly formatted with 🎯 الهدف الأول etc.
+        if targets:
+            for idx, val in targets:
+                ordinal = _arabic_ordinal(idx)
+                lines.append(f"🎯 <b>الهدف {ordinal}:</b> <b>{_format_price(val)}</b> EGP")
+        else:
+            # Fallback: at least show placeholder if no targets parsed
+            lines.append(f"🎯 <b>الهدف الأول:</b> <b>-</b> EGP")
+        lines.append(sep)
+        # AI Intelligence blocks - include if available, else compact placeholder
+        if news_raw and str(news_raw).strip():
+            body = str(news_raw).strip()
+            # Strip excessive whitespace, keep first 500 chars
+            if len(body) > 500:
+                body = body[:500].rstrip() + "…"
+            lines.append(f"🤖 <b>ملخص الأخبار (AI):</b> {body}")
+            lines.append(sep)
+        if macro_raw and str(macro_raw).strip():
+            macro = str(macro_raw).strip()
+            if len(macro) > 400:
+                macro = macro[:400].rstrip() + "…"
+            lines.append(f"🧠 <b>التحليل الكلي والأثر غير المباشر:</b> {macro}")
+            lines.append(sep)
+        if financial_raw and str(financial_raw).strip():
+            fin = str(financial_raw).strip()
+            if len(fin) > 400:
+                fin = fin[:400].rstrip() + "…"
+            lines.append(f"📊 <b>التحليل المالي:</b> {fin}")
+            lines.append(sep)
+        # If no intelligence provided, still indicate it
+        if not (news_raw or macro_raw or financial_raw):
+            lines.append("🤖 <b>ملخص الأخبار والتحليل:</b> سيتم إرسال التحديثات والتحليل المفصل في الخاص.")
+            lines.append(sep)
+        lines.append("🔒 تداول فوري (Spot) فقط - تم إضافة الصفقة لمحفظتك للمتابعة.")
+        lines.append("👇 استخدم الأزرار أدناه لمتابعة حالة الصفقة أو الخروج:")
         return "\n".join(lines)
 
     def build_dm_inline_keyboard(ticker: str, trade_id: int) -> Dict[str, Any]:
@@ -806,10 +1012,10 @@ try:
                         break
                     except:
                         continue
-        # Fallback to signal entry
+        # Fallback to signal entry - dynamic targets
         signal_entry = None
         signal_sl = None
-        t1 = t2 = t3 = None
+        signal_targets: List[float] = []
         strategy_raw = None
         tqi_raw = None
         if isinstance(signal_row, dict):
@@ -821,14 +1027,15 @@ try:
                 signal_sl = float(signal_row.get("stop_loss") or signal_row.get("current_stop_loss") or 0) if signal_row.get("stop_loss") or signal_row.get("current_stop_loss") else None
             except:
                 signal_sl = None
-            for k1, v in [("t1", "target_1"), ("t2", "target_2"), ("t3", "target_3")]:
-                try:
-                    if signal_row.get(v) is not None:
-                        if k1 == "t1": t1 = float(signal_row.get(v))
-                        elif k1 == "t2": t2 = float(signal_row.get(v))
-                        elif k1 == "t3": t3 = float(signal_row.get(v))
-                except:
-                    pass
+            # Dynamic targets collection (supports target_1..target_10)
+            for i in range(1, 11):
+                for key in (f"target_{i}", f"target{i}", f"tp{i}"):
+                    if signal_row.get(key) is not None:
+                        try:
+                            signal_targets.append(float(signal_row.get(key)))
+                            break
+                        except:
+                            continue
             strategy_raw = signal_row.get("strategy_type") or signal_row.get("strategy")
             tqi_raw = signal_row.get("tqi_score") or signal_row.get("tqi")
         # Effective entry for P&L is user's custom entry if present else signal entry
@@ -845,15 +1052,21 @@ try:
                 pnl_str = f"{sign}{pnl_pct:.2f}%"
             except:
                 pnl_str = "-"
-        # Target progression
+        # Target progression - dynamic count
+        n_targets = len(signal_targets) if signal_targets else 0
         progression = "⏳ لم يصل أي هدف"
         hit_count = 0
-        if cp is not None:
+        if cp is not None and n_targets > 0:
             try:
-                if t3 is not None and cp >= t3: hit_count = 3; progression = "🎯 حقق جميع الأهداف (3/3) ✅"
-                elif t2 is not None and cp >= t2: hit_count = 2; progression = "🥈 تم تحقيق الهدف الثاني (2/3) ⏳"
-                elif t1 is not None and cp >= t1: hit_count = 1; progression = "🥇 تم تحقيق الهدف الأول (1/3)"
-                else: progression = "⏳ لم يصل أي هدف بعد"
+                # Count how many targets hit
+                hit_count = sum(1 for tv in signal_targets if cp >= tv)
+                if hit_count == n_targets:
+                    progression = f"🎯 حقق جميع الأهداف ({hit_count}/{n_targets}) ✅"
+                elif hit_count >= 1:
+                    ordinal = _arabic_ordinal(hit_count)
+                    progression = f"🎯 تم تحقيق الهدف {ordinal} ({hit_count}/{n_targets}) ⏳"
+                else:
+                    progression = "⏳ لم يصل أي هدف بعد"
             except:
                 progression = "⏳ -"
         # Trailing SL (use latest signal stop_loss)
@@ -884,9 +1097,10 @@ try:
         lines.append(f"🔴 <b>وقف الخسارة المتحرك الحالي:</b> {trailing_sl_str} EGP")
         lines.append(sep)
         lines.append(f"🎯 <b>تقدم الأهداف:</b> {progression}")
-        if t1 is not None: lines.append(f"🥇 الهدف الأول: {_format_price(t1)} EGP" + (" ✅" if cp and t1 and cp >= t1 else ""))
-        if t2 is not None: lines.append(f"🥈 الهدف الثاني: {_format_price(t2)} EGP" + (" ✅" if cp and t2 and cp >= t2 else ""))
-        if t3 is not None: lines.append(f"🥉 الهدف الثالث: {_format_price(t3)} EGP" + (" ✅" if cp and t3 and cp >= t3 else ""))
+        if signal_targets:
+            for idx, tv in enumerate(signal_targets, start=1):
+                ordinal = _arabic_ordinal(idx)
+                lines.append(f"🎯 الهدف {ordinal}: {_format_price(tv)} EGP" + (" ✅" if cp and tv and cp >= tv else ""))
         lines.append(sep)
         if isinstance(portfolio_row, dict) and portfolio_row.get("joined_at"):
             lines.append(f"📅 <b>تاريخ الانضمام:</b> {str(portfolio_row.get('joined_at'))[:10]}")

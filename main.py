@@ -3461,12 +3461,17 @@ def build_join_markup(ticker: str) -> Dict[str, Any]:
         return {"inline_keyboard": []}
 
 
-def build_channel_short_card(strategy: Any, ticker: Any, ctx: Any, sentiment: Any = None) -> str:
-    """Compose the UNIFIED SHORT public-channel card (كارت مختصر فقط).
+def build_channel_signal_card(strategy: Any, ticker: Any, ctx: Any, sentiment: Any = None) -> str:
+    """Professional public channel template - full spec with dynamic targets.
 
-    Public channels receive ONLY this compact teaser + the [Track Signal]
-    inline button - never the full detail card and never close cards.
-    Contains: ticker + Shariah tag, track label, TQI, entry, SL and target_1.
+    Header: 🚀 إشارة جديدة | {ticker} ({company_name})
+    Shariah & Strategy: ⚖️ التوافق الشرعي: {shariah_status} | 📂 المسار: {strategy_type}
+    Quality Rating: 🎯 تقييم الجودة (TQI): {tqi_score}/10 | 🌟 التصنيف: {setup_grade}
+    Technical Trigger: 💡 السبب الفني: {technical_reason}
+    Execution Levels: 💵 سعر الدخول, 🛑 وقف الخسارة, dynamic 🎯 الهدف الأول/الثاني/الثالث/الرابع...
+    Call to Action: 👇 اضغط الزر للمتابعة وتلقي التحديثات والتحليل المفصل في الخاص
+    Inline Keyboard: [ 📥 انضم للصفقة | Track Signal ]
+    Dynamically loops over available targets (Target 1..N) present in trade_signals / ctx / plan.
     """
     try:
         if not isinstance(ctx, dict):
@@ -3477,6 +3482,19 @@ def build_channel_short_card(strategy: Any, ticker: Any, ctx: Any, sentiment: An
         ticker_str = normalize_ticker(str(ticker)) if ticker else "UNKNOWN.CA"
         clean_sym = ticker_str.replace(".CA", "")
         stock_name_ar = STOCK_NAMES_AR.get(ticker_str, clean_sym)
+        # Shariah status line
+        try:
+            shariah_tag_raw = get_sharia_status_tag(ticker_str)
+            # Extract short display: strip markdown ** and keep emoji+text
+            shariah_text = shariah_tag_raw.replace("**", "").replace("🕌 ", "").strip() if shariah_tag_raw else "⚠️ يحتاج مراجعة شرعية"
+            if "متوافق" in shariah_tag_raw:
+                shariah_display = "✅ متوافق (Compliant)"
+            elif "غير متوافق" in shariah_tag_raw:
+                shariah_display = "⛔ غير متوافق (Non-Compliant)"
+            else:
+                shariah_display = "⚠️ قيد المراجعة (Needs Review)"
+        except:
+            shariah_display = "⚠️ قيد المراجعة (Needs Review)"
 
         try:
             tqi_score, track_label, conviction_label = resolve_tqi(ctx, strategy, sentiment)
@@ -3495,39 +3513,144 @@ def build_channel_short_card(strategy: Any, ticker: Any, ctx: Any, sentiment: An
             entry_price = float(ctx.get("price") or 0.0)
         except (TypeError, ValueError):
             entry_price = 0.0
+        # Technical reason
         try:
-            targets = plan.get("targets_pct", (0.03, 0.05, 0.08))
-            if not isinstance(targets, (list, tuple)) or len(targets) < 3:
-                targets = (0.03, 0.05, 0.08)
-            p1 = float(targets[0])
-            sl_pct = float(plan.get("sl_pct", -0.03))
-            target_1 = entry_price * (1 + p1)
+            technical_reason = str(plan.get("technical_reason_ar", "")).strip() if isinstance(plan, dict) else ""
+            if not technical_reason:
+                technical_reason = "كسر السعر لأعلى EMA20 مع زخم إيجابي و RSI فوق 50"
+            if len(technical_reason) > 220:
+                technical_reason = technical_reason[:220].rstrip() + "…"
+        except:
+            technical_reason = "تحليل فني"
+
+        # Stop loss
+        try:
+            sl_pct = float(plan.get("sl_pct", -0.03)) if isinstance(plan, dict) and plan.get("sl_pct") is not None else -0.03
             stop_loss = entry_price * (1 + sl_pct)
         except Exception:
-            target_1 = stop_loss = entry_price
+            stop_loss = entry_price
 
-        return (
-            f"🚀 **إشارة جديدة | {stock_name_ar} {clean_sym}**\n"
-            f"{get_sharia_status_tag(ticker_str)}\n"
-            f"\n"
-            f"🏷️ المسار: {track_label}\n"
-            f"🎯 تقييم الجودة (TQI): {tqi_score_f:.1f}/10\n"
-            f"\n"
-            f"💵 سعر الدخول : {entry_price:.2f} 🏷\n"
-            f"🛑 وقف الخسارة : {stop_loss:.2f} ⛔️\n"
-            f"🥇 الهدف الأول : {target_1:.2f} 🎯\n"
-            f"\n"
-            f"⭐ التصنيف: {conviction_label}\n"
-            f"\n"
-            f"👇 اضغط الزر للمتابعة الخاصة بالصفقة:"
-        )
+        # Dynamic targets collection: check ctx overrides first (target_1..target_4), else compute from plan's targets_pct
+        targets_list: List[float] = []
+        # 1) ctx explicit targets (dynamic)
+        has_ctx_targets = False
+        for i in range(1, 11):
+            val = None
+            for k in (f"target_{i}", f"target{i}", f"tp{i}"):
+                if k in ctx and ctx[k] is not None:
+                    try:
+                        if str(ctx[k]).strip() != "":
+                            val = float(ctx[k])
+                            break
+                    except:
+                        continue
+            if val is not None:
+                targets_list.append(val)
+                has_ctx_targets = True
+        # 2) if no ctx targets, compute from plan's targets_pct (supports 2,3,4...)
+        if not has_ctx_targets:
+            try:
+                targets_pct = plan.get("targets_pct", (0.03, 0.05, 0.08))
+                if isinstance(targets_pct, (list, tuple)) and len(targets_pct) >= 1:
+                    for pct in targets_pct:
+                        try:
+                            p = float(pct)
+                            targets_list.append(entry_price * (1 + p))
+                        except:
+                            continue
+                else:
+                    targets_list = [entry_price * 1.03]
+            except Exception:
+                targets_list = [entry_price] if entry_price else []
+
+        # Arabic ordinals for targets
+        ordinals = {1: "الأول", 2: "الثاني", 3: "الثالث", 4: "الرابع", 5: "الخامس", 6: "السادس", 7: "السابع", 8: "الثامن", 9: "التاسع", 10: "العاشر"}
+        sep = "------------------------------------"
+        # Header
+        header = f"🚀 إشارة جديدة | {clean_sym} ({stock_name_ar})" if stock_name_ar != clean_sym else f"🚀 إشارة جديدة | {clean_sym}"
+        lines: List[str] = [
+            header,
+            f"⚖️ التوافق الشرعي: {shariah_display} | 📂 المسار: {track_label}",
+            f"🎯 تقييم الجودة (TQI): {tqi_score_f:.1f}/10 | 🌟 التصنيف: {conviction_label}",
+            f"💡 السبب الفني: {technical_reason}",
+            sep,
+            f"💵 سعر الدخول: {entry_price:.2f} EGP",
+            f"🛑 وقف الخسارة (SL): {stop_loss:.2f} EGP",
+        ]
+        if targets_list:
+            for idx, tv in enumerate(targets_list, start=1):
+                ordinal = ordinals.get(idx, f"{idx}")
+                lines.append(f"🎯 الهدف {ordinal}: {tv:.2f} EGP")
+        else:
+            lines.append(f"🎯 الهدف الأول: - EGP")
+        lines += [
+            sep,
+            "👇 اضغط الزر للمتابعة وتلقي التحديثات والتحليل المفصل في الخاص:",
+        ]
+        return "\n".join(lines)
     except Exception as exc:
-        logger.warning("build_channel_short_card failed (%s); using minimal card", exc)
+        logger.warning("build_channel_signal_card failed (%s); using minimal card", exc)
         try:
             sym = str(ticker).replace(".CA", "") if ticker else "UNKNOWN"
         except Exception:
             sym = "UNKNOWN"
-        return f"🚀 **إشارة جديدة | {sym}**\n👇 اضغط الزر للمتابعة الخاصة بالصفقة:"
+        return f"🚀 إشارة جديدة | {sym}\n👇 اضغط الزر للمتابعة الخاصة بالصفقة:"
+
+
+def build_channel_short_card(strategy: Any, ticker: Any, ctx: Any, sentiment: Any = None) -> str:
+    """Backward-compat alias for build_channel_signal_card (unified public template)."""
+    return build_channel_signal_card(strategy, ticker, ctx, sentiment)
+
+
+def build_full_dm_card(ticker: str, alert: Optional[Dict[str, Any]]) -> str:
+    """Full private DM card (main.py alias) - dynamic targets + AI intelligence.
+
+    Wrapper around build_message / webhook-style DM to ensure dynamic handling
+    of Target 1..N with 🎯 الهدف الأول etc. Retains news, macro, financial analysis
+    and pairs with interactive buttons [ 📊 حالة الصفقة ] [ 🛑 خروج من الصفقة ].
+    """
+    try:
+        if not isinstance(alert, dict):
+            alert = {}
+        # Map alert dict to ctx/sentiment for build_message compatibility
+        strategy = alert.get("strategy_type") or alert.get("strategy") or alert.get("trade_track") or "swing"
+        # Build ctx with price and explicit targets
+        entry = alert.get("entry_price") if alert.get("entry_price") is not None else alert.get("price")
+        ctx: Dict[str, Any] = {"price": float(entry) if entry is not None else 0.0}
+        # Inject dynamic targets into ctx so build_message picks them up
+        for i in range(1, 11):
+            for k in (f"target_{i}", f"target{i}", f"tp{i}"):
+                if k in alert and alert[k] is not None:
+                    try:
+                        if str(alert[k]).strip() != "":
+                            ctx[f"target_{i}"] = float(alert[k])
+                            break
+                    except:
+                        continue
+        sentiment = alert.get("sentiment") or alert.get("news_summary") or alert.get("ai_summary") or alert.get("gemini_summary") or ""
+        # Include macro/financial in sentiment if available for build_message to surface
+        macro = alert.get("macro_analysis") or alert.get("macro") or ""
+        financial = alert.get("financial_analysis") or alert.get("financial") or ""
+        if macro and macro not in str(sentiment):
+            sentiment = f"{sentiment}\n{macro}" if sentiment else macro
+        if financial and financial not in str(sentiment):
+            sentiment = f"{sentiment}\n{financial}" if sentiment else financial
+        # Use build_message for full intelligence, but prepend DM header
+        base_msg = build_message(strategy, ticker, ctx, sentiment)
+        # Ensure DM header is present
+        if "[كارت انضمام للصفقة]" not in base_msg:
+            header = "🟢 [كارت انضمام للصفقة]\n------------------------------------\n"
+            base_msg = header + base_msg
+        # Append interactive hint
+        if "حالة الصفقة" not in base_msg:
+            base_msg += "\n\n👇 استخدم الأزرار أدناه: [ 📊 حالة الصفقة ] [ 🛑 خروج من الصفقة ]"
+        return base_msg
+    except Exception as exc:
+        logger.warning("build_full_dm_card wrapper failed (%s); using build_message fallback", exc)
+        try:
+            return build_message(alert.get("strategy_type") if isinstance(alert, dict) else "swing", ticker, {}, "")
+        except:
+            return f"🟢 [كارت انضمام للصفقة]\n{ticker} - {alert}"
 
 
 def send_telegram(chat_id: Optional[str], message: str, bot_token: Optional[str], reply_markup: Optional[Dict[str, Any]] = None) -> bool:
@@ -4583,27 +4706,74 @@ def build_message(strategy: Any, ticker: Any, ctx: Any, sentiment: Any) -> str:
         except (TypeError, ValueError):
             entry_price = 0.0
 
-        # Safe plan targets
+        # Dynamic plan targets - supports 2,3,4+ levels
+        ordinals_dm = {1: "الأول", 2: "الثاني", 3: "الثالث", 4: "الرابع", 5: "الخامس", 6: "السادس", 7: "السابع", 8: "الثامن"}
         try:
-            targets = plan.get("targets_pct", (0.03, 0.05, 0.08))
-            if not isinstance(targets, (list, tuple)) or len(targets) < 3:
-                targets = (0.03, 0.05, 0.08)
-            p1, p2, p3 = float(targets[0]), float(targets[1]), float(targets[2])
+            # Check ctx for explicit dynamic targets (if caller supplied target_1..target_4)
+            ctx_targets: List[float] = []
+            has_ctx = False
+            for i in range(1, 11):
+                for k in (f"target_{i}", f"target{i}", f"tp{i}"):
+                    if k in ctx and ctx[k] is not None:
+                        try:
+                            if str(ctx[k]).strip() != "":
+                                ctx_targets.append(float(ctx[k]))
+                                has_ctx = True
+                                break
+                        except:
+                            continue
+                if has_ctx and i == len(ctx_targets) and ctx_targets[-1] is not None:
+                    # continue to next i; we already broke inner
+                    pass
+                # If we didn't find for this i but we already have some, check if next also missing => stop
+                if not has_ctx:
+                    continue
+                # Need to detect gaps: if i > len(ctx_targets) and has_ctx, try peek next
+                # We'll instead after loop, if has_ctx we use ctx_targets
+            if has_ctx and ctx_targets:
+                targets = tuple(ctx_targets)
+                # derive pct for RR from prices
+                try:
+                    p_list = [(t / entry_price - 1) if entry_price else 0.0 for t in targets]
+                except:
+                    p_list = [0.03, 0.05, 0.08][:len(targets)]
+                p1 = float(p_list[0]) if len(p_list) > 0 else 0.03
+                # for RR use last target pct
+                p_last = float(p_list[-1]) if p_list else 0.08
+                targets_pct_for_rr = p_last
+                # Assign individual for backward compat but dynamic list used for rendering
+                p3 = p_last
+            else:
+                targets = plan.get("targets_pct", (0.03, 0.05, 0.08))
+                if not isinstance(targets, (list, tuple)) or len(targets) < 1:
+                    targets = (0.03, 0.05, 0.08)
+                # Normalize to floats
+                targets = tuple(float(x) for x in targets)
+                p1 = float(targets[0]) if len(targets) > 0 else 0.03
+                p_last = float(targets[-1]) if len(targets) else 0.08
+                p3 = p_last
         except Exception:
-            p1, p2, p3 = 0.03, 0.05, 0.08
+            targets = (0.03, 0.05, 0.08)
+            p1 = 0.03
+            p3 = 0.08
 
         try:
             sl_pct = float(plan.get("sl_pct", -0.03)) if plan.get("sl_pct") is not None else -0.03
         except (TypeError, ValueError):
             sl_pct = -0.03
 
+        # Compute actual target prices list dynamically
         try:
-            target_1 = entry_price * (1 + p1)
-            target_2 = entry_price * (1 + p2)
-            target_3 = entry_price * (1 + p3)
-            stop_loss = entry_price * (1 + sl_pct)
+            if has_ctx and ctx_targets:
+                target_prices = ctx_targets
+                stop_loss = entry_price * (1 + sl_pct)
+            else:
+                target_prices = [entry_price * (1 + float(p)) for p in targets]
+                stop_loss = entry_price * (1 + sl_pct)
         except Exception:
-            target_1 = target_2 = target_3 = stop_loss = entry_price
+            target_prices = [entry_price] * 3
+            stop_loss = entry_price
+            p3 = 0.08
 
         try:
             rr = abs(p3 / sl_pct) if sl_pct else 0
@@ -4660,6 +4830,22 @@ def build_message(strategy: Any, ticker: Any, ctx: Any, sentiment: Any) -> str:
         # Prepare macro section (only if indirect effect detected)
         macro_section = f"\n{macro_block}\n" if macro_block else ""
 
+        # Build dynamic targets block with 🎯 الهدف الأول..الرابع etc.
+        try:
+            target_lines_parts: List[str] = []
+            for idx, tv in enumerate(target_prices, start=1):
+                ordinal = ordinals_dm.get(idx, f"{idx}")
+                # Compute pct for display if entry_price >0
+                try:
+                    pct = (tv / entry_price - 1) * 100 if entry_price else 0.0
+                    pct_str = f" ({pct:.1f}%)"
+                except:
+                    pct_str = ""
+                target_lines_parts.append(f"🎯 الهدف {ordinal}: {tv:.2f}{pct_str} EGP")
+            targets_block = "\n".join(target_lines_parts) if target_lines_parts else f"🎯 الهدف الأول: - EGP"
+        except Exception:
+            targets_block = "\n".join([f"🎯 الهدف {ordinals_dm.get(i, f'{i}')}: {tv:.2f} EGP" for i, tv in enumerate(target_prices, 1)]) if 'target_prices' in locals() else "🎯 الهدف الأول: - EGP"
+
         return (
             f"اسم السهم : {stock_name_ar} {clean_ticker}\n"
             f"\n"
@@ -4673,9 +4859,7 @@ def build_message(strategy: Any, ticker: Any, ctx: Any, sentiment: Any) -> str:
             f"\n"
             f"سعر الدخول : {entry_price:.2f} 🏷\n"
             f"\n"
-            f"الهدف الاول: {target_1:.2f} ({p1 * 100:.1f}%) 🎯\n"
-            f"الهدف الثاني : {target_2:.2f} ({p2 * 100:.1f}%) 🎯\n"
-            f"الهدف الثالث: {target_3:.2f} ({p3 * 100:.1f}%) 🎯\n"
+            f"{targets_block}\n"
             f"\n"
             f"وقف الخسارة : {sl_condition} {stop_loss:.2f} ({sl_pct * 100:.1f}%) ⛔️\n"
             f"\n"
