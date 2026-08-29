@@ -288,14 +288,19 @@ try:
             logger.warning("[JOIN][ENV AUDIT] SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY missing - user_portfolio upsert skipped (user=%s symbol=%s)", user_id, symbol)
             print(f"[JOIN][ENV AUDIT] SUPABASE_URL or key missing - skipping upsert for user={user_id} symbol={symbol}")
             return False, False
+        # Deployed user_portfolio schema (via Supabase): id, user_id, symbol, trade_id, status, joined_at
+        # No `snapshot` column (PGRST204), so omit it; keep payload minimal and schema-compatible
         payload: Dict[str, Any] = {
             "user_id": str(user_id),
-            "trade_id": int(trade_id),
+            "trade_id": int(trade_id) if trade_id else 0,
             "symbol": normalize_ticker(symbol),
-            "snapshot": snapshot,
             "status": "TRACKING",
             "joined_at": datetime.now(timezone.utc).isoformat(),
         }
+        # Include snapshot only if caller provided and column exists (handled via fallback)
+        # To avoid PGRST204, we do NOT send snapshot by default; log it for visibility
+        if snapshot:
+            print(f"[SUPABASE] Snapshot provided (not sent due to missing column): {json.dumps(snapshot)[:300]}")
         headers = {
             "apikey": supabase_key,
             "Authorization": f"Bearer {supabase_key}",
