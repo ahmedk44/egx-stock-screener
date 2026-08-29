@@ -1,6 +1,6 @@
 import json
 
-def handler(request, *args, **kwargs):
+def _handler_impl(request, *args, **kwargs):
     try:
         return {"statusCode": 200, "body": "OK - minimal"}
     except Exception:
