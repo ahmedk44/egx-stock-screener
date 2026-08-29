@@ -2,8 +2,8 @@ name: Post-Market News Scan
 
 on:
   schedule:
-    # Every day, Sun-Thu (0-4), 11:35 UTC = 14:35 Cairo time (02:35 PM Cairo)
-    - cron: "35 11 * * 0-4"
+    # Every trading day Sun-Thu, 15:30 Cairo = 12:30 UTC (Cairo UTC+3)
+    - cron: "30 12 * * 0-4"
   workflow_dispatch:
 
 permissions:
@@ -37,17 +37,21 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TELEGRAM_CHANNEL_NEWS: ${{ secrets.TELEGRAM_CHANNEL_NEWS }}
+          TELEGRAM_NEWS_CHANNEL_ID: ${{ secrets.TELEGRAM_NEWS_CHANNEL_ID }}
+          TELEGRAM_CHAT_ID_NEWS: ${{ secrets.TELEGRAM_CHAT_ID_NEWS }}
           TELEGRAM_CHANNEL_SCALP: ${{ secrets.TELEGRAM_CHANNEL_SCALP }}
           TELEGRAM_CHANNEL_SWING: ${{ secrets.TELEGRAM_CHANNEL_SWING }}
           TELEGRAM_CHANNEL_INVEST: ${{ secrets.TELEGRAM_CHANNEL_INVEST }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-          TELEGRAM_CHAT_ID_NEWS: ${{ secrets.TELEGRAM_CHAT_ID_NEWS }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           CHANNEL_SCALPING: ${{ secrets.CHANNEL_SCALPING }}
           CHANNEL_SWING: ${{ secrets.CHANNEL_SWING }}
           CHANNEL_INVESTMENT: ${{ secrets.CHANNEL_INVESTMENT }}
-        run: python main.py --mode=post_market
+        run: |
+          echo "Running EGX Post-Market Bulletin (EGX News & Market Summaries)"
+          python -m egx_quant.news.post_market_summary || python egx_quant/news/post_market_summary.py || python main.py --mode=post_market
 
       - name: Persist Active Positions State
         run: |
