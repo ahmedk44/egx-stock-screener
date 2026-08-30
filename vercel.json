@@ -1,16 +1,16 @@
 {
   "functions": {
     "api/webhook.py": {
-      "runtime": "@vercel/python@3.9"
+      "runtime": "@vercel/python@3.9.0"
     },
     "api/pre_market.py": {
-      "runtime": "@vercel/python@3.9"
+      "runtime": "@vercel/python@3.9.0"
     },
     "api/post_market.py": {
-      "runtime": "@vercel/python@3.9"
+      "runtime": "@vercel/python@3.9.0"
     },
     "api/scanner.py": {
-      "runtime": "@vercel/python@3.9"
+      "runtime": "@vercel/python@3.9.0"
     }
   },
   "rewrites": [
