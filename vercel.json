@@ -5,7 +5,15 @@
       "use": "@vercel/python"
     },
     {
+      "src": "api/cron/pre_market.py",
+      "use": "@vercel/python"
+    },
+    {
       "src": "api/cron/post_market.py",
+      "use": "@vercel/python"
+    },
+    {
+      "src": "api/cron/scanner.py",
       "use": "@vercel/python"
     }
   ],
@@ -15,11 +23,27 @@
       "dest": "api/webhook.py"
     },
     {
+      "src": "/api/cron/pre_market",
+      "dest": "api/cron/pre_market.py"
+    },
+    {
       "src": "/api/cron/post_market",
       "dest": "api/cron/post_market.py"
+    },
+    {
+      "src": "/api/cron/scanner",
+      "dest": "api/cron/scanner.py"
     }
   ],
   "crons": [
+    {
+      "path": "/api/cron/pre_market",
+      "schedule": "30 5 * * 0-4"
+    },
+    {
+      "path": "/api/cron/scanner",
+      "schedule": "*/15 7-11 * * 0-4"
+    },
     {
       "path": "/api/cron/post_market",
       "schedule": "30 12 * * 0-4"

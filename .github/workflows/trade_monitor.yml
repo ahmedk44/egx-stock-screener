@@ -1,10 +1,9 @@
 name: Real-Time Target & SL Monitor
 
 on:
-  schedule:
-    # Live Trading Scanners & Signal Monitor — Active Session Only
-    # 10:00 AM - 02:30 PM Cairo / 11:00 AM - 03:30 PM Oman = 07:00 - 11:30 UTC (Sun-Thu)
-    - cron: "*/15 7-11 * * 0-4"
+  # schedule: DISABLED — migrated to Vercel Cron / cron-job.org (see vercel.json crons & scripts/setup_cronjobs.py)
+  # Previous: */15 7-11 * * 0-4 → 07:00-11:30 UTC (10:00-14:30 Cairo / 11:00-15:30 Oman Sun-Thu) — now triggers via https://.../api/cron/scanner
+  # Keeping workflow_dispatch for manual runs only (prevents double-posting & GH queue delays)
   workflow_dispatch:
 
 permissions:

@@ -1,9 +1,9 @@
 name: Weekly Market & Portfolio Summary
 
 on:
-  schedule:
-    # Every Saturday, 18:00 Cairo / 19:00 Oman = 15:00 UTC (Cairo UTC+3, Oman UTC+4) — Weekly Market Summary (FINAL)
-    - cron: "0 15 * * 6"
+  # schedule: DISABLED — migrated to Vercel Cron / cron-job.org (see vercel.json crons & scripts/setup_cronjobs.py)
+  # Previous: 0 15 * * 6 → 15:00 UTC (18:00 Cairo / 19:00 Oman Sat) — use Vercel Cron or manual dispatch; GitHub queue caused delays
+  # Keeping workflow_dispatch for manual runs only
   workflow_dispatch:
 
 permissions:

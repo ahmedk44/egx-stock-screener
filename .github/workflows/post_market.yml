@@ -1,10 +1,9 @@
 name: Post-Market News Scan
 
 on:
-  schedule:
-    # Post-Market Bulletin — FINAL message of trading day after close
-    # 03:30 PM Cairo / 04:30 PM Oman = 12:30 PM UTC (Sun-Thu) — ABSOLUTE FINAL
-    - cron: "30 12 * * 0-4"
+  # schedule: DISABLED — migrated to Vercel Cron / cron-job.org (see vercel.json crons & scripts/setup_cronjobs.py)
+  # Previous: 30 12 * * 0-4 → 12:30 UTC (15:30 Cairo / 16:30 Oman Sun-Thu) — now triggers via https://.../api/cron/post_market
+  # Keeping workflow_dispatch for manual runs only (prevents double-posting & GH queue delays). Vercel Cron is primary; GH queue caused 4.5h delay (Created 12:31 → Started 16:48).
   workflow_dispatch:
 
 permissions:

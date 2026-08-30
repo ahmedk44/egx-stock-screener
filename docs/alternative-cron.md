@@ -1,4 +1,16 @@
-# Alternative Cron Trigger — Post-Market Bulletin (12:30 UTC)
+# Alternative Cron Trigger — Direct Webhooks (Eliminate GitHub Delays)
+
+> **Migration complete:** All scheduled bulletins & scanners now run via Vercel Cron / cron-job.org, not GitHub `schedule` (which caused 4.5h queue delays). GitHub workflows retain `workflow_dispatch` for manual runs only.
+
+## Endpoints (All Accept `CRON_SECRET` via `Authorization: Bearer` OR `?secret=`)
+
+| Job | Vercel Cron | Endpoint | Schedule (UTC) | Local Time |
+|-----|-------------|----------|----------------|------------|
+| Pre-Market | `30 5 * * 0-4` | `GET /api/cron/pre_market` | 05:30 UTC Sun-Thu | 08:30 Cairo / 09:30 Oman — FIRST |
+| Live Scanner | `*/15 7-11 * * 0-4` | `GET /api/cron/scanner` | Every 15m 07:00-11:30 UTC Sun-Thu | 10:00-14:30 Cairo / 11:00-15:30 Oman — Active Session |
+| Post-Market | `30 12 * * 0-4` | `GET /api/cron/post_market` | 12:30 UTC Sun-Thu | 15:30 Cairo / 16:30 Oman — FINAL |
+
+## Problem — Post-Market Example (12:30 UTC)
 
 ## Problem
 
@@ -20,42 +32,71 @@ How to audit:
 `vercel.json` now declares:
 
 ```json
-"crons": [{ "path": "/api/cron/post_market", "schedule": "30 12 * * 0-4" }]
+"crons": [
+  { "path": "/api/cron/pre_market", "schedule": "30 5 * * 0-4" },
+  { "path": "/api/cron/scanner", "schedule": "*/15 7-11 * * 0-4" },
+  { "path": "/api/cron/post_market", "schedule": "30 12 * * 0-4" }
+]
 ```
 
-*   Vercel's scheduler triggers `GET https://<your-app>.vercel.app/api/cron/post_market` at **12:30 UTC Sun-Thu** on Vercel's edge (not GitHub's queue).
-*   Handler `api/cron/post_market.py` runs `egx_quant/news/post_market_summary.py` synchronously, re-uses the **60-minute stale guard** (late banner `⚠️ Late Run` appended if `delay>60m` or `past 14:00 UTC`), and returns `{ok, delay_minutes, is_stale}`.
-*   Auth: set `CRON_SECRET` in Vercel env. Vercel sends `x-vercel-cron: 1` automatically; external callers must send `Authorization: Bearer <CRON_SECRET>`.
+*   Vercel's scheduler triggers each `GET https://<your-app>.vercel.app/api/cron/<job>` at its `schedule` on Vercel's edge (not GitHub's queue).
+*   Handlers `api/cron/pre_market.py`, `api/cron/scanner.py`, `api/cron/post_market.py` run their pipelines synchronously, re-use the **60-minute stale guard** for post-market (late banner `⚠️ Late Run` appended if `delay>60m` or `past 14:00 UTC`), and return `{ok, delay_minutes, is_stale}`.
+*   Auth: set `CRON_SECRET` in Vercel env. Accepts `Authorization: Bearer <CRON_SECRET>` **or** query `?secret=<CRON_SECRET>` / `?cron_secret=` / `?token=` (all three endpoints). Vercel sends `x-vercel-cron: 1` automatically.
 
 Deploy:
 
 ```bash
 vercel --prod
-vercel env add CRON_SECRET  # optional but recommended
+vercel env add CRON_SECRET  # optional but recommended — then use header OR ?secret=
 ```
 
-Verify: `curl -i https://<app>.vercel.app/api/cron/post_market -H "Authorization: Bearer $CRON_SECRET"`
+Verify (header or query — both work):
+
+```bash
+curl -i https://<app>.vercel.app/api/cron/post_market -H "Authorization: Bearer $CRON_SECRET"
+curl -i "https://<app>.vercel.app/api/cron/pre_market?secret=$CRON_SECRET"
+curl -i "https://<app>.vercel.app/api/cron/scanner?secret=$CRON_SECRET"
+```
 
 If you keep both triggers, the Python **idempotency guard** (`news_publish_log` unique `bulletin_type+publish_date`) ensures only the first writer publishes — the second run exits `Idempotent — Already published today` (no duplicate Telegram).
 
-## Solution B — External Lightweight Ping (cron-job.org / easycron)
+## Solution B — External Lightweight Ping (cron-job.org / easycron) — Helper Script
 
-If Vercel Cron is not desired, use any external cron that does a single `GET`:
+**Automated via helper (recommended):**
 
-**cron-job.org steps:**
+```bash
+# Preview what will be created:
+python scripts/setup_cronjobs.py --dry-run --base-url https://egx-stock-screener.vercel.app
+
+# Verify endpoints (header + ?secret=):
+CRON_SECRET=xxx python scripts/setup_cronjobs.py --verify-only
+
+# Create 3 jobs on cron-job.org (needs CRONJOB_API_KEY from https://cron-job.org/en/members/settings/):
+CRONJOB_API_KEY=yyy CRON_SECRET=xxx python scripts/setup_cronjobs.py --create
+```
+
+The helper creates:
+
+*   `EGX Pre-Market 05:30 UTC` → `GET https://.../api/cron/pre_market?secret=xxx` — `30 5 * * 0-4`
+*   `EGX Live Scanner */15` → `GET https://.../api/cron/scanner?secret=xxx` — `*/15 7-11 * * 0-4`
+*   `EGX Post-Market 12:30 UTC` → `GET https://.../api/cron/post_market?secret=xxx` — `30 12 * * 0-4`
+
+**Manual cron-job.org steps (if not using script):**
 
 1.  Create account → *Create Cronjob*
-2.  Title: `EGX Post-Market 12:30 UTC`
-3.  URL: `https://<your-app>.vercel.app/api/cron/post_market`
+2.  Titles & URLs (use query-string auth — no custom header needed):
+    *   `EGX Pre-Market 05:30 UTC` → `https://<app>.vercel.app/api/cron/pre_market?secret=<CRON_SECRET>` — `30 5 * * 0-4`
+    *   `EGX Live Scanner 07:00-11:30` → `https://<app>.vercel.app/api/cron/scanner?secret=<CRON_SECRET>` — `*/15 7-11 * * 0-4`
+    *   `EGX Post-Market 12:30 UTC` → `https://<app>.vercel.app/api/cron/post_market?secret=<CRON_SECRET>` — `30 12 * * 0-4`
     *   Alternative: trigger GitHub directly via workflow_dispatch:
         `POST https://api.github.com/repos/<owner>/<repo>/actions/workflows/post_market.yml/dispatches`
         with `Authorization: Bearer <GH_PAT>` and `{"ref":"main"}` — but Vercel endpoint is lighter.
-4.  Schedule: `30 12 * * 0-4`  (or use *Every 5 minutes* expression `30 12 * * 0,1,2,3,4`)
-5.  Advanced → Headers → Add: `Authorization: Bearer <CRON_SECRET>` (if you set `CRON_SECRET`)
-6.  Enable `Fail on HTTP != 200` alert so you get email if Telegram fails.
-7.  Save → Test Run → expect `{"ok":true,"delay_minutes":0}`.
+3.  Schedule: set Hours/Minutes/Weekdays as above, Timezone **UTC**, Weekdays `0,1,2,3,4` (Sun-Thu).
+4.  Alternatively add header: `Authorization: Bearer <CRON_SECRET>` + plain URL (both work).
+5.  Enable `Fail on HTTP != 200` alert so you get email if Telegram fails.
+6.  Save → Test Run → expect `{"ok":true,"delay_minutes":0}`.
 
-**easycron / healthchecks.io** — identical URL + Bearer header.
+**easycron / healthchecks.io** — identical URL + `?secret=` query.
 
 Cost: free tier (cron-job.org allows 50 jobs at 1-min granularity). No runner queue — request hits Vercel serverless in <100 ms.
 

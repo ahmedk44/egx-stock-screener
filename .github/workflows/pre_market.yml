@@ -1,10 +1,9 @@
 name: Pre-Market News Scan
 
 on:
-  schedule:
-    # Pre-Market Briefing — FIRST message before market opens
-    # 08:30 AM Cairo / 09:30 AM Oman = 05:30 AM UTC (Sun-Thu)
-    - cron: "30 5 * * 0-4"
+  # schedule: DISABLED — migrated to Vercel Cron / cron-job.org (see vercel.json crons & scripts/setup_cronjobs.py)
+  # Previous: 30 5 * * 0-4 → 05:30 UTC (08:30 Cairo / 09:30 Oman Sun-Thu) — now triggers via https://.../api/cron/pre_market
+  # Keeping workflow_dispatch for manual runs only (prevents double-posting & GH queue delays)
   workflow_dispatch:
 
 permissions:
