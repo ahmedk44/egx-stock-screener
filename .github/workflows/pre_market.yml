@@ -2,7 +2,8 @@ name: Pre-Market News Scan
 
 on:
   schedule:
-    # Every trading day Sun-Thu, 08:30 Cairo = 05:30 UTC (Cairo UTC+3)
+    # Pre-Market Briefing — FIRST message before market opens
+    # 08:30 AM Cairo / 09:30 AM Oman = 05:30 AM UTC (Sun-Thu)
     - cron: "30 5 * * 0-4"
   workflow_dispatch:
 

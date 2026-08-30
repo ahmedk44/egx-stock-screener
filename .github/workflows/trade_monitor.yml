@@ -2,9 +2,9 @@ name: Real-Time Target & SL Monitor
 
 on:
   schedule:
-    # Every 5 minutes during market hours (Sun-Thu 10:00 AM - 02:30 PM Cairo = UTC+3)
-    # 10:00 Cairo = 07:00 UTC, 14:30 Cairo = 11:30 UTC
-    - cron: "*/5 7-11 * * 0-4"
+    # Live Trading Scanners & Signal Monitor — Active Session Only
+    # 10:00 AM - 02:30 PM Cairo / 11:00 AM - 03:30 PM Oman = 07:00 - 11:30 UTC (Sun-Thu)
+    - cron: "*/15 7-11 * * 0-4"
   workflow_dispatch:
 
 permissions:

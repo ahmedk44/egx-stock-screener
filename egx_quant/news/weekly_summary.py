@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Weekly Summary Bulletin for EGX News & Market Summaries channel.
-Broadcasted every Saturday 18:00 Cairo Time (16:00 UTC).
+Broadcasted every Saturday 18:00 Cairo / 19:00 Oman = 15:00 UTC (Cairo UTC+3, Oman UTC+4).
 
 Features:
 - Calculates weekly performance for EGX30, EGX70, and overall market volume
@@ -530,7 +530,7 @@ def format_weekly_card(
 
     card = (
         f"{WEEKLY_TITLE}\n"
-        f"📅 **الأسبوع:** {week_str} | ⏰ **السبت 18:00** بتوقيت القاهرة\n"
+        f"📅 **الأسبوع:** {week_str} | ⏰ **السبت 18:00** بتوقيت القاهرة / 19:00 بتوقيت عمان\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📊 **الأداء الأسبوعي للمؤشرات وحجم السوق:**\n"
         f"{idx_block}\n"

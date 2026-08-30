@@ -2,7 +2,8 @@ name: Post-Market News Scan
 
 on:
   schedule:
-    # Every trading day Sun-Thu, 15:30 Cairo = 12:30 UTC (Cairo UTC+3)
+    # Post-Market Bulletin — FINAL message of trading day after close
+    # 03:30 PM Cairo / 04:30 PM Oman = 12:30 PM UTC (Sun-Thu) — ABSOLUTE FINAL
     - cron: "30 12 * * 0-4"
   workflow_dispatch:
 

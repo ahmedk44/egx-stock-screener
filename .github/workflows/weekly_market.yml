@@ -2,8 +2,8 @@ name: Weekly Market & Portfolio Summary
 
 on:
   schedule:
-    # Every Saturday, 18:00 Cairo = 16:00 UTC (Cairo UTC+2 winter, UTC+3 summer -> use 16:00 UTC to cover 18:00 Cairo year-round)
-    - cron: "0 16 * * 6"
+    # Every Saturday, 18:00 Cairo / 19:00 Oman = 15:00 UTC (Cairo UTC+3, Oman UTC+4) — Weekly Market Summary (FINAL)
+    - cron: "0 15 * * 6"
   workflow_dispatch:
 
 permissions:
