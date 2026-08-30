@@ -3,12 +3,26 @@
     {
       "src": "api/webhook.py",
       "use": "@vercel/python"
+    },
+    {
+      "src": "api/cron/post_market.py",
+      "use": "@vercel/python"
     }
   ],
   "routes": [
     {
       "src": "/api/webhook",
       "dest": "api/webhook.py"
+    },
+    {
+      "src": "/api/cron/post_market",
+      "dest": "api/cron/post_market.py"
+    }
+  ],
+  "crons": [
+    {
+      "path": "/api/cron/post_market",
+      "schedule": "30 12 * * 0-4"
     }
   ]
 }

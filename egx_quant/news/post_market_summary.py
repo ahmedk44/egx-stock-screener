@@ -15,7 +15,7 @@ import os
 import sys
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -433,6 +433,128 @@ def format_post_market_card(
     )
     return card
 
+def check_execution_window(
+    scheduled_hour: int = 12,
+    scheduled_minute: int = 30,
+    window_minutes: int = 60,
+    strict_cutoff_hour: int = 14,
+    strict_cutoff_minute: int = 0,
+) -> Tuple[bool, float, datetime, datetime, str]:
+    """
+    Time-Window Guard for stale cron detection (GitHub queue delay).
+
+    Compares current UTC time against the most recent scheduled trigger
+    (30 12 * * 0-4 → 12:30 UTC Sun-Thu). If execution is >window_minutes
+    past the window (or past strict 14:00 UTC / 18:00 Oman), flags stale.
+
+    Returns (is_stale, delay_minutes, now_utc, scheduled_utc, reason).
+    Never raises — returns non-stale on any error.
+    """
+    try:
+        # Skip stale check for manual dispatches — operator intentionally triggered
+        event_name = (os.environ.get("GITHUB_EVENT_NAME") or "").strip()
+        if event_name == "workflow_dispatch":
+            now_utc = datetime.now(timezone.utc)
+            sched = now_utc.replace(hour=scheduled_hour, minute=scheduled_minute, second=0, microsecond=0)
+            return False, 0.0, now_utc, sched, "manual dispatch — window check bypassed"
+
+        now_utc = datetime.now(timezone.utc)
+
+        # Find most recent scheduled slot (Sun-Thu 12:30 UTC) ≤ now_utc
+        # Cron 0-4 = Sun(0), Mon(1), Tue(2), Wed(3), Thu(4)
+        scheduled = now_utc.replace(hour=scheduled_hour, minute=scheduled_minute, second=0, microsecond=0)
+        if now_utc < scheduled:
+            # Before today's 12:30 → most recent was yesterday
+            scheduled = scheduled - timedelta(days=1)
+
+        # Walk back to last Sun-Thu if scheduled falls on Fri/Sat
+        for _ in range(7):
+            # Python weekday(): Mon=0 … Sun=6; GitHub cron Sun=0 => mapping
+            # Map GH 0->6, 1->0, 2->1, 3->2, 4->3, 5->4, 6->5
+            gh_dow = (scheduled.weekday() + 1) % 7  # Mon0→1, Sun6→0
+            if gh_dow in (0, 1, 2, 3, 4):  # Sun-Thu valid
+                break
+            scheduled = scheduled - timedelta(days=1)
+            scheduled = scheduled.replace(hour=scheduled_hour, minute=scheduled_minute, second=0, microsecond=0)
+
+        delay_minutes = (now_utc - scheduled).total_seconds() / 60.0
+
+        # Strict cutoff 14:00 UTC (18:00 Oman) per requirement example
+        cutoff = now_utc.replace(hour=strict_cutoff_hour, minute=strict_cutoff_minute, second=0, microsecond=0)
+        is_past_cutoff = now_utc >= cutoff and delay_minutes > 0
+
+        is_stale = False
+        reason = ""
+        if delay_minutes > window_minutes:
+            is_stale = True
+            reason = f"delay {delay_minutes:.0f}m > window {window_minutes}m (scheduled {scheduled.strftime('%H:%M UTC')}, now {now_utc.strftime('%H:%M UTC')})"
+        elif is_past_cutoff:
+            # Past 14:00 UTC even if delay just over window — strict policy
+            is_stale = True
+            reason = f"past strict cutoff {strict_cutoff_hour:02d}:{strict_cutoff_minute:02d} UTC (now {now_utc.strftime('%H:%M UTC')}, scheduled {scheduled.strftime('%H:%M UTC')})"
+        else:
+            reason = f"within window (delay {delay_minutes:.0f}m, scheduled {scheduled.strftime('%H:%M UTC')})"
+
+        return is_stale, delay_minutes, now_utc, scheduled, reason
+    except Exception as exc:
+        try:
+            now_utc = datetime.now(timezone.utc)
+            sched = now_utc.replace(hour=scheduled_hour, minute=scheduled_minute, second=0, microsecond=0)
+            return False, 0.0, now_utc, sched, f"window check error: {exc}"
+        except Exception:
+            return False, 0.0, datetime.now(timezone.utc), datetime.now(timezone.utc), "window check critical error"
+
+
+def format_late_banner(delay_minutes: float, scheduled: datetime, now_utc: datetime) -> str:
+    """Build late-run indicator banner for Telegram card."""
+    try:
+        delay_h = int(delay_minutes // 60)
+        delay_m = int(delay_minutes % 60)
+        delay_str = f"{delay_h}h {delay_m}m" if delay_h else f"{delay_m}m"
+        # Show both UTC and local conversions
+        # Scheduled 12:30 UTC = 15:30 Cairo / 16:30 Oman
+        return (
+            f"⚠️ **تنبيه تأخر التنفيذ | Late Run Detected**\n"
+            f"⏰ الموعد المقرر: **12:30 UTC** (15:30 القاهرة / 16:30 مسقط)\n"
+            f"⏰ وقت التنفيذ الفعلي: **{now_utc.strftime('%H:%M UTC')}** ({now_utc.astimezone(timezone(timedelta(hours=3))).strftime('%H:%M Cairo')} / {now_utc.astimezone(timezone(timedelta(hours=4))).strftime('%H:%M Oman')})\n"
+            f"⏱️ مدة التأخر: **{delay_str}** (≈{delay_minutes:.0f} دقيقة) — تجاوز النافذة المسموحة 60 دقيقة\n"
+            f"📌 السبب المحتمل: تأخر طابور GitHub Actions (public runner queue)\n"
+            f"━━━━━━━━━━━━━━━━━━━━"
+        )
+    except Exception:
+        return f"⚠️ **تأخر التنفيذ** — تأخر {delay_minutes:.0f} دقيقة عن الموعد 12:30 UTC"
+
+
+def trigger_stale_retry_alert(delay_minutes: float, scheduled: datetime, now_utc: datetime, reason: str) -> None:
+    """Strict retry alert: log and optionally notify admin Telegram chat."""
+    try:
+        msg = f"[STALE-ALERT] Post-Market bulletin delayed {delay_minutes:.0f}m (scheduled {scheduled.isoformat()}, now {now_utc.isoformat()}) reason={reason}"
+        logger.warning(msg)
+        print(f"[STALE-ALERT] {msg}")
+        # Best-effort admin notify via Telegram if ADMIN chat configured
+        admin_chat = (os.environ.get("ADMIN_TELEGRAM_IDS") or os.environ.get("ADMIN_USER_IDS") or os.environ.get("TELEGRAM_USER_CHAT_ID") or "").split(",")[0].strip()
+        token = (os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
+        if admin_chat and token and requests:
+            try:
+                alert_text = (
+                    f"🚨 **تنبيه تأخر نشرة الإغلاق | Stale Execution**\n"
+                    f"⏰ المقرر: 12:30 UTC / 15:30 Cairo / 16:30 Oman\n"
+                    f"⏰ الفعلي: {now_utc.strftime('%Y-%m-%d %H:%M UTC')}\n"
+                    f"⏱️ التأخر: {delay_minutes:.0f} دقيقة\n"
+                    f"📋 السبب: {reason}\n"
+                    f"💡 الإجراء: يراجع سجل Actions (Created vs Started) ويُفعّل cron-job.org/Vercel Cron كبديل إذا تكرر."
+                )
+                requests.post(
+                    f"https://api.telegram.org/bot{token}/sendMessage",
+                    json={"chat_id": admin_chat, "text": alert_text, "parse_mode": "Markdown"},
+                    timeout=10,
+                )
+            except Exception as e:
+                logger.warning(f"Stale alert Telegram notify failed: {e}")
+    except Exception as e:
+        logger.warning(f"trigger_stale_retry_alert failed: {e}")
+
+
 def publish_to_news_channel(text: str, parse_mode: str = "Markdown", dry_run: bool = False) -> bool:
     """Publish to EGX News & Market Summaries channel."""
     if dry_run:
@@ -477,6 +599,38 @@ def publish_to_news_channel(text: str, parse_mode: str = "Markdown", dry_run: bo
 def main(dry_run: bool = False, broadcast: bool = True) -> int:
     """Run full post-market pipeline: fetch -> AI -> format -> publish."""
     logger.info("Starting post-market summary pipeline")
+    # ── Time-Window Guard: detect stale GitHub queue delay (>60m past 12:30 UTC / past 14:00 UTC) ──
+    is_stale = False
+    delay_minutes = 0.0
+    late_banner = ""
+    try:
+        is_stale, delay_minutes, now_utc, scheduled_utc, reason = check_execution_window()
+        # Audit log for GH Created vs Started — GH runners log UTC; we emit both
+        try:
+            gh_created = os.environ.get("GITHUB_RUN_CREATED_AT") or os.environ.get("GITHUB_EVENT_CREATED_AT") or "n/a"
+        except Exception:
+            gh_created = "n/a"
+        print(f"[TIMESTAMP-AUDIT] Scheduled=12:30 UTC (15:30 Cairo/16:30 Oman) | Now={now_utc.strftime('%Y-%m-%d %H:%M:%S UTC')} | Delay={delay_minutes:.0f}m | Reason={reason} | GH_EVENT={os.environ.get('GITHUB_EVENT_NAME','local')} | GH_CREATED={gh_created}")
+        logger.info("Timestamp audit: now=%s scheduled=%s delay=%.0fm stale=%s reason=%s", now_utc.isoformat(), scheduled_utc.isoformat(), delay_minutes, is_stale, reason)
+        if is_stale:
+            late_banner = format_late_banner(delay_minutes, scheduled_utc, now_utc)
+            logger.warning("Stale execution detected: delay %.0fm — will append late-run indicator to Telegram card", delay_minutes)
+            print(f"[STALE-DETECTED] {reason}")
+            # Trigger strict retry alert (admin notify)
+            try:
+                trigger_stale_retry_alert(delay_minutes, scheduled_utc, now_utc, reason)
+            except Exception as e:
+                logger.warning(f"Stale alert trigger failed: {e}")
+            # Note: we do NOT abort — we still publish but marked as late (fallback). Alternative is to exit and let external cron retry.
+            # To enforce strict abort, set env STRICT_STALE_ABORT=1
+            if (os.environ.get("STRICT_STALE_ABORT") or "").strip() in ("1", "true", "True"):
+                print("[STRICT-ABORT] STRICT_STALE_ABORT=1 — aborting stale bulletin (no Telegram send)")
+                logger.error("Aborting stale post-market bulletin due to STRICT_STALE_ABORT")
+                return 2
+    except Exception as e:
+        logger.warning(f"Time-window guard failed (proceeding without stale check): {e}")
+        is_stale = False
+
     # Idempotency guard - check before heavy fetching if already published today
     if broadcast and not dry_run:
         try:
@@ -499,6 +653,11 @@ def main(dry_run: bool = False, broadcast: bool = True) -> int:
             logger.warning(f"Active signals fetch failed: {e}")
             active_enriched = []
         card = format_post_market_card(indices, gainers, losers, turnover, ai_summary, active_signals=active_enriched)
+        # Append late-run indicator if stale (>60m past 12:30 UTC) — requirement: stale handling not silent
+        if is_stale and late_banner:
+            card = f"{late_banner}\n\n{card}"
+            print(f"[LATE-BANNER] Appended late-run indicator to card (delay {delay_minutes:.0f}m)")
+            logger.warning("Appended late-run banner to post-market card")
         print(card)
         if broadcast:
             ok = publish_to_news_channel(card, dry_run=dry_run)
