@@ -2,7 +2,7 @@
 Vercel Cron endpoint for Live Scanner — alternative to GitHub Actions
 
 Triggered by:
-  - Vercel Cron (vercel.json crons: */15 7-11 * * 0-4 → GET /api/cron/scanner)
+  - Vercel Cron (vercel.json crons: */15 7-11 * * 0-4 -> GET /api/cron/scanner)
   - External ping (cron-job.org) via GET with Bearer token or ?secret=
 
 Auth: accepts header `Authorization: Bearer <CRON_SECRET>` or query `?secret=<CRON_SECRET>`.
@@ -136,7 +136,7 @@ class handler(BaseHTTPRequestHandler):
             "now": ended.isoformat(),
             "duration_seconds": round(duration, 1),
             "auth": auth_reason,
-            "schedule": "*/15 7-11 * * 0-4 → every 15m 07:00-11:30 UTC (10:00-14:30 Cairo / 11:00-15:30 Oman) Sun-Thu",
+            "schedule": "*/15 7-11 * * 0-4 -> every 15m 07:00-11:30 UTC (10:00-14:30 Cairo / 11:00-15:30 Oman) Sun-Thu",
             "result": result,
         }
         try:
@@ -158,3 +158,49 @@ class handler(BaseHTTPRequestHandler):
             print(f"[VERCEL-CRON] {format % args}")
         except Exception:
             pass
+
+
+def _get_scalping_channel_id() -> str:
+    """Hard-aligned to SCAPLING_CHANNEL_ID per task spec."""
+    SCALPING_FALLBACK = "-1003993921849"
+    for env in ["TELEGRAM_CHANNEL_SCALPING", "SCALPING_CHANNEL_ID", "CHANNEL_SCALPING", "TELEGRAM_CHANNEL_ID"]:
+        val = (os.environ.get(env) or "").strip().strip('"').strip("'")
+        if val:
+            return val
+    return SCALPING_FALLBACK
+
+
+# Direct execution support: `python api/scanner.py` -> SCALPING channel -1003993921849
+if __name__ == "__main__":
+    import sys
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+    if not os.environ.get("TELEGRAM_CHANNEL_SCALPING"):
+        os.environ["TELEGRAM_CHANNEL_SCALPING"] = "-1003993921849"
+    print(f"[DIRECT] Running api/scanner.py -> SCAPLING_CHANNEL_ID={_get_scalping_channel_id()} (fallback -1003993921849)")
+    # Scanner delegates to main.py + trade_monitor; trigger via handler logic
+    # For direct run, invoke the same pipeline as Vercel handler would
+    from egx_quant.news.pre_market_briefing import main as _sm_main  # fallback to ensure import works
+    # Actually run main scanner via handler simulation
+    import importlib.util, pathlib
+    # Re-use handler's internal logic by simulating a GET
+    # Simplest: run main.py directly
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+    try:
+        import main as egx_main
+        sys.argv = ["main.py"]
+        print(f"[DIRECT] Executing main.py scanner -> targeting SCALPING {_get_scalping_channel_id()}")
+        ret = egx_main.main()
+        print(f"[DIRECT] main.py returned {ret}")
+    except SystemExit as se:
+        print(f"[DIRECT] main.py exit {se.code}")
+    except Exception as e:
+        print(f"[DIRECT] scanner failed: {e}")
+        import traceback; traceback.print_exc()
+        sys.exit(1)
+    # Also run trade monitor
+    try:
+        from egx_quant.engine.trade_monitor import run_monitor_cycle
+        res = run_monitor_cycle(dry_run=False)
+        print(f"[DIRECT] trade_monitor: {res}")
+    except Exception as e:
+        print(f"[DIRECT] trade_monitor failed: {e}")

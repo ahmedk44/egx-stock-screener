@@ -112,25 +112,26 @@ except Exception:
     STOCK_NAMES_AR = {t: t.replace(".CA","") for t in TICKERS}
 
 def get_news_channel_id() -> Optional[str]:
-    candidates = [
-        "TELEGRAM_CHANNEL_NEWS",
+    """Hard-aligned to NEWS & Summaries Channel per task spec."""
+    # Explicit mapping: News & Summaries Channel = -1004492677393
+    NEWS_FALLBACK = "-1004492677393"
+    # Priority: explicit NEWS envs first
+    for env in [
         "TELEGRAM_NEWS_CHANNEL_ID",
+        "NEWS_CHANNEL_ID",
+        "TELEGRAM_CHANNEL_NEWS",
         "TELEGRAM_CHAT_ID_NEWS",
-        "TELEGRAM_CHANNEL_ID_NEWS",
         "EGX_NEWS_CHANNEL_ID",
-        "TELEGRAM_CHANNEL_ID",
-        "TELEGRAM_CHAT_ID",
-        "TELEGRAM_USER_CHAT_ID",
-        "CHANNEL_SCALPING",
-        "TELEGRAM_CHANNEL_SCALPING",
-    ]
-    for env in candidates:
+    ]:
         val = (os.environ.get(env) or "").strip().strip('"').strip("'")
         if val:
-            logger.info(f"News channel resolved via {env}={val[:6]}...")
+            # Guard: if env still points to old scalping ID, warn but respect explicit NEWS env
+            if val == "-1003993921849":
+                logger.warning(f"News channel env {env} still points to SCALPING ID -1003993921849 — expected NEWS -1004492677393")
+            logger.info(f"News channel resolved via {env}={val} (NEWS_CHANNEL_ID hard fallback {NEWS_FALLBACK})")
             return val
-    logger.warning("No news channel found; checked: " + ", ".join(candidates))
-    return None
+    logger.info(f"No NEWS env set — using hard fallback NEWS_CHANNEL_ID={NEWS_FALLBACK} per spec")
+    return NEWS_FALLBACK
 
 def fetch_global_cues() -> Dict[str, Dict[str, Any]]:
     """Fetch global market cues via yfinance."""

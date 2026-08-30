@@ -133,3 +133,16 @@ class handler(BaseHTTPRequestHandler):
             print(f"[VERCEL-CRON] {format % args}")
         except Exception:
             pass
+
+
+# Direct execution support: `python api/pre_market.py` must deliver to NEWS channel -1004492677393
+if __name__ == "__main__":
+    import sys
+    # Ensure project root on path
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+    # Hard-align env for direct run if missing
+    if not (os.environ.get("TELEGRAM_NEWS_CHANNEL_ID") or os.environ.get("TELEGRAM_CHANNEL_NEWS")):
+        os.environ["TELEGRAM_NEWS_CHANNEL_ID"] = "-1004492677393"
+    print("[DIRECT] Running api/pre_market.py -> egx_quant.news.pre_market_briefing (NEWS_CHANNEL_ID=-1004492677393)")
+    from egx_quant.news.pre_market_briefing import main as _pm_main
+    sys.exit(_pm_main(dry_run=False, broadcast=True))

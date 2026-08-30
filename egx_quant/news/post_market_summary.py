@@ -105,27 +105,23 @@ INDICES_MAP = {
 }
 
 def get_news_channel_id() -> Optional[str]:
-    """Resolve EGX News & Market Summaries channel ID with fallback chain."""
-    candidates = [
-        "TELEGRAM_CHANNEL_NEWS",
+    """Hard-aligned to NEWS & Summaries Channel per task spec."""
+    NEWS_FALLBACK = "-1004492677393"
+    for env in [
         "TELEGRAM_NEWS_CHANNEL_ID",
+        "NEWS_CHANNEL_ID",
+        "TELEGRAM_CHANNEL_NEWS",
         "TELEGRAM_CHAT_ID_NEWS",
-        "TELEGRAM_CHANNEL_ID_NEWS",
         "EGX_NEWS_CHANNEL_ID",
-        # Fallbacks to generic channels if dedicated news channel not set
-        "TELEGRAM_CHANNEL_ID",
-        "TELEGRAM_CHAT_ID",
-        "TELEGRAM_USER_CHAT_ID",
-        "CHANNEL_SCALPING",
-        "TELEGRAM_CHANNEL_SCALPING",
-    ]
-    for env in candidates:
+    ]:
         val = (os.environ.get(env) or "").strip().strip('"').strip("'")
         if val:
-            logger.info(f"News channel resolved via {env}={val[:6]}...")
+            if val == "-1003993921849":
+                logger.warning(f"News channel env {env} still points to SCALPING ID -1003993921849 — expected NEWS -1004492677393")
+            logger.info(f"News channel resolved via {env}={val} (NEWS hard fallback {NEWS_FALLBACK})")
             return val
-    logger.warning("No news channel found; checked: " + ", ".join(candidates))
-    return None
+    logger.info(f"No NEWS env set — using hard fallback NEWS_CHANNEL_ID={NEWS_FALLBACK} per spec")
+    return NEWS_FALLBACK
 
 def fetch_indices_performance() -> Dict[str, Dict[str, Any]]:
     """Fetch closing prices & performance for EGX30/EGX70/EGX100 via yfinance."""
