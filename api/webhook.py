@@ -2020,37 +2020,132 @@ try:
                         import traceback; traceback.print_exc()
                 else:
                     print(f"[TELEGRAM] Skipping answerCallbackQuery missing token/callback_id/requests (token={bool(bot_token)}, id={bool(callback_id)})")
-                # === SLASH COMMANDS: /portfolio, /close, /update ===
-                elif isinstance(update, dict) and update.get("message"):
-                    message = update["message"]
-                    if isinstance(message, dict) and message.get("text", "").strip().startswith("/"):
-                        try:
-                            from egx_quant.admin.commands import handle_slash_command  # type: ignore
-                            text = str(message.get("text", ""))
-                            from_user = message.get("from") or {}
-                            chat_id = str(message.get("chat", {}).get("id", ""))
-                            success, response_text = handle_slash_command(text, from_user, bot_token)
-                            if response_text and bot_token and requests:
-                                try:
-                                    requests.post(
-                                        TELEGRAM_SEND_URL.format(token=bot_token),
-                                        json={"chat_id": chat_id, "text": response_text, "parse_mode": "HTML"},
-                                        timeout=10,
-                                    )
-                                    print(f"[SLASH] Command {text.split()[0]} response sent to {chat_id}")
-                                except Exception as _se:
-                                    print(f"[SLASH] Send failed: {_se}")
-                        except Exception as _sc:
-                            print(f"[SLASH] Command handler error: {_sc}")
+                # Fallback return for callback_query branch (ensures 200 even if no data)
+                try:
+                    if hasattr(request, "status_code"):
+                        request.status_code = 200
+                        return "OK"
+                except Exception:
+                    pass
+                return {"statusCode": 200, "body": "OK"}
+            elif isinstance(update, dict) and update.get("message"):
+                # === TEXT MESSAGE & COMMAND DISPATCHER ===
+                # Correctly placed OUTSIDE callback_query block so private chat commands are reachable.
+                message = update.get("message", {})
+                text_raw = ""
+                try:
+                    text_raw = str(message.get("text", "") or "").strip()
+                except Exception:
+                    text_raw = ""
+                chat_obj = message.get("chat", {}) if isinstance(message, dict) else {}
+                chat_id = str(chat_obj.get("id", "")).strip() if isinstance(chat_obj, dict) else ""
+                from_user = message.get("from", {}) if isinstance(message, dict) else {}
+                user_id = str(from_user.get("id", "")).strip() if isinstance(from_user, dict) else ""
+                # Re-resolve bot_token outside callback block (may not have been set)
+                try:
+                    bot_token_msg = (os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
+                except Exception:
+                    bot_token_msg = ""
+                # Log message for diagnostics
+                print(f"[WEBHOOK][MESSAGE] chat_id={chat_id} user_id={user_id} text={text_raw[:80]!r}")
+                logger.info("[WEBHOOK][MESSAGE] chat=%s user=%s text=%s", chat_id, user_id, text_raw[:80])
+                # Env audit: required vars
+                supabase_url_msg, supabase_key_msg = _get_supabase_config()
+                if not bot_token_msg:
+                    print("[WEBHOOK][ENV AUDIT] TELEGRAM_BOT_TOKEN missing - cannot reply to message")
+                if not supabase_url_msg or not supabase_key_msg:
+                    print(f"[WEBHOOK][ENV AUDIT] SUPABASE env missing url={bool(supabase_url_msg)} key={bool(supabase_key_msg)} - portfolio commands may fail")
+                # Handle slash commands and /start
+                if isinstance(message, dict) and text_raw.startswith("/"):
+                    # Strip @botname suffix for Telegram group compatibility
+                    cmd_text = text_raw
                     try:
-                        if hasattr(request, "status_code"):
-                            request.status_code = 200
-                            return "OK"
+                        first_token = cmd_text.split()[0]
+                        if "@" in first_token:
+                            base_cmd = first_token.split("@")[0]
+                            rest = " ".join(cmd_text.split()[1:])
+                            cmd_text = base_cmd + (" " + rest if rest else "")
                     except Exception:
                         pass
-                    return {"statusCode": 200, "body": "OK"}
-                else:
-                    print("[WEBHOOK] No callback_query in update")
+                    # Explicit try-except around handler with fallback error message
+                    response_text = ""
+                    success = False
+                    handler_error = ""
+                    try:
+                        from egx_quant.admin.commands import handle_slash_command  # type: ignore
+                        print(f"[SLASH] Dispatching command: {cmd_text[:80]!r} from user={user_id}")
+                        logger.info("[SLASH] Dispatching %r from user=%s", cmd_text[:80], user_id)
+                        # Wrap handle_portfolio explicitly with try-except for Supabase errors
+                        try:
+                            success, response_text = handle_slash_command(cmd_text, from_user, bot_token_msg)
+                        except Exception as hp_exc:
+                            import traceback
+                            traceback.print_exc()
+                            logger.error("[SLASH][PORTFOLIO] handle_slash_command crashed: %s", hp_exc, exc_info=True)
+                            print(f"[SLASH][ERROR] handle_slash_command crashed: {hp_exc}")
+                            handler_error = str(hp_exc)
+                            # Fallback error message instead of silent fail
+                            response_text = (
+                                f"⚠️ حدث خطأ أثناء تنفيذ الأمر <code>{cmd_text.split()[0]}</code>.\n"
+                                f"السبب: {str(hp_exc)[:200]}\n"
+                                f"تحقق من إعدادات قاعدة البيانات أو تواصل مع المسؤول."
+                            )
+                            success = False
+                    except Exception as _sc:
+                        import traceback
+                        traceback.print_exc()
+                        logger.error("[SLASH] Command handler import/dispatch error: %s", _sc, exc_info=True)
+                        print(f"[SLASH] Command handler error: {_sc}")
+                        handler_error = str(_sc)
+                        response_text = (
+                            f"⚠️ فشل تنفيذ الأمر <code>{cmd_text.split()[0] if cmd_text else 'unknown'}</code>.\n"
+                            f"السبب: {str(_sc)[:200]}"
+                        )
+                        success = False
+                    # Always send a response if we have text and can reply, even on error
+                    if response_text and bot_token_msg and requests and chat_id:
+                        try:
+                            resp = requests.post(
+                                TELEGRAM_SEND_URL.format(token=bot_token_msg),
+                                json={"chat_id": chat_id, "text": response_text, "parse_mode": "HTML"},
+                                timeout=10,
+                            )
+                            print(f"[SLASH] Command {cmd_text.split()[0] if cmd_text else 'unknown'} response sent to {chat_id} -> {resp.status_code}")
+                            logger.info("[SLASH] Response sent to %s -> %s", chat_id, resp.status_code)
+                            if resp.status_code != 200:
+                                print(f"[SLASH][WARN] Telegram sendMessage non-200: {resp.status_code} {resp.text[:300]}")
+                        except Exception as _se:
+                            print(f"[SLASH] Send failed: {_se}")
+                            logger.warning("[SLASH] Send failed to %s: %s", chat_id, _se)
+                    elif handler_error and bot_token_msg and requests and chat_id:
+                        # Fallback: ensure error is reported even if response_text empty
+                        try:
+                            fallback_msg = f"⚠️ حدث خطأ غير متوقع: {handler_error[:300]}"
+                            requests.post(
+                                TELEGRAM_SEND_URL.format(token=bot_token_msg),
+                                json={"chat_id": chat_id, "text": fallback_msg, "parse_mode": "HTML"},
+                                timeout=10,
+                            )
+                        except Exception:
+                            pass
+                    else:
+                        if not response_text:
+                            print(f"[SLASH][WARN] No response_text for {cmd_text[:40]!r} success={success} error={handler_error[:100]}")
+                        if not chat_id:
+                            print("[SLASH][WARN] No chat_id to reply")
+                elif isinstance(message, dict) and text_raw:
+                    # Non-command text: log and optionally ignore or provide help for private chat
+                    print(f"[WEBHOOK][MESSAGE] Non-command text ignored: {text_raw[:80]!r}")
+                # Always return 200 OK after message handling
+                try:
+                    if hasattr(request, "status_code"):
+                        request.status_code = 200
+                        return "OK"
+                except Exception:
+                    pass
+                return {"statusCode": 200, "body": "OK"}
+            else:
+                print("[WEBHOOK] No callback_query or message in update - ignoring")
         except Exception as e:
             print(f"[WEBHOOK ERROR] Top-level handler error: {e}")
             logger.warning(f"Webhook handler top-level error: {e}")

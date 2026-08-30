@@ -38,10 +38,31 @@ except ImportError:
 
 logger = logging.getLogger("egx_admin.commands")
 
-# Admin IDs from env (comma-separated)
-ADMIN_IDS: List[str] = [
-    x.strip() for x in (os.environ.get("ADMIN_TELEGRAM_IDS") or "").split(",") if x.strip()
-]
+# Admin IDs from env (comma-separated) - supports both ADMIN_USER_IDS (task spec) and legacy ADMIN_TELEGRAM_IDS
+def _load_admin_ids() -> List[str]:
+    raw = (os.environ.get("ADMIN_USER_IDS") or os.environ.get("ADMIN_TELEGRAM_IDS") or os.environ.get("ADMIN_IDS") or "").strip()
+    # Also check Vercel-style ADMIN_USER_IDS with fallback
+    if not raw:
+        # Try alternative env that may contain single ID
+        raw = (os.environ.get("ADMIN_TELEGRAM_ID") or "").strip()
+    ids = [x.strip() for x in raw.split(",") if x.strip()]
+    # Also support space-separated
+    if len(ids) == 1 and " " in ids[0]:
+        ids = [x.strip() for x in ids[0].split() if x.strip()]
+    return ids
+
+ADMIN_IDS: List[str] = _load_admin_ids()
+
+def _refresh_admin_ids() -> List[str]:
+    """Re-read ADMIN_USER_IDS dynamically (env may change at runtime on Vercel)."""
+    ids = _load_admin_ids()
+    # Update global for backward compat
+    try:
+        global ADMIN_IDS
+        ADMIN_IDS = ids
+    except Exception:
+        pass
+    return ids
 
 TELEGRAM_SEND_URL = "https://api.telegram.org/bot{token}/sendMessage"
 TELEGRAM_ANSWER_URL = "https://api.telegram.org/bot{token}/answerCallbackQuery"
@@ -68,10 +89,29 @@ def _headers(prefer: str = "return=minimal") -> Dict[str, str]:
 
 
 def is_admin(user_id: str) -> bool:
-    """Check if user_id is in the configured admin list."""
-    if not ADMIN_IDS:
+    """Check if user_id is in the configured admin list (dynamic lookup)."""
+    ids = _refresh_admin_ids()
+    if not ids:
+        # Log env audit warning
+        print("[ADMIN][ENV AUDIT] ADMIN_USER_IDS / ADMIN_TELEGRAM_IDS is empty - all admin commands will be denied")
+        logger.warning("[ADMIN][ENV AUDIT] ADMIN_USER_IDS is empty - admin check denied for %s", str(user_id)[:8])
         return False
-    return str(user_id).strip() in ADMIN_IDS
+    return str(user_id).strip() in ids
+
+def verify_env_vars() -> Dict[str, bool]:
+    """Verify required env vars per task spec: TELEGRAM_BOT_TOKEN, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, ADMIN_USER_IDS."""
+    checks = {
+        "TELEGRAM_BOT_TOKEN": bool((os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()),
+        "SUPABASE_URL": bool((os.environ.get("SUPABASE_URL") or "").strip()),
+        "SUPABASE_SERVICE_ROLE_KEY": bool((os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get("SUPABASE_KEY") or "").strip()),
+        "ADMIN_USER_IDS": bool((_load_admin_ids())),
+    }
+    for k, ok in checks.items():
+        status = "OK" if ok else "MISSING"
+        print(f"[ENV AUDIT] {k}: {status}")
+        if not ok:
+            logger.warning("[ENV AUDIT] %s is missing", k)
+    return checks
 
 
 def _answer_callback(callback_query_id: str, bot_token: str, text: str, show_alert: bool = False) -> bool:
@@ -432,27 +472,79 @@ def update_trade(
     return (sub_ok, card)
 
 
-def handle_slash_command(text: str, from_user: Dict[str, Any], bot_token: str) -> Tuple[bool, str]:
-    """Route slash commands: /close, /update, /portfolio, محفظتي.
+def _handle_start(user_id: str) -> Tuple[bool, str]:
+    """Handle /start welcome message."""
+    return True, (
+        "👋 <b>مرحباً بك في بوت البورصة المصرية | EGX Signals Bot</b>\n"
+        "------------------------------------\n"
+        "📌 <b>الأوامر المتاحة:</b>\n"
+        "• <code>/portfolio</code> - عرض محفظتك النشطة مع الأرباح/الخسائر المباشرة\n"
+        "• <code>/portfolio [TICKER]</code> - تعديل سعر الدخول لسهم محدد\n"
+        "• <code>/close &lt;TICKER&gt; [سبب]</code> - إغلاق صفقة (للمسؤولين فقط)\n"
+        "• <code>/update &lt;TICKER&gt; sl=VALUE target1=VALUE</code> - تحديث أهداف الصفقة (للمسؤولين)\n"
+        "------------------------------------\n"
+        "💡 اضغط زر <b>انضم للصفقة | Track Signal</b> من أي إشارة في القناة العامة لبدء المتابعة.\n"
+        "🔒 جميع التحديثات ستصلك في الخاص.\n"
+    )
 
-    Returns (success, response_text).
+def handle_slash_command(text: str, from_user: Dict[str, Any], bot_token: str) -> Tuple[bool, str]:
+    """Route slash commands: /start, /portfolio, /close, /update, محفظتي.
+
+    Returns (success, response_text). Handles Telegram @botname suffix.
+    Never fails silently - errors are returned as user-visible messages.
     """
     text = (text or "").strip()
+    if not text:
+        return False, ""
+    # Support Arabic محفظتي without slash
+    if text.strip() in ("محفظتي", "محفظتى"):
+        text = "/portfolio"
     if not text.startswith("/"):
         return False, ""
+    # Strip @botname suffix like /portfolio@EGXSignalsBot or /start@EGXSignalsBot
+    try:
+        first = text.split()[0]
+        if "@" in first:
+            text = first.split("@")[0] + (" " + " ".join(text.split()[1:]) if len(text.split()) > 1 else "")
+    except Exception:
+        pass
     parts = text.split()
     command = parts[0].lower()
     user_id = str(from_user.get("id", ""))
     user_name = from_user.get("first_name", "") or ""
 
-    # /portfolio or محفظتي
-    if command in ("/portfolio", "/محفظتي", "محفظتي"):
-        # Optional: /portfolio [TICKER] to set custom entry price
-        ticker_arg = parts[1] if len(parts) > 1 else None
-        return handle_portfolio(user_id, bot_token, ticker_arg)
+    # /start - always allowed, no Supabase needed
+    if command == "/start":
+        return _handle_start(user_id)
 
+    # /help alias
+    if command in ("/help", "/مساعدة"):
+        return _handle_start(user_id)
+
+    # /portfolio or محفظتي - user command with explicit try-except logging
+    if command in ("/portfolio", "/محفظتي", "محفظتي"):
+        ticker_arg = parts[1] if len(parts) > 1 else None
+        try:
+            print(f"[PORTFOLIO] Dispatch /portfolio user={user_id} ticker_arg={ticker_arg}")
+            logger.info("[PORTFOLIO] Dispatch user=%s ticker_arg=%s", user_id, ticker_arg)
+            success, card = handle_portfolio(user_id, bot_token, ticker_arg)
+            return success, card
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            logger.error("[PORTFOLIO] handle_portfolio crashed for user=%s: %s", user_id, e, exc_info=True)
+            print(f"[PORTFOLIO][ERROR] handle_portfolio crashed: {e}")
+            # Fallback response instead of silent fail
+            return False, (
+                f"⚠️ حدث خطأ أثناء جلب المحفظة.\n"
+                f"السبب: {str(e)[:200]}\n"
+                f"تحقق من إعدادات SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY أو تواصل مع المسؤول."
+            )
+
+    # Also handle /portfolio with @bot suffix already stripped above
     # Admin-only commands
     if not is_admin(user_id):
+        print(f"[ADMIN] Denied {command} for non-admin user={user_id} admin_ids={_load_admin_ids()}")
         return False, "⛔ هذا الأمر مخصص للمسؤولين فقط."
 
     if command == "/close":
@@ -460,7 +552,11 @@ def handle_slash_command(text: str, from_user: Dict[str, Any], bot_token: str) -
             return False, "📝 الاستخدام: /close <TICKER> [سبب]\nمثال: /close COMI.CA إغلاق يدوي"
         ticker = parts[1].upper()
         reason = " ".join(parts[2:]) if len(parts) > 2 else "إغلاق يدوي من المسؤول"
-        result, card = close_trade(ticker, reason, user_id, bot_token, *get_supabase_config() if get_supabase_config() else ("", ""))
+        try:
+            result, card = close_trade(ticker, reason, user_id, bot_token, *get_supabase_config() if get_supabase_config() else ("", ""))
+        except Exception as e:
+            logger.error("[CLOSE] close_trade crashed: %s", e, exc_info=True)
+            return False, f"⚠️ فشل إغلاق {ticker}: {str(e)[:200]}"
         return result[0] if isinstance(result, tuple) else result, card
 
     if command == "/update":
@@ -472,17 +568,35 @@ def handle_slash_command(text: str, from_user: Dict[str, Any], bot_token: str) -
             if "=" in p:
                 k, v = p.split("=", 1)
                 params[k.lower()] = v
-        ok, card = update_trade(ticker, params, user_id, bot_token, *get_supabase_config() if get_supabase_config() else ("", ""))
+        try:
+            ok, card = update_trade(ticker, params, user_id, bot_token, *get_supabase_config() if get_supabase_config() else ("", ""))
+        except Exception as e:
+            logger.error("[UPDATE] update_trade crashed: %s", e, exc_info=True)
+            return False, f"⚠️ فشل تحديث {ticker}: {str(e)[:200]}"
         return ok, card
 
-    return False, "⚠️ أمر غير معروف. استخدم /close، /update، أو /portfolio."
+    return False, "⚠️ أمر غير معروف. استخدم /start، /portfolio، /close، أو /update."
 
 
 def handle_portfolio(user_id: str, bot_token: str, ticker_arg: Optional[str] = None) -> Tuple[bool, str]:
-    """Handle /portfolio command. If ticker_arg given, set custom entry price."""
-    supabase_url, supabase_key = get_supabase_config() if get_supabase_config() else ("", "")
+    """Handle /portfolio command. If ticker_arg given, set custom entry price.
+
+    Explicit try-except with logging for missing Supabase env / connection errors.
+    Never fails silently - errors are returned as user-visible messages.
+    """
+    try:
+        supabase_url, supabase_key = get_supabase_config() if get_supabase_config() else ("", "")
+    except Exception as cfg_exc:
+        logger.error("[PORTFOLIO][ENV AUDIT] get_supabase_config failed: %s", cfg_exc, exc_info=True)
+        print(f"[PORTFOLIO][ENV AUDIT] get_supabase_config failed: {cfg_exc}")
+        return False, f"⚠️ إعدادات قاعدة البيانات غير متوفرة: {str(cfg_exc)[:150]}"
     if not supabase_url or not supabase_key:
-        return False, "⚠️ إعدادات قاعدة البيانات غير متوفرة."
+        print(f"[PORTFOLIO][ENV AUDIT] SUPABASE_URL present={bool(supabase_url)} SUPABASE_SERVICE_ROLE_KEY present={bool(supabase_key)} - cannot fetch portfolio")
+        logger.warning("[PORTFOLIO][ENV AUDIT] SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY missing - portfolio fetch skipped for user=%s", str(user_id)[:8])
+        return False, (
+            "⚠️ إعدادات قاعدة البيانات غير متوفرة.\n"
+            "تأكد من ضبط <code>SUPABASE_URL</code> و <code>SUPABASE_SERVICE_ROLE_KEY</code> في إعدادات Vercel."
+        )
 
     # If ticker_arg provided, set/update custom entry price
     if ticker_arg and ticker_arg.upper() != user_id:
@@ -522,10 +636,22 @@ def handle_portfolio(user_id: str, bot_token: str, ticker_arg: Optional[str] = N
                     }
                     positions.append(pos)
     except Exception as e:
-        logger.warning(f"Portfolio fetch failed: {e}")
-        return False, f"⚠️ فشل جلب المحفظة: {e}"
+        import traceback
+        traceback.print_exc()
+        logger.error(f"Portfolio fetch failed for user={user_id}: {e}", exc_info=True)
+        print(f"[PORTFOLIO][ERROR] fetch failed: {e}")
+        return False, (
+            f"⚠️ فشل جلب المحفظة: {str(e)[:200]}\n"
+            f"تحقق من إعدادات SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY."
+        )
 
-    card = format_portfolio_card(positions, user_id, user_id)
+    try:
+        card = format_portfolio_card(positions, user_id, user_id)
+    except Exception as ce:
+        import traceback
+        traceback.print_exc()
+        logger.error("[PORTFOLIO] format_portfolio_card crashed: %s", ce, exc_info=True)
+        return False, f"⚠️ فشل تنسيق بيانات المحفظة: {str(ce)[:200]}"
     return True, card
 
 
