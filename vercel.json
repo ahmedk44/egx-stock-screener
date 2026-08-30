@@ -1,16 +1,16 @@
 {
   "functions": {
     "api/webhook.py": {
-      "runtime": "@vercel/python@3.9.0"
+      "runtime": "@vercel/python@3.9"
     },
     "api/cron/pre_market.py": {
-      "runtime": "@vercel/python@3.9.0"
+      "runtime": "@vercel/python@3.9"
     },
     "api/cron/post_market.py": {
-      "runtime": "@vercel/python@3.9.0"
+      "runtime": "@vercel/python@3.9"
     },
     "api/cron/scanner.py": {
-      "runtime": "@vercel/python@3.9.0"
+      "runtime": "@vercel/python@3.9"
     }
   },
   "rewrites": [
@@ -29,42 +29,6 @@
     {
       "source": "/api/cron/scanner",
       "destination": "/api/cron/scanner.py"
-    }
-  ],
-  "builds": [
-    {
-      "src": "api/webhook.py",
-      "use": "@vercel/python"
-    },
-    {
-      "src": "api/cron/pre_market.py",
-      "use": "@vercel/python"
-    },
-    {
-      "src": "api/cron/post_market.py",
-      "use": "@vercel/python"
-    },
-    {
-      "src": "api/cron/scanner.py",
-      "use": "@vercel/python"
-    }
-  ],
-  "routes": [
-    {
-      "src": "/api/webhook",
-      "dest": "api/webhook.py"
-    },
-    {
-      "src": "/api/cron/pre_market",
-      "dest": "api/cron/pre_market.py"
-    },
-    {
-      "src": "/api/cron/post_market",
-      "dest": "api/cron/post_market.py"
-    },
-    {
-      "src": "/api/cron/scanner",
-      "dest": "api/cron/scanner.py"
     }
   ],
   "crons": [
