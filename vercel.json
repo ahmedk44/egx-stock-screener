@@ -1,34 +1,38 @@
 {
-  "functions": {
-    "api/webhook.py": {
-      "runtime": "@vercel/python@3.9.0"
+  "builds": [
+    {
+      "src": "api/webhook.py",
+      "use": "@vercel/python"
     },
-    "api/pre_market.py": {
-      "runtime": "@vercel/python@3.9.0"
+    {
+      "src": "api/pre_market.py",
+      "use": "@vercel/python"
     },
-    "api/post_market.py": {
-      "runtime": "@vercel/python@3.9.0"
+    {
+      "src": "api/post_market.py",
+      "use": "@vercel/python"
     },
-    "api/scanner.py": {
-      "runtime": "@vercel/python@3.9.0"
+    {
+      "src": "api/scanner.py",
+      "use": "@vercel/python"
     }
-  },
-  "rewrites": [
+  ],
+  "routes": [
     {
-      "source": "/api/webhook",
-      "destination": "/api/webhook.py"
+      "src": "/api/webhook",
+      "dest": "api/webhook.py"
     },
     {
-      "source": "/api/pre_market",
-      "destination": "/api/pre_market.py"
+      "src": "/api/pre_market",
+      "dest": "api/pre_market.py"
     },
     {
-      "source": "/api/post_market",
-      "destination": "/api/post_market.py"
+      "src": "/api/post_market",
+      "dest": "api/post_market.py"
     },
     {
-      "source": "/api/scanner",
-      "destination": "/api/scanner.py"
+      "src": "/api/scanner",
+      "dest": "api/scanner.py"
     }
   ],
   "crons": [
