@@ -6,9 +6,9 @@ Creates/ verifies external cron jobs that trigger Vercel endpoints directly,
 bypassing GitHub Actions public runner queue (which caused 4.5h delays: Created 12:31 → Started 16:48).
 
 Endpoints (all accept CRON_SECRET via header `Authorization: Bearer <CRON_SECRET>` OR query `?secret=<CRON_SECRET>`):
-  - Pre-Market:  05:30 UTC (08:30 Cairo / 09:30 Oman) → https://egx-stock-screener.vercel.app/api/cron/pre_market
-  - Live Scanner: */15 07:00-11:30 UTC (10:00-14:30 Cairo) → https://egx-stock-screener.vercel.app/api/cron/scanner
-  - Post-Market: 12:30 UTC (15:30 Cairo / 16:30 Oman) → https://egx-stock-screener.vercel.app/api/cron/post_market
+  - Pre-Market:  05:30 UTC (08:30 Cairo / 09:30 Oman) → https://egx-stock-screener.vercel.app/api/pre_market
+  - Live Scanner: */15 07:00-11:30 UTC (10:00-14:30 Cairo) → https://egx-stock-screener.vercel.app/api/scanner
+  - Post-Market: 12:30 UTC (15:30 Cairo / 16:30 Oman) → https://egx-stock-screener.vercel.app/api/post_market
 
 Supports:
   - Vercel Cron (already in vercel.json `crons` — just `vercel --prod`)
@@ -65,7 +65,7 @@ JOBS = [
     {
         "key": "pre_market",
         "title": "EGX Pre-Market 05:30 UTC",
-        "path": "/api/cron/pre_market",
+        "path": "/api/pre_market",
         "cron": "30 5 * * 0-4",
         "desc": "08:30 Cairo / 09:30 Oman — FIRST message before market opens",
         "cronjob_schedule": {
@@ -81,7 +81,7 @@ JOBS = [
     {
         "key": "scanner",
         "title": "EGX Live Scanner 07:00-11:30 UTC */15",
-        "path": "/api/cron/scanner",
+        "path": "/api/scanner",
         "cron": "*/15 7-11 * * 0-4",
         "desc": "10:00-14:30 Cairo / 11:00-15:30 Oman — every 15m active session",
         "cronjob_schedule": {
@@ -97,7 +97,7 @@ JOBS = [
     {
         "key": "post_market",
         "title": "EGX Post-Market 12:30 UTC",
-        "path": "/api/cron/post_market",
+        "path": "/api/post_market",
         "cron": "30 12 * * 0-4",
         "desc": "15:30 Cairo / 16:30 Oman — FINAL bulletin after close",
         "cronjob_schedule": {
@@ -197,7 +197,7 @@ def check_vercel_crons() -> None:
         print(f"[VERCEL] builds: {[b.get('src') for b in builds]}")
         print(f"[VERCEL] routes: {[r.get('src') for r in routes]}")
         print(f"[VERCEL] crons: {crons}")
-        expected = {"/api/cron/pre_market": "30 5 * * 0-4", "/api/cron/scanner": "*/15 7-11 * * 0-4", "/api/cron/post_market": "30 12 * * 0-4"}
+        expected = {"/api/pre_market": "30 5 * * 0-4", "/api/scanner": "*/15 7-11 * * 0-4", "/api/post_market": "30 12 * * 0-4"}
         ok = True
         for exp_path, exp_sched in expected.items():
             found = next((c for c in crons if c.get("path") == exp_path), None)
@@ -316,7 +316,7 @@ def print_manual_instructions(base: str, secret: str) -> None:
         print(f'    {{"path": "{job["path"]}", "schedule": "{job["cron"]}"}},')
     print("  ]")
     print("  Deploy: vercel --prod  (or git push → auto-deploy)")
-    print("  Then verify: curl -i https://your-app.vercel.app/api/cron/pre_market?secret=$CRON_SECRET")
+    print("  Then verify: curl -i https://your-app.vercel.app/api/pre_market?secret=$CRON_SECRET")
     print()
     print("Fallback: If GitHub delays reappear, disable GitHub schedule (see Workflow Cleanup) and rely solely on Vercel/cron-job.org.")
     print("Idempotency: Python news_publish_log unique (bulletin_type+publish_date) ensures no double Telegram post even if both triggers fire.")
@@ -380,7 +380,7 @@ def main() -> int:
                 all_ok = False
         if not all_ok:
             print("[VERIFY][WARN] Some endpoints not reachable — deploy first: vercel --prod or git push")
-            print("[VERIFY][HINT] Test manually: curl -i \"{}/api/cron/pre_market?secret=YOUR_SECRET\"".format(base))
+            print("[VERIFY][HINT] Test manually: curl -i \"{}/api/pre_market?secret=YOUR_SECRET\"".format(base))
         else:
             print("[VERIFY][PASS] All endpoints reachable (header + ?secret= both work)")
         print()
@@ -422,7 +422,7 @@ def main() -> int:
 
     print()
     print("[DONE] Setup complete. Next: disable GitHub schedule (see Workflow Cleanup) and deploy Vercel.")
-    print("[DONE] Then verify clean: curl \"{}/api/cron/post_market?secret=$CRON_SECRET\"".format(base))
+    print("[DONE] Then verify clean: curl \"{}/api/post_market?secret=$CRON_SECRET\"".format(base))
     return 0
 
 
