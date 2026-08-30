@@ -8,3 +8,5 @@ venv/
 news_publish_log.json
 active_positions.json
 state.json
+.vercel
+.env*

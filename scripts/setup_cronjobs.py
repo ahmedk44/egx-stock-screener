@@ -197,9 +197,11 @@ def check_vercel_crons() -> None:
         print(f"[VERCEL] builds: {[b.get('src') for b in builds]}")
         print(f"[VERCEL] routes: {[r.get('src') for r in routes]}")
         print(f"[VERCEL] crons: {crons}")
-        expected = {"/api/pre_market": "30 5 * * 0-4", "/api/scanner": "*/15 7-11 * * 0-4", "/api/post_market": "30 12 * * 0-4"}
+        # Hobby plan: scanner (*/15) exceeds daily limit, so Vercel cron for scanner is intentionally external (cron-job.org)
+        expected_required = {"/api/pre_market": "30 5 * * 0-4", "/api/post_market": "30 12 * * 0-4"}
+        expected_optional = {"/api/scanner": "*/15 7-11 * * 0-4"}
         ok = True
-        for exp_path, exp_sched in expected.items():
+        for exp_path, exp_sched in expected_required.items():
             found = next((c for c in crons if c.get("path") == exp_path), None)
             if not found:
                 print(f"[VERCEL][FAIL] Missing cron for {exp_path} (expected {exp_sched})")
@@ -209,10 +211,18 @@ def check_vercel_crons() -> None:
                 ok = False
             else:
                 print(f"[VERCEL][PASS] {exp_path} → {exp_sched}")
+        for exp_path, exp_sched in expected_optional.items():
+            found = next((c for c in crons if c.get("path") == exp_path), None)
+            if not found:
+                print(f"[VERCEL][INFO] Optional cron for {exp_path} (expected {exp_sched}) not in vercel.json — handled externally via cron-job.org (Hobby daily limit)")
+            elif found.get("schedule") != exp_sched:
+                print(f"[VERCEL][WARN] Optional cron {exp_path}: got {found.get('schedule')} expected {exp_sched} (Hobby may reject */15)")
+            else:
+                print(f"[VERCEL][PASS] {exp_path} → {exp_sched} (if Hobby allows)")
         if ok:
-            print("[VERCEL][PASS] All Vercel crons correctly exposed")
+            print("[VERCEL][PASS] Required Vercel crons correctly exposed (scanner external due to Hobby limit)")
         else:
-            print("[VERCEL][FAIL] Fix vercel.json crons to match expected (see above)")
+            print("[VERCEL][FAIL] Fix vercel.json required crons to match expected (see above)")
     except Exception as exc:
         print(f"[VERCEL][ERROR] {exc}")
 
