@@ -1,4 +1,36 @@
 {
+  "functions": {
+    "api/webhook.py": {
+      "runtime": "@vercel/python@3.9.0"
+    },
+    "api/cron/pre_market.py": {
+      "runtime": "@vercel/python@3.9.0"
+    },
+    "api/cron/post_market.py": {
+      "runtime": "@vercel/python@3.9.0"
+    },
+    "api/cron/scanner.py": {
+      "runtime": "@vercel/python@3.9.0"
+    }
+  },
+  "rewrites": [
+    {
+      "source": "/api/webhook",
+      "destination": "/api/webhook.py"
+    },
+    {
+      "source": "/api/cron/pre_market",
+      "destination": "/api/cron/pre_market.py"
+    },
+    {
+      "source": "/api/cron/post_market",
+      "destination": "/api/cron/post_market.py"
+    },
+    {
+      "source": "/api/cron/scanner",
+      "destination": "/api/cron/scanner.py"
+    }
+  ],
   "builds": [
     {
       "src": "api/webhook.py",
