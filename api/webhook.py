@@ -545,6 +545,44 @@ try:
                     except Exception as re_exc:
                         logger.warning("[JOIN] retry upsert failed: %s", re_exc)
                     return False, False
+                # FK resilience: if trade_id does not exist in trade_signals parent, retry with trade_id=0 (or NULL fallback)
+                _body_lower = (resp.text or "").lower()
+                if "foreign key" in _body_lower or "violates foreign key" in _body_lower or "23503" in (resp.text or ""):
+                    print(f"[SUPABASE][FK] Foreign key violation for trade_id={attempt_payload.get('trade_id')} - retrying with trade_id=0 fallback (trade_signals deleted)")
+                    logger.warning("[JOIN][FK] trade_id %s not found in trade_signals - fallback to 0", attempt_payload.get('trade_id'))
+                    fallback_payload = dict(attempt_payload)
+                    fallback_payload["trade_id"] = 0
+                    try:
+                        resp_fk = requests.post(
+                            f"{supabase_url}/rest/v1/{USER_PORTFOLIO_TABLE}?on_conflict=user_id,symbol",
+                            json=fallback_payload,
+                            headers=upsert_headers,
+                            timeout=10,
+                        )
+                        print(f"[SUPABASE][FK] Retry with trade_id=0 code={resp_fk.status_code} body={resp_fk.text[:300]}")
+                        if resp_fk.status_code in (200, 201, 204, 409):
+                            is_already = resp_fk.status_code == 409
+                            print(f"[SUPABASE][FK] Fallback SUCCESS trade_id=0 already={is_already}")
+                            return True, is_already
+                    except Exception as fk_exc:
+                        import traceback
+                        print(f"[JOIN_ERROR] {traceback.format_exc()}")
+                        logger.warning("[JOIN][FK] fallback failed: %s", fk_exc)
+                    # If fallback also fails, try with trade_id omitted (rely on DB default)
+                    try:
+                        no_trade_payload = {k: v for k, v in attempt_payload.items() if k != "trade_id"}
+                        resp_no_trade = requests.post(
+                            f"{supabase_url}/rest/v1/{USER_PORTFOLIO_TABLE}?on_conflict=user_id,symbol",
+                            json=no_trade_payload,
+                            headers=upsert_headers,
+                            timeout=10,
+                        )
+                        print(f"[SUPABASE][FK] Retry without trade_id code={resp_no_trade.status_code}")
+                        if resp_no_trade.status_code in (200, 201, 204, 409):
+                            return True, resp_no_trade.status_code == 409
+                    except Exception:
+                        pass
+                    return False, False
                 body = (resp.text or "")[:300]
                 if 400 <= resp.status_code < 500:
                     logger.warning("[JOIN][SUPABASE 4xx] user_portfolio upsert %s (%s) - check SUPABASE_SERVICE_ROLE_KEY / RLS", resp.status_code, body)
@@ -555,6 +593,8 @@ try:
                 else:
                     logger.warning("[JOIN] user_portfolio upsert %s (%s)", resp.status_code, body)
             except Exception as exc:
+                import traceback
+                print(f"[JOIN_ERROR] {traceback.format_exc()}")
                 logger.warning("[JOIN] user_portfolio upsert request failed: %s", exc)
             # Only one attempt loop for upsert; break to fallback plain insert
             break
@@ -595,6 +635,41 @@ try:
                     except Exception as re2_exc:
                         logger.warning("[JOIN] plain retry failed: %s", re2_exc)
                     return False, False
+                # FK resilience for plain insert
+                _body2_lower = (resp2.text or "").lower()
+                if "foreign key" in _body2_lower or "violates foreign key" in _body2_lower or "23503" in (resp2.text or ""):
+                    print(f"[SUPABASE][FK] Plain insert FK violation trade_id={attempt_payload.get('trade_id')} - retrying with trade_id=0")
+                    logger.warning("[JOIN][FK] plain insert trade_id %s FK fail - fallback 0", attempt_payload.get('trade_id'))
+                    fallback_plain = dict(attempt_payload)
+                    fallback_plain["trade_id"] = 0
+                    try:
+                        resp_fk_plain = requests.post(
+                            f"{supabase_url}/rest/v1/{USER_PORTFOLIO_TABLE}",
+                            json=fallback_plain,
+                            headers=plain_headers,
+                            timeout=10,
+                        )
+                        print(f"[SUPABASE][FK] Plain retry trade_id=0 code={resp_fk_plain.status_code}")
+                        if resp_fk_plain.status_code in (200, 201, 204, 409):
+                            return True, resp_fk_plain.status_code == 409
+                    except Exception as fkpe:
+                        import traceback
+                        print(f"[JOIN_ERROR] {traceback.format_exc()}")
+                    # Try without trade_id
+                    try:
+                        no_trade_plain = {k: v for k, v in attempt_payload.items() if k != "trade_id"}
+                        resp_no_trade_plain = requests.post(
+                            f"{supabase_url}/rest/v1/{USER_PORTFOLIO_TABLE}",
+                            json=no_trade_plain,
+                            headers=plain_headers,
+                            timeout=10,
+                        )
+                        print(f"[SUPABASE][FK] Plain retry without trade_id code={resp_no_trade_plain.status_code}")
+                        if resp_no_trade_plain.status_code in (200, 201, 204, 409):
+                            return True, resp_no_trade_plain.status_code == 409
+                    except Exception:
+                        pass
+                    return False, False
                 body2 = (resp2.text or "")[:300]
                 if 400 <= resp2.status_code < 500:
                     logger.warning("[JOIN][SUPABASE 4xx] user_portfolio insert failed %s: %s", resp2.status_code, body2)
@@ -605,6 +680,8 @@ try:
                 else:
                     logger.warning("[JOIN] user_portfolio insert failed %s: %s", resp2.status_code, body2)
             except Exception as exc:
+                import traceback
+                print(f"[JOIN_ERROR] {traceback.format_exc()}")
                 logger.warning("[JOIN] user_portfolio insert request failed: %s", exc)
             break
         return False, False
@@ -1302,6 +1379,251 @@ try:
         logger.info("[PORTFOLIO_STATUS] user=%s ticker=%s trade_id=%s dm=%s", user_id, ticker, trade_id, delivered)
         return True, f"portfolio_status dm={delivered} pnl={current_price}"
 
+    CLOSED_POSITIONS_TABLE = "closed_positions"
+
+    def _archive_closed_position(
+        supabase_url: str,
+        supabase_key: str,
+        user_id: str,
+        symbol: str,
+        trade_id: int,
+        entry_price: Optional[float],
+        exit_price: Optional[float],
+        quantity_pct: int,
+        close_reason: str,
+    ) -> bool:
+        """Archive closed trade to closed_positions with realized PnL. Never raises. Handles missing table gracefully."""
+        if not supabase_url or not supabase_key or not user_id or not symbol:
+            print(f"[ARCHIVE][SKIP] missing config user={user_id} symbol={symbol}")
+            return False
+        if entry_price is None or exit_price is None:
+            print(f"[ARCHIVE][WARN] missing prices entry={entry_price} exit={exit_price} for {symbol} - using 0 PnL")
+            realized_pnl_pct = 0.0
+            realized_pnl = 0.0
+        else:
+            try:
+                realized_pnl_pct = (float(exit_price) - float(entry_price)) / float(entry_price) * 100.0 * (quantity_pct / 100.0)
+                realized_pnl = (float(exit_price) - float(entry_price)) * (quantity_pct / 100.0)
+            except Exception as e:
+                print(f"[ARCHIVE][ERROR] PnL calc failed: {e}")
+                realized_pnl_pct = 0.0
+                realized_pnl = 0.0
+        payload = {
+            "user_id": str(user_id),
+            "symbol": normalize_ticker(symbol),
+            "trade_id": int(trade_id) if trade_id else 0,
+            "entry_price": float(entry_price) if entry_price is not None else None,
+            "exit_price": float(exit_price) if exit_price is not None else None,
+            "quantity_percentage": int(quantity_pct),
+            "realized_pnl": float(realized_pnl),
+            "realized_pnl_pct": float(realized_pnl_pct),
+            "close_reason": str(close_reason)[:50],
+            "closed_at": datetime.now(timezone.utc).isoformat(),
+        }
+        # Remove None values for optional fields
+        payload = {k: v for k, v in payload.items() if v is not None}
+        headers = {"apikey": supabase_key, "Authorization": f"Bearer {supabase_key}", "Content-Type": "application/json", "Prefer": "return=representation"}
+        try:
+            resp = requests.post(f"{supabase_url}/rest/v1/{CLOSED_POSITIONS_TABLE}", json=payload, headers=headers, timeout=10)  # type: ignore
+            print(f"[ARCHIVE] POST closed_positions {symbol} qty={quantity_pct}% reason={close_reason} -> {resp.status_code} {resp.text[:300]}")
+            if resp.status_code in (200, 201, 204):
+                logger.info("[ARCHIVE] closed_positions archived user=%s symbol=%s qty=%s reason=%s pnl=%.2f%%", user_id, symbol, quantity_pct, close_reason, realized_pnl_pct)
+                return True
+            elif resp.status_code == 404 and "PGRST205" in (resp.text or ""):
+                print(f"[ARCHIVE][WARN] closed_positions table not found (PGRST205) - run SQL to create table")
+                logger.warning("[ARCHIVE] closed_positions table missing - run CREATE TABLE")
+                # Fallback: log to user_portfolio snapshot for now
+                return False
+            else:
+                body = (resp.text or "")[:300]
+                if 400 <= resp.status_code < 500:
+                    logger.warning("[ARCHIVE][4xx] closed_positions %s %s", resp.status_code, body)
+                print(f"[ARCHIVE][FAIL] {resp.status_code} {body}")
+                return False
+        except Exception as exc:
+            import traceback
+            print(f"[JOIN_ERROR] {traceback.format_exc()}")
+            logger.warning("[ARCHIVE] request failed: %s", exc)
+            return False
+
+    def _fetch_user_portfolio_entry(supabase_url: str, supabase_key: str, user_id: str, symbol: str, trade_id: int) -> Optional[Dict[str, Any]]:
+        """Fetch user_portfolio entry to get entry_price. Never raises."""
+        try:
+            norm = normalize_ticker(symbol)
+            headers = {"apikey": supabase_key, "Authorization": f"Bearer {supabase_key}", "Content-Type": "application/json"}
+            # Try by trade_id first
+            if trade_id and trade_id > 0:
+                url = f"{supabase_url}/rest/v1/{USER_PORTFOLIO_TABLE}?user_id=eq.{user_id}&trade_id=eq.{trade_id}&select=*&limit=1"
+                resp = requests.get(url, headers=headers, timeout=10)
+                if resp.status_code == 200:
+                    rows = resp.json()
+                    if isinstance(rows, list) and rows:
+                        return dict(rows[0])
+            # Fallback by symbol
+            url2 = f"{supabase_url}/rest/v1/{USER_PORTFOLIO_TABLE}?user_id=eq.{user_id}&symbol=eq.{norm}&select=*&limit=1"
+            resp2 = requests.get(url2, headers=headers, timeout=10)
+            if resp2.status_code == 200:
+                rows2 = resp2.json()
+                if isinstance(rows2, list) and rows2:
+                    return dict(rows2[0])
+            # Bare symbol fallback
+            bare = norm.replace(".CA", "")
+            url3 = f"{supabase_url}/rest/v1/{USER_PORTFOLIO_TABLE}?user_id=eq.{user_id}&symbol=eq.{bare}&select=*&limit=1"
+            resp3 = requests.get(url3, headers=headers, timeout=10)
+            if resp3.status_code == 200:
+                rows3 = resp3.json()
+                if isinstance(rows3, list) and rows3:
+                    return dict(rows3[0])
+            return None
+        except Exception as exc:
+            print(f"[FETCH_ENTRY][ERROR] {exc}")
+            return None
+
+    def _get_current_market_price(ticker: str) -> Optional[float]:
+        """Fetch current market price for exit price fallback. Never raises."""
+        try:
+            import yfinance as yf  # type: ignore
+            df = yf.Ticker(ticker).history(period="1d", auto_adjust=False)
+            if df is not None and not df.empty and "Close" in df.columns:
+                return float(df["Close"].iloc[-1])
+        except Exception:
+            pass
+        return None
+
+    def handle_exit_confirm(
+        query: Dict[str, Any],
+        data: str,
+        bot_token: str,
+        supabase_url: str,
+        supabase_key: str,
+    ) -> Tuple[bool, str]:
+        """Handle exit_confirm:{ticker}:{trade_id}:{qty_pct}:{exit_price}:{reason} - archive to closed_positions."""
+        callback_query_id = str((query or {}).get("id", "")).strip()
+        if callback_query_id and bot_token:
+            try:
+                _answer_callback(callback_query_id, bot_token, "⏳ جاري تسجيل الخروج...")
+            except:
+                pass
+        try:
+            parts = str(data or "").split(":")
+            if len(parts) < 4 or parts[0] != "exit_confirm":
+                return False, "invalid-exit-confirm"
+            ticker = normalize_ticker(parts[1])
+            trade_id = int(parts[2]) if parts[2].strip().isdigit() else 0
+            qty_pct = int(parts[3]) if len(parts) > 3 and parts[3].strip().isdigit() else 100
+            exit_price = None
+            if len(parts) > 4 and parts[4].strip():
+                try:
+                    exit_price = float(parts[4].strip())
+                except:
+                    exit_price = None
+            close_reason = parts[5].strip() if len(parts) > 5 and parts[5].strip() else "Manual Exit"
+            if qty_pct not in (25, 50, 75, 100):
+                qty_pct = 100 if qty_pct >= 75 else 50
+            from_user = query.get("from") or {}
+            user_id = str(from_user.get("id", "")).strip()
+            if not user_id:
+                return False, "missing-user-id"
+            # Fetch entry_price from user_portfolio
+            entry_row = _fetch_user_portfolio_entry(supabase_url, supabase_key, user_id, ticker, trade_id)
+            entry_price = None
+            if entry_row:
+                entry_price = entry_row.get("entry_price") or entry_row.get("joined_at_price")
+                try:
+                    entry_price = float(entry_price) if entry_price is not None else None
+                except:
+                    entry_price = None
+            # Fallback to trade_signals entry_price
+            if entry_price is None:
+                sig = _fetch_trade_signal(supabase_url, supabase_key, ticker, trade_id)
+                if sig:
+                    entry_price = sig.get("entry_price")
+                    try:
+                        entry_price = float(entry_price) if entry_price is not None else None
+                    except:
+                        entry_price = None
+            # Fallback to current market price if exit_price not provided
+            if exit_price is None:
+                exit_price = _get_current_market_price(ticker)
+                if exit_price is None:
+                    exit_price = entry_price
+            if entry_price is None or exit_price is None:
+                msg = "⚠️ تعذر تحديد أسعار الدخول/الخروج. استخدم /exit <TICKER> <PRICE> <QTY%>"
+                try:
+                    _answer_callback(callback_query_id, bot_token, msg, show_alert=True)
+                except:
+                    pass
+                return False, "missing-prices"
+            # Archive to closed_positions
+            archived = _archive_closed_position(supabase_url, supabase_key, user_id, ticker, trade_id, entry_price, exit_price, qty_pct, close_reason)
+            # Update user_portfolio: if 100% exit, mark EXITED; if partial, keep TRACKING but log
+            try:
+                headers = {"apikey": supabase_key, "Authorization": f"Bearer {supabase_key}", "Content-Type": "application/json", "Prefer": "return=representation"}
+                norm = normalize_ticker(ticker)
+                if qty_pct >= 100:
+                    # Full exit - mark EXITED
+                    for status in ("EXITED", "CLOSED"):
+                        try:
+                            if trade_id and trade_id > 0:
+                                url = f"{supabase_url}/rest/v1/{USER_PORTFOLIO_TABLE}?user_id=eq.{user_id}&trade_id=eq.{trade_id}"
+                            else:
+                                url = f"{supabase_url}/rest/v1/{USER_PORTFOLIO_TABLE}?user_id=eq.{user_id}&symbol=eq.{norm}"
+                            resp = requests.patch(url, json={"status": status}, headers=headers, timeout=10)  # type: ignore
+                            if resp.status_code in (200, 204):
+                                break
+                        except Exception:
+                            continue
+                else:
+                    # Partial exit - keep TRACKING, optionally update quantity metadata
+                    # For now, keep status TRACKING and log partial
+                    print(f"[EXIT] Partial {qty_pct}% for {ticker} - keeping TRACKING, archived closed portion")
+                print(f"[EXIT] Archived {ticker} qty={qty_pct}% entry={entry_price} exit={exit_price} reason={close_reason} archived={archived}")
+            except Exception as e:
+                print(f"[EXIT][WARN] user_portfolio update failed: {e}")
+            # Send confirmation DM
+            try:
+                pnl_pct = (float(exit_price) - float(entry_price)) / float(entry_price) * 100.0 if entry_price and entry_price != 0 else 0.0
+                pnl_pct_adj = pnl_pct * (qty_pct / 100.0)
+                emoji = "🟢" if pnl_pct_adj >= 0 else "🔴"
+                confirm_text = (
+                    f"{emoji} <b>تم تسجيل الخروج</b> {qty_pct}% من <code>{ticker.replace('.CA','')}</code>\n"
+                    f"💵 دخول: {float(entry_price):.2f} EGP\n"
+                    f"💰 خروج: {float(exit_price):.2f} EGP\n"
+                    f"📊 ربح/خسارة: {pnl_pct_adj:+.2f}% ({quantity_pct_to_egp(entry_price, exit_price, qty_pct):+.2f} EGP)\n"
+                    f"📝 السبب: {close_reason}\n"
+                    f"{'🔴 تم إغلاق الصفقة بالكامل' if qty_pct >= 100 else '🟡 تبقى جزء في المحفظة - يمكنك إغلاق الباقي لاحقا'}"
+                )
+            except Exception:
+                confirm_text = f"✅ تم تسجيل الخروج {qty_pct}% من {ticker} بسعر {exit_price} EGP - {close_reason}"
+            try:
+                _answer_callback(callback_query_id, bot_token, f"✅ خروج {qty_pct}% مسجل", show_alert=False)
+            except:
+                pass
+            try:
+                if requests and bot_token and user_id:
+                    dm_payload = {"chat_id": user_id, "text": confirm_text, "parse_mode": "HTML"}
+                    requests.post(TELEGRAM_SEND_URL.format(token=bot_token), json=dm_payload, timeout=10)
+            except Exception:
+                pass
+            logger.info("[EXIT_CONFIRM] user=%s ticker=%s qty=%s entry=%s exit=%s reason=%s", user_id, ticker, qty_pct, entry_price, exit_price, close_reason)
+            return True, f"exit_confirm qty={qty_pct} pnl={pnl_pct_adj:.2f}%"
+        except Exception as exc:
+            import traceback
+            print(f"[JOIN_ERROR] {traceback.format_exc()}")
+            logger.error("[EXIT_CONFIRM] crashed: %s", exc, exc_info=True)
+            try:
+                if callback_query_id and bot_token:
+                    _answer_callback(callback_query_id, bot_token, "⚠️ حدث خطأ - حاول مرة أخرى")
+            except:
+                pass
+            return False, f"error:{exc}"
+
+    def quantity_pct_to_egp(entry: float, exit: float, qty_pct: int) -> float:
+        try:
+            return (float(exit) - float(entry)) * (qty_pct / 100.0)
+        except:
+            return 0.0
+
     def handle_leave_trade(
         query: Dict[str, Any],
         data: str,
@@ -1309,7 +1631,7 @@ try:
         supabase_url: str,
         supabase_key: str,
     ) -> Tuple[bool, str]:
-        """Handle leave_trade:{ticker}:{trade_id} - update status to CLOSED and notify."""
+        """Handle leave_trade:{ticker}:{trade_id} - show interactive exit dialog (Full vs Partial) instead of flat delete."""
         callback_query_id = ""
         try:
             callback_query_id = str((query or {}).get("id", "")).strip()
@@ -1317,7 +1639,7 @@ try:
             callback_query_id = ""
         if callback_query_id and bot_token:
             try:
-                _answer_callback(callback_query_id, bot_token, "⏳ جاري إغلاق الصفقة...")
+                _answer_callback(callback_query_id, bot_token, "⏳ جاري تحضير خيارات الخروج...")
             except:
                 pass
         parsed = parse_leave_trade_callback(data)
@@ -1339,87 +1661,80 @@ try:
                 try: _answer_callback(callback_query_id, bot_token, "⚠️ إعدادات قاعدة البيانات غير متوفرة", show_alert=True)
                 except: pass
             return False, "missing-supabase-config"
-        # Update status to CLOSED (also support EXITED for legacy CHECK constraint)
-        success = False
-        # Try CLOSED first, fallback to EXITED, then DELETED
-        for target_status in ("CLOSED", "EXITED"):
+        # Fetch entry and current price for prompt
+        entry_row = _fetch_user_portfolio_entry(supabase_url, supabase_key, user_id, ticker, trade_id)
+        entry_price = None
+        if entry_row:
+            entry_price = entry_row.get("entry_price") or entry_row.get("joined_at_price")
             try:
-                # Use PATCH with filters user_id + symbol (and trade_id if >0)
-                # Supabase PostgREST PATCH expects query params
-                headers = {"apikey": supabase_key, "Authorization": f"Bearer {supabase_key}", "Content-Type": "application/json", "Prefer": "return=representation"}
-                # Build filter
-                # Prefer trade_id if provided (>0) to be precise
-                if trade_id and trade_id > 0:
-                    # Update by user_id + trade_id (more precise)
-                    url = f"{supabase_url}/rest/v1/{USER_PORTFOLIO_TABLE}?user_id=eq.{user_id}&trade_id=eq.{trade_id}"
-                    # Also add symbol filter as extra safety via or? But primary is user_id+trade_id
-                else:
-                    norm = normalize_ticker(ticker)
-                    url = f"{supabase_url}/rest/v1/{USER_PORTFOLIO_TABLE}?user_id=eq.{user_id}&symbol=eq.{norm}"
-                resp = requests.patch(url, json={"status": target_status}, headers=headers, timeout=10)  # type: ignore
-                print(f"[LEAVE_TRADE] PATCH {url} status={target_status} -> {resp.status_code} {resp.text[:300]}")
-                if resp.status_code in (200, 204):
-                    # Verify at least one row affected (if representation, check body)
-                    try:
-                        if resp.text and "CLOSED" in resp.text or "EXITED" in resp.text:
-                            success = True
-                        else:
-                            # 204 no content is also success
-                            success = True
-                    except:
-                        success = True
-                    if success:
-                        break
-                elif resp.status_code == 400 and ("PGRST" in (resp.text or "") or "CHECK" in (resp.text or "")):
-                    # CHECK constraint violation (e.g., CLOSED not allowed, try next)
-                    print(f"[LEAVE_TRADE] CHECK violation for {target_status}, trying next")
-                    continue
-                else:
-                    # Other error, try next status
-                    body = (resp.text or "")[:200]
-                    if 400 <= resp.status_code < 500:
-                        logger.warning("[LEAVE_TRADE][4xx] PATCH %s %s", resp.status_code, body)
-                    continue
-            except Exception as exc:
-                logger.warning("[LEAVE_TRADE] PATCH failed for %s: %s", target_status, exc)
-                continue
-        if not success:
-            # Final fallback: try updating by symbol bare variant
+                entry_price = float(entry_price) if entry_price is not None else None
+            except:
+                entry_price = None
+        if entry_price is None:
+            sig = _fetch_trade_signal(supabase_url, supabase_key, ticker, trade_id)
+            if sig:
+                entry_price = sig.get("entry_price")
+                try:
+                    entry_price = float(entry_price) if entry_price is not None else None
+                except:
+                    entry_price = None
+        current_price = _get_current_market_price(ticker) or entry_price
+        # Build interactive exit dialog
+        try:
+            _answer_callback(callback_query_id, bot_token, "📋 اختر نوع الخروج", show_alert=False)
+        except:
+            pass
+        # Send DM with exit options
+        try:
+            if requests and bot_token and user_id:
+                bare = ticker.replace(".CA", "")
+                entry_str = f"{float(entry_price):.2f}" if entry_price is not None else "-"
+                current_str = f"{float(current_price):.2f}" if current_price is not None else "-"
+                dialog_text = (
+                    f"📤 <b>خروج من الصفقة | {bare}</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"💵 دخول: {entry_str} EGP\n"
+                    f"📈 حالي: {current_str} EGP\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"اختر نوع الخروج:\n"
+                    f"• <b>Full Exit 100%</b> - إغلاق كامل\n"
+                    f"• <b>Partial 50%</b> - بيع نصف الكمية\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"أو أرسل يدوياً: <code>/exit {bare} {current_str} 50</code>\n"
+                    f"الصيغة: <code>/exit TICKER PRICE QTY%</code>"
+                )
+                # Use current_price as default exit price for buttons, fallback to entry
+                exit_price_for_button = float(current_price) if current_price is not None else float(entry_price) if entry_price is not None else 0.0
+                keyboard = {
+                    "inline_keyboard": [
+                        [
+                            {"text": "🔴 خروج كامل 100%", "callback_data": f"exit_confirm:{ticker}:{trade_id}:100:{exit_price_for_button:.2f}:Manual Exit"},
+                            {"text": "🟡 خروج جزئي 50%", "callback_data": f"exit_confirm:{ticker}:{trade_id}:50:{exit_price_for_button:.2f}:Target 1"},
+                        ],
+                        [
+                            {"text": "🔵 25% خروج", "callback_data": f"exit_confirm:{ticker}:{trade_id}:25:{exit_price_for_button:.2f}:Partial"},
+                            {"text": "📊 حالة الصفقة", "callback_data": f"portfolio_status:{bare}"},
+                        ]
+                    ]
+                }
+                resp_dm = requests.post(
+                    TELEGRAM_SEND_URL.format(token=bot_token),
+                    json={"chat_id": user_id, "text": dialog_text, "parse_mode": "HTML", "reply_markup": keyboard},
+                    timeout=10,
+                )
+                print(f"[LEAVE_TRADE] Exit dialog DM to {user_id} -> {resp_dm.status_code} {resp_dm.text[:200]}")
+                logger.info("[LEAVE_TRADE] exit dialog sent user=%s ticker=%s trade_id=%s entry=%s current=%s", user_id, ticker, trade_id, entry_price, current_price)
+                return True, "exit_dialog_sent"
+        except Exception as dm_exc:
+            import traceback
+            print(f"[JOIN_ERROR] {traceback.format_exc()}")
+            logger.warning("[LEAVE_TRADE] exit dialog DM failed: %s", dm_exc)
+            # Fallback to old behavior: mark closed
             try:
-                norm_bare = normalize_ticker(ticker).replace(".CA", "")
-                headers = {"apikey": supabase_key, "Authorization": f"Bearer {supabase_key}", "Content-Type": "application/json", "Prefer": "return=representation"}
-                url2 = f"{supabase_url}/rest/v1/{USER_PORTFOLIO_TABLE}?user_id=eq.{user_id}&symbol=eq.{norm_bare}"
-                resp2 = requests.patch(url2, json={"status": "EXITED"}, headers=headers, timeout=10)  # type: ignore
-                print(f"[LEAVE_TRADE] Fallback PATCH bare {url2} -> {resp2.status_code}")
-                if resp2.status_code in (200, 204):
-                    success = True
+                _answer_callback(callback_query_id, bot_token, "⚠️ فشل إرسال خيارات الخروج - سيتم الإغلاق المباشر", show_alert=True)
             except:
                 pass
-        if success:
-            msg = "🔴 تم إغلاق الصفقة وإزالتها من محفظتك النشطة."
-            try:
-                _answer_callback(callback_query_id, bot_token, msg, show_alert=True)
-            except:
-                pass
-            # Also send private DM confirmation
-            try:
-                if requests and bot_token and user_id:
-                    dm_payload = {"chat_id": user_id, "text": msg, "parse_mode": "HTML"}
-                    resp_dm = requests.post(TELEGRAM_SEND_URL.format(token=bot_token), json=dm_payload, timeout=10)
-                    print(f"[LEAVE_TRADE] Confirmation DM to {user_id} -> {resp_dm.status_code}")
-            except Exception as dm_exc:
-                logger.warning("[LEAVE_TRADE] confirmation DM failed: %s", dm_exc)
-            logger.info("[LEAVE_TRADE] user=%s ticker=%s trade_id=%s -> CLOSED success", user_id, ticker, trade_id)
-            return True, "closed"
-        else:
-            # Not found or failed
-            msg = "⚠️ لم يتم العثور على الصفقة في محفظتك."
-            try:
-                _answer_callback(callback_query_id, bot_token, msg, show_alert=True)
-            except:
-                pass
-            logger.info("[LEAVE_TRADE] user=%s ticker=%s trade_id=%s not found or update failed", user_id, ticker, trade_id)
-            return True, "not-found"
+        return True, "exit_dialog"
 
     # Live signal updates propagation to tracking users
     def push_live_update_to_subscribers(
@@ -1632,6 +1947,25 @@ try:
                 if alert is None:
                     logger.info("[JOIN] trade_signals miss for %s id=%s, trying legacy sent_alerts fallback", ticker_bare, trade_id)
                     alert = _fetch_latest_sent_alert(supabase_url, supabase_key, ticker_bare)
+                # FK resilience: if trade_signals deleted, use callback payload metadata to prevent silent FK failure
+                if alert is None:
+                    print(f"[JOIN][FK] trade_signals miss for {ticker_bare} id={trade_id} - using callback payload fallback (prevents FK silent fail)")
+                    logger.warning("[JOIN][FK] trade_signals miss for %s id=%s - synthetic fallback from callback", ticker_bare, trade_id)
+                    alert = {
+                        "ticker": ticker_bare,
+                        "symbol": ticker_bare,
+                        "ticker_bare": ticker_bare.replace(".CA", ""),
+                        "entry_price": None,
+                        "stop_loss": None,
+                        "current_stop_loss": None,
+                        "target_1": None,
+                        "target_2": None,
+                        "target_3": None,
+                        "strategy": "Unknown",
+                        "strategy_type": "Unknown",
+                        "source": "callback_fallback",
+                        "id": trade_id if trade_id else 0,
+                    }
                 # Normalize stop_loss column naming (trade_signals uses stop_loss, webhook card uses current_stop_loss)
                 sl_value = (alert or {}).get("current_stop_loss")
                 if sl_value is None:
@@ -1748,6 +2082,8 @@ try:
             logger.info("[JOIN] user=%s trade=%s id=%s -> %s", user_id, ticker_bare, trade_id, detail)
             return True, detail
         except Exception as exc:
+            import traceback
+            print(f"[JOIN_ERROR] {traceback.format_exc()}")
             logger.error("[JOIN] handle_join_trade crashed: %s", exc, exc_info=True)
             # Ensure spinner is killed even on crash.
             try:
@@ -1934,6 +2270,37 @@ try:
                         detail_lt = f"error:{exc}"
                     print(f"[WEBHOOK][LEAVE_TRADE] handled={handled_lt} detail={detail_lt}")
                     logger.info("[WEBHOOK][LEAVE_TRADE] handled=%s detail=%s", handled_lt, detail_lt)
+                    try:
+                        if hasattr(request, "status_code"):
+                            request.status_code = 200
+                            return "OK"
+                    except:
+                        pass
+                    return {"statusCode": 200, "body": "OK"}
+
+                if data.startswith("exit_confirm:"):
+                    handled_ec, detail_ec = False, "not-executed"
+                    try:
+                        handled_ec, detail_ec = handle_exit_confirm(
+                            query=query,
+                            data=data,
+                            bot_token=bot_token,
+                            supabase_url=supabase_url,
+                            supabase_key=supabase_key,
+                        )
+                    except Exception as exc:
+                        print(f"[WEBHOOK][EXIT_CONFIRM][ERROR] {exc}")
+                        import traceback
+                        print(f"[JOIN_ERROR] {traceback.format_exc()}")
+                        logger.error("[WEBHOOK][EXIT_CONFIRM] crashed: %s", exc, exc_info=True)
+                        if not _immediate_done and bot_token and callback_id:
+                            try:
+                                _answer_callback(str(callback_id), bot_token, "⚠️ حدث خطأ - حاول مرة أخرى")
+                            except:
+                                pass
+                        detail_ec = f"error:{exc}"
+                    print(f"[WEBHOOK][EXIT_CONFIRM] handled={handled_ec} detail={detail_ec}")
+                    logger.info("[WEBHOOK][EXIT_CONFIRM] handled=%s detail=%s", handled_ec, detail_ec)
                     try:
                         if hasattr(request, "status_code"):
                             request.status_code = 200

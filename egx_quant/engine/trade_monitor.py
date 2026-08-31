@@ -391,13 +391,23 @@ def publish_target_alert(ticker: str, target_level: int, target_price: float, cu
         print(f"[DRY-RUN - PUBLIC CARD]\n{card[:800]}")
         public_ok = True
 
-    # Push DM to subscribers
+    # Push DM to subscribers with actionable steps
     trade_id = None
     raw_signals = _get_active_signals_from_supabase()
     for s in raw_signals:
         if (s.get("ticker") or s.get("symbol")) == ticker:
             trade_id = s.get("trade_id") or s.get("id")
             break
+
+    # Determine actionable suggestion based on target level
+    if target_level == 1:
+        action_suggestion = "💡 <b>الإجراء المقترح:</b> بيع 50% من الكمية عند T1 وحرك وقف الخسارة إلى نقطة الدخول (Breakeven) لتأمين الأرباح."
+    elif target_level == 2:
+        action_suggestion = "💡 <b>الإجراء المقترح:</b> بيع 25% إضافية عند T2 وحافظ على وقف متحرك تحت T1."
+    elif target_level >= 3:
+        action_suggestion = "💡 <b>الإجراء المقترح:</b> جني الأرباح المتبقية أو الإغلاق الكامل - الهدف النهائي تحقق."
+    else:
+        action_suggestion = "💡 <b>الإجراء المقترح:</b> مراجعة الصفقة وتحديث وقف الخسارة."
 
     if not dry_run:
         try:
@@ -408,6 +418,7 @@ def publish_target_alert(ticker: str, target_level: int, target_price: float, cu
                 dm_text = (
                     f"{card}\n"
                     f"------------------------------------\n"
+                    f"{action_suggestion}\n"
                     f"📩 تم إرسال تنبيه الهدف لك في الخاص."
                 )
                 token = (os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
@@ -425,9 +436,9 @@ def publish_target_alert(ticker: str, target_level: int, target_price: float, cu
                         except Exception:
                             continue
                     dm_ok = ok_count > 0
-                    logger.info(f"[DM] Target alert sent to {ok_count}/{len(subscribers)} subscribers for {ticker}")
+                    logger.info(f"[DM] Target alert with action sent to {ok_count}/{len(subscribers)} subscribers for {ticker} T{target_level}")
                 else:
-                    logger.info(f"[MOCK DM] Would send target alert to {len(subscribers)} users for {ticker}")
+                    logger.info(f"[MOCK DM] Would send target alert with action to {len(subscribers)} users for {ticker}")
                     dm_ok = True
             else:
                 logger.info(f"[DM] No subscribers for {ticker} (trade_id={trade_id})")
@@ -436,11 +447,88 @@ def publish_target_alert(ticker: str, target_level: int, target_price: float, cu
             logger.warning(f"[DM] Exception: {e}")
             dm_ok = True  # degrade gracefully
     else:
-        logger.info(f"[DRY-RUN] Would push DM to subscribers for {ticker}")
+        logger.info(f"[DRY-RUN] Would push DM with action to subscribers for {ticker} T{target_level}")
         dm_ok = True
 
     return (public_ok, dm_ok)
 
+
+def format_trailing_sl_update(ticker: str, new_sl: float, current_price: float, entry_price: Optional[float] = None) -> str:
+    """Format trailing stop update card with actionable suggestion."""
+    bare = clean_ticker(ticker)
+    pnl = ((current_price - entry_price) / entry_price * 100) if entry_price else 0
+    return (
+        f"📈 <b>تحديث وقف الخسارة المتحرك | {bare}</b>\n"
+        f"------------------------------------\n"
+        f"🔹 <b>السهم:</b> <code>{bare}</code>\n"
+        f"💵 <b>السعر الحالي:</b> {current_price:.2f} EGP ({pnl:+.2f}%)\n"
+        f"🔴 <b>وقف الخسارة الجديد:</b> {new_sl:.2f} EGP\n"
+        f"------------------------------------\n"
+        f"💡 <b>الإجراء المقترح:</b> تم رفع الوقف لحماية الأرباح - لا حاجة للتدخل.\n"
+        f"📊 [EGX TradingView](https://www.tradingview.com/markets/egypt/)"
+    )
+
+def publish_trailing_sl_alert(ticker: str, new_sl: float, current_price: float, entry_price: Optional[float] = None, dry_run: bool = False) -> Tuple[bool, bool]:
+    """Broadcast trailing SL update to subscribers with actionable DM."""
+    card = format_trailing_sl_update(ticker, new_sl, current_price, entry_price)
+    # Reuse target alert logic but with trailing specific
+    public_ok = False
+    dm_ok = False
+    if not dry_run:
+        channel = os.environ.get("TELEGRAM_CHANNEL_NEWS") or os.environ.get("TELEGRAM_CHANNEL_SCALPING") or ""
+        if channel and notifier.enabled:
+            public_ok = notifier.send_to_chat(channel, card)
+        elif notifier.enabled:
+            public_ok = notifier.broadcast_signal(card)
+        else:
+            logger.info(f"[MOCK BROADCAST] Trailing SL update for {ticker}")
+            print(f"[MOCK BROADCAST - PUBLIC]\n{card[:500]}")
+            public_ok = True
+    else:
+        logger.info(f"[DRY-RUN] Would broadcast trailing SL update for {ticker}")
+        print(f"[DRY-RUN - PUBLIC CARD]\n{card[:800]}")
+        public_ok = True
+
+    # Push DM with trailing suggestion
+    raw_signals = _get_active_signals_from_supabase()
+    trade_id = None
+    for s in raw_signals:
+        if (s.get("ticker") or s.get("symbol")) == ticker:
+            trade_id = s.get("trade_id") or s.get("id")
+            break
+    if not dry_run:
+        try:
+            subscribers = list_subscribers(trade_id) if trade_id else []
+            if not subscribers and ticker:
+                subscribers = list_subscribers_by_symbol(ticker)
+            if subscribers:
+                dm_text = f"{card}\n------------------------------------\n💡 <b>الإجراء:</b> الوقف المتحرك يحمي أرباحك تلقائياً."
+                token = (os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
+                if token and requests:
+                    ok_count = 0
+                    for uid in subscribers:
+                        try:
+                            resp = requests.post(
+                                f"https://api.telegram.org/bot{token}/sendMessage",
+                                json={"chat_id": uid, "text": dm_text, "parse_mode": "HTML"},
+                                timeout=10,
+                            )
+                            if resp.status_code == 200:
+                                ok_count += 1
+                        except Exception:
+                            continue
+                    dm_ok = ok_count > 0
+                    logger.info(f"[DM] Trailing SL sent to {ok_count}/{len(subscribers)} for {ticker}")
+                else:
+                    dm_ok = True
+            else:
+                dm_ok = True
+        except Exception as e:
+            logger.warning(f"[DM] Exception: {e}")
+            dm_ok = True
+    else:
+        dm_ok = True
+    return (public_ok, dm_ok)
 
 def publish_sl_alert(ticker: str, current_price: float, stop_loss: float, entry_price: Optional[float] = None, dry_run: bool = False) -> Tuple[bool, bool]:
     """Broadcast SL exit alert to public channel + mark trade closed + push DM.
@@ -622,6 +710,59 @@ def check_stop_loss_hits(enriched: List[Dict[str, Any]]) -> List[Dict[str, Any]]
     return hits
 
 
+def check_trailing_stop_updates(enriched: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Detect trailing stop opportunities: when price is up >5% and trailing SL should be moved.
+
+    Returns list of dicts with keys: ticker, current_price, new_sl, entry_price, trade_id.
+    Suggests moving SL to breakeven or trailing.
+    """
+    updates: List[Dict[str, Any]] = []
+    for sig in enriched:
+        try:
+            ticker = sig.get("ticker")
+            entry = sig.get("entry_price")
+            current = sig.get("current_price")
+            stop = sig.get("stop_loss")
+            if not ticker or entry is None or current is None or stop is None:
+                continue
+            if current <= stop:
+                continue  # SL hit will be handled separately
+            pnl_pct = (current - entry) / entry * 100 if entry else 0
+            # If up >5% and current SL still below entry, suggest moving to breakeven
+            if pnl_pct >= 5.0 and stop < entry:
+                new_sl = round(entry * 1.005, 2)  # Breakeven + 0.5%
+                # Check if new SL is higher than old (trailing up)
+                if new_sl > stop:
+                    updates.append({
+                        "ticker": ticker,
+                        "current_price": current,
+                        "new_sl": new_sl,
+                        "entry_price": entry,
+                        "trade_id": sig.get("trade_id"),
+                        "pnl_pct": pnl_pct,
+                    })
+            # If up >10% and already breakeven, trail to T1 level
+            elif pnl_pct >= 10.0:
+                targets = sig.get("targets", [])
+                if targets and len(targets) >= 1:
+                    t1 = targets[0]
+                    # Trail to T1 if current above T1 and SL below T1
+                    if current >= t1 and stop < t1:
+                        new_sl = round(t1 * 0.99, 2)
+                        if new_sl > stop:
+                            updates.append({
+                                "ticker": ticker,
+                                "current_price": current,
+                                "new_sl": new_sl,
+                                "entry_price": entry,
+                                "trade_id": sig.get("trade_id"),
+                                "pnl_pct": pnl_pct,
+                            })
+        except Exception:
+            continue
+    return updates
+
+
 def run_monitor_cycle(dry_run: bool = False) -> Dict[str, Any]:
     """Execute one full monitoring cycle.
 
@@ -707,7 +848,35 @@ def run_monitor_cycle(dry_run: bool = False) -> Dict[str, Any]:
         logger.error(f"SL hit detection failed: {e}")
         result["errors"].append(f"detect_sl: {e}")
 
-    logger.info(f"===== Trade Monitor Cycle END: {result['target_hits']} targets, {result['sl_hits']} SLs =====")
+    # Trailing Stop & Target Hit Auto-Alerts: dispatch DM with actionable steps
+    try:
+        trailing_updates = check_trailing_stop_updates(enriched)
+        result["trailing_updates"] = len(trailing_updates)
+        result["trailing_results"] = []
+        for upd in trailing_updates:
+            try:
+                public_ok, dm_ok = publish_trailing_sl_alert(
+                    ticker=upd["ticker"],
+                    new_sl=upd["new_sl"],
+                    current_price=upd["current_price"],
+                    entry_price=upd["entry_price"],
+                    dry_run=dry_run,
+                )
+                result["trailing_results"].append({
+                    "ticker": upd["ticker"],
+                    "new_sl": upd["new_sl"],
+                    "public_ok": public_ok,
+                    "dm_ok": dm_ok,
+                })
+                logger.info(f"Trailing SL update for {upd['ticker']}: new_sl={upd['new_sl']} public={public_ok} dm={dm_ok}")
+            except Exception as e:
+                logger.error(f"Trailing alert failed for {upd['ticker']}: {e}")
+                result["errors"].append(f"trailing_{upd['ticker']}: {e}")
+    except Exception as e:
+        logger.error(f"Trailing check failed: {e}")
+        result["errors"].append(f"detect_trailing: {e}")
+
+    logger.info(f"===== Trade Monitor Cycle END: {result['target_hits']} targets, {result['sl_hits']} SLs, {result.get('trailing_updates',0)} trailing =====")
     return result
 
 

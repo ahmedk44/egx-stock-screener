@@ -480,12 +480,220 @@ def _handle_start(user_id: str) -> Tuple[bool, str]:
         "📌 <b>الأوامر المتاحة:</b>\n"
         "• <code>/portfolio</code> - عرض محفظتك النشطة مع الأرباح/الخسائر المباشرة\n"
         "• <code>/portfolio [TICKER]</code> - تعديل سعر الدخول لسهم محدد\n"
+        "• <code>/exit &lt;TICKER&gt; [PRICE] [QTY%]</code> - تسجيل خروج جزئي/كامل (مثال: /exit COMI 95 50)\n"
+        "• <code>/stats</code> / <code>/weekly</code> - تقرير أرباح الأسبوع من closed_positions\n"
         "• <code>/close &lt;TICKER&gt; [سبب]</code> - إغلاق صفقة (للمسؤولين فقط)\n"
         "• <code>/update &lt;TICKER&gt; sl=VALUE target1=VALUE</code> - تحديث أهداف الصفقة (للمسؤولين)\n"
         "------------------------------------\n"
         "💡 اضغط زر <b>انضم للصفقة | Track Signal</b> من أي إشارة في القناة العامة لبدء المتابعة.\n"
         "🔒 جميع التحديثات ستصلك في الخاص.\n"
     )
+
+def _handle_exit_command(text: str, from_user: Dict[str, Any], bot_token: str) -> Tuple[bool, str]:
+    """Handle /exit <TICKER> [PRICE] [QTY%] - user exit with partial/full support. Never fails silently."""
+    try:
+        parts = text.strip().split()
+        # parts[0] is /exit
+        if len(parts) < 2:
+            return False, "📝 الاستخدام: <code>/exit &lt;TICKER&gt; [PRICE] [QTY%]</code>\nمثال: <code>/exit COMI.CA 95 50</code> (بيع 50% بسعر 95)\nمثال: <code>/exit COMI.CA</code> (إغلاق كامل بالسعر الحالي)"
+        ticker_raw = parts[1].strip().upper()
+        if not ticker_raw.endswith(".CA"):
+            ticker_raw = f"{ticker_raw}.CA"
+        # Parse optional price and qty
+        exit_price = None
+        qty_pct = 100
+        close_reason = "Manual Exit"
+        if len(parts) >= 3:
+            # Check if parts[2] is price (numeric) or qty%
+            try:
+                # Try to parse as price
+                val = parts[2].replace("%", "")
+                fval = float(val)
+                # Heuristic: if value between 1 and 1000 and contains decimal or is reasonable price, treat as price
+                # If next part also numeric and first was price, second is qty
+                exit_price = fval
+                if len(parts) >= 4:
+                    try:
+                        qty_val = parts[3].replace("%", "")
+                        qty_pct = int(float(qty_val))
+                        if qty_pct not in (25, 50, 75, 100):
+                            qty_pct = 100 if qty_pct >= 75 else 50
+                        if len(parts) >= 5:
+                            close_reason = " ".join(parts[4:])
+                    except:
+                        pass
+            except:
+                # parts[2] might be qty% like 50%
+                try:
+                    qty_val = parts[2].replace("%", "")
+                    qty_pct = int(float(qty_val))
+                    if qty_pct not in (25, 50, 75, 100):
+                        qty_pct = 100
+                except:
+                    pass
+        user_id = str(from_user.get("id", "")).strip()
+        if not user_id:
+            return False, "⚠️ تعذر تحديد هويتك"
+        # Import webhook helpers for archiving (avoid circular import)
+        import sys, os
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+        try:
+            import api.webhook as wh
+            # Use webhook's helper to archive
+            supa_url, supa_key = wh._get_supabase_config()
+            if not supa_url or not supa_key:
+                return False, "⚠️ إعدادات قاعدة البيانات غير متوفرة."
+            # Fetch entry price
+            entry_row = wh._fetch_user_portfolio_entry(supa_url, supa_key, user_id, ticker_raw, 0)
+            entry_price = None
+            if entry_row:
+                entry_price = entry_row.get("entry_price") or entry_row.get("joined_at_price")
+                try:
+                    entry_price = float(entry_price) if entry_price is not None else None
+                except:
+                    entry_price = None
+            if entry_price is None:
+                sig = wh._fetch_trade_signal(supa_url, supa_key, ticker_raw, 0)
+                if sig:
+                    entry_price = sig.get("entry_price")
+                    try:
+                        entry_price = float(entry_price) if entry_price is not None else None
+                    except:
+                        entry_price = None
+            if exit_price is None:
+                # Fetch current market price
+                exit_price = wh._get_current_market_price(ticker_raw)
+                if exit_price is None:
+                    exit_price = entry_price
+            if entry_price is None or exit_price is None:
+                return False, f"⚠️ تعذر تحديد أسعار {ticker_raw}. استخدم: <code>/exit {ticker_raw.replace('.CA','')} 95.5 50</code>"
+            # Archive
+            archived = wh._archive_closed_position(supa_url, supa_key, user_id, ticker_raw, 0, entry_price, exit_price, qty_pct, close_reason)
+            # Update user_portfolio
+            try:
+                headers = {"apikey": supa_key, "Authorization": f"Bearer {supa_key}", "Content-Type": "application/json", "Prefer": "return=representation"}
+                norm = ticker_raw
+                if qty_pct >= 100:
+                    for status in ("EXITED", "CLOSED"):
+                        try:
+                            url = f"{supa_url}/rest/v1/{wh.USER_PORTFOLIO_TABLE}?user_id=eq.{user_id}&symbol=eq.{norm}"
+                            resp = wh.requests.patch(url, json={"status": status}, headers=headers, timeout=10)  # type: ignore
+                            if resp.status_code in (200, 204):
+                                break
+                        except Exception:
+                            continue
+                else:
+                    print(f"[EXIT] Partial {qty_pct}% - keeping TRACKING")
+            except Exception as e:
+                print(f"[EXIT] portfolio update failed: {e}")
+            # Build confirmation
+            try:
+                pnl_pct = (float(exit_price) - float(entry_price)) / float(entry_price) * 100.0 * (qty_pct/100.0) if entry_price else 0.0
+            except:
+                pnl_pct = 0.0
+            emoji = "🟢" if pnl_pct >= 0 else "🔴"
+            text_out = (
+                f"{emoji} <b>تم تسجيل الخروج</b> {qty_pct}% من <code>{ticker_raw.replace('.CA','')}</code>\n"
+                f"💵 دخول: {float(entry_price):.2f} EGP\n"
+                f"💰 خروج: {float(exit_price):.2f} EGP\n"
+                f"📊 ربح/خسارة: {pnl_pct:+.2f}%\n"
+                f"📝 السبب: {close_reason}\n"
+                f"{'🔴 إغلاق كامل' if qty_pct>=100 else '🟡 خروج جزئي - الباقي لا يزال نشط'}"
+            )
+            return True, text_out
+        except Exception as e:
+            import traceback
+            print(f"[JOIN_ERROR] {traceback.format_exc()}")
+            return False, f"⚠️ فشل تسجيل الخروج: {str(e)[:150]}"
+    except Exception as e:
+        import traceback
+        print(f"[JOIN_ERROR] {traceback.format_exc()}")
+        return False, f"⚠️ خطأ: {str(e)[:150]}"
+
+def _handle_weekly_stats(user_id: str, bot_token: str) -> Tuple[bool, str]:
+    """Handle /stats or /weekly - query closed_positions for current week."""
+    try:
+        import sys, os
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+        import api.webhook as wh
+        supa_url, supa_key = wh._get_supabase_config()
+        if not supa_url or not supa_key:
+            return False, "⚠️ إعدادات قاعدة البيانات غير متوفرة."
+        # Calculate week start (Monday 00:00 UTC)
+        from datetime import timedelta
+        now = datetime.now(timezone.utc)
+        # Find Monday of current week
+        monday = now - timedelta(days=now.weekday())
+        monday = monday.replace(hour=0, minute=0, second=0, microsecond=0)
+        monday_iso = monday.isoformat()
+        headers = {"apikey": supa_key, "Authorization": f"Bearer {supa_key}", "Content-Type": "application/json"}
+        # Query closed_positions for user_id and closed_at >= monday
+        url = f"{supa_url}/rest/v1/{wh.CLOSED_POSITIONS_TABLE}?user_id=eq.{user_id}&closed_at=gte.{monday_iso}&select=*&order=closed_at.desc&limit=50"
+        try:
+            resp = wh.requests.get(url, headers=headers, timeout=10)  # type: ignore
+            if resp.status_code == 404 and "PGRST205" in (resp.text or ""):
+                return False, "⚠️ جدول closed_positions غير موجود - شغل SQL: CREATE TABLE closed_positions ( ... )"
+            if resp.status_code != 200:
+                return False, f"⚠️ فشل جلب البيانات: {resp.status_code} {(resp.text or '')[:150]}"
+            rows = resp.json()
+            if not isinstance(rows, list):
+                rows = []
+        except Exception as e:
+            import traceback
+            print(f"[JOIN_ERROR] {traceback.format_exc()}")
+            return False, f"⚠️ فشل الاتصال: {str(e)[:150]}"
+        if not rows:
+            return True, (
+                f"📊 <b>تقرير الأسبوع</b> ({monday.strftime('%Y-%m-%d')} → {now.strftime('%Y-%m-%d')})\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"🔍 لا توجد صفقات مغلقة هذا الأسبوع.\n"
+                f"استخدم زر الخروج لتسجيل أول صفقة."
+            )
+        total = len(rows)
+        wins = 0
+        total_pnl_pct = 0.0
+        total_pnl_egp = 0.0
+        best = None
+        worst = None
+        best_pnl = -9999
+        worst_pnl = 9999
+        for r in rows:
+            try:
+                pnl_pct = float(r.get("realized_pnl_pct") or 0.0)
+                pnl_egp = float(r.get("realized_pnl") or 0.0)
+                total_pnl_pct += pnl_pct
+                total_pnl_egp += pnl_egp
+                if pnl_pct > 0:
+                    wins += 1
+                if pnl_pct > best_pnl:
+                    best_pnl = pnl_pct
+                    best = r
+                if pnl_pct < worst_pnl:
+                    worst_pnl = pnl_pct
+                    worst = r
+            except:
+                continue
+        win_rate = (wins / total * 100.0) if total else 0.0
+        avg_pnl = (total_pnl_pct / total) if total else 0.0
+        sep = "━━━━━━━━━━━━━━━━━━━━"
+        lines = [
+            f"📊 <b>تقرير الأسبوع</b> ({monday.strftime('%Y-%m-%d')} → {now.strftime('%Y-%m-%d')})\n",
+            sep,
+            f"📋 إجمالي الصفقات المغلقة: <b>{total}</b>",
+            f"🏆 Win Rate: <b>{win_rate:.1f}%</b> ({wins}/{total})",
+            f"💰 إجمالي PnL: <b>{total_pnl_egp:+.2f} EGP</b> (<b>{total_pnl_pct:+.2f}%</b>)",
+            f"📈 متوسط PnL: <b>{avg_pnl:+.2f}%</b>",
+        ]
+        if best:
+            lines.append(f"🥇 أفضل صفقة: <code>{str(best.get('symbol','')).replace('.CA','')}</code> {float(best.get('realized_pnl_pct') or 0):+.2f}% ({best.get('close_reason','')})")
+        if worst:
+            lines.append(f"🔻 أسوأ صفقة: <code>{str(worst.get('symbol','')).replace('.CA','')}</code> {float(worst.get('realized_pnl_pct') or 0):+.2f}% ({worst.get('close_reason','')})")
+        lines += [sep, "💡 استخدم <code>/exit TICKER PRICE QTY%</code> لتسجيل خروج جديد"]
+        return True, "\n".join(lines)
+    except Exception as e:
+        import traceback
+        print(f"[JOIN_ERROR] {traceback.format_exc()}")
+        return False, f"⚠️ فشل تقرير الأسبوع: {str(e)[:150]}"
 
 def handle_slash_command(text: str, from_user: Dict[str, Any], bot_token: str) -> Tuple[bool, str]:
     """Route slash commands: /start, /portfolio, /close, /update, محفظتي.
@@ -540,6 +748,22 @@ def handle_slash_command(text: str, from_user: Dict[str, Any], bot_token: str) -
                 f"السبب: {str(e)[:200]}\n"
                 f"تحقق من إعدادات SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY أو تواصل مع المسؤول."
             )
+
+    # /exit - user exit with partial/full support (not admin-only)
+    if command == "/exit":
+        # /exit <TICKER> [PRICE] [QTY%] - e.g., /exit COMI 95 50, /exit COMI.CA 100
+        return _handle_exit_command(text, from_user, bot_token)
+
+    # /stats and /weekly - weekly PnL from closed_positions
+    if command in ("/stats", "/weekly", "/احصائيات", "/تقرير"):
+        try:
+            print(f"[WEEKLY] Dispatch /weekly user={user_id}")
+            success, card = _handle_weekly_stats(user_id, bot_token)
+            return success, card
+        except Exception as e:
+            import traceback
+            print(f"[JOIN_ERROR] {traceback.format_exc()}")
+            return False, f"⚠️ فشل تقرير الأسبوع: {str(e)[:150]}"
 
     # Also handle /portfolio with @bot suffix already stripped above
     # Admin-only commands
