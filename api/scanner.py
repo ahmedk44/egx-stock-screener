@@ -23,7 +23,7 @@ import json
 import os
 import sys
 # Ensure project root is on sys.path for Vercel runtime (/var/task)
-sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from datetime import datetime, timezone, timedelta
 from http.server import BaseHTTPRequestHandler
 from typing import Any, Dict
@@ -107,13 +107,10 @@ class handler(BaseHTTPRequestHandler):
                 finally:
                     sys.argv = orig_argv
             except Exception as e:
-                print(f"[CRON][SCANNER] screener import/run failed: {e}, trying subprocess fallback")
-                import subprocess
-                main_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "main.py")
-                proc = subprocess.run([sys.executable, main_path], capture_output=True, text=True, timeout=120)
-                result["signals"] = {"ok": proc.returncode == 0, "returncode": proc.returncode, "stdout": proc.stdout[-500:], "stderr": proc.stderr[-500:]}
-                if proc.returncode != 0:
-                    overall_ok = False
+                print(f"[CRON][SCANNER] screener import/run failed: {e}")
+                import traceback; traceback.print_exc()
+                result["signals"] = {"ok": False, "error": str(e)}
+                overall_ok = False
 
             # 2) Run trade monitor (target/SL)
             try:
