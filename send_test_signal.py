@@ -40,11 +40,11 @@ try:
 except ImportError:
     requests = None  # type: ignore[assignment]
 
-# Scanner pipeline imports - ensure we use the canonical short card + single button
+# Scanner pipeline imports - unified card comes from the egx_quant notifier;
+# main.py provides the join markup + telegram transport.
 try:
-    from main import build_channel_short_card, build_join_markup, send_telegram
+    from main import build_join_markup, send_telegram
 except ImportError:
-    build_channel_short_card = None  # type: ignore[assignment]
     build_join_markup = None  # type: ignore[assignment]
     send_telegram = None  # type: ignore[assignment]
 
@@ -219,61 +219,57 @@ def insert_trade_signal(url: str, key: str) -> int | None:
 
 
 def broadcast_teaser(ticker: str, trade_id: int, token: str, channel: str, dry_run: bool = False) -> bool:
-    """Send concise teaser card with single join_trade button to TELEGRAM_CHANNEL_SCALPING."""
-    # Build short card via canonical scanner pipeline
-    strategy = "scalping"
-    ctx: Dict[str, Any] = {
-        "price": 100.0,
-        "rsi": 62.0,
-        "ema20": 98.0,
-        "sma50": 95.0,
-        "volume_ratio": 2.1,
-    }
-    # Use main.py's build_channel_short_card if available, else fallback to minimal manual card
-    if build_channel_short_card is not None:
-        try:
-            short_card = build_channel_short_card(strategy, ticker, ctx, None)
-        except Exception as exc:
-            print(f"[WARN] build_channel_short_card failed: {exc}, using fallback")
-            short_card = f"🚀 **إشارة جديدة | TEST.CA**\n💵 سعر الدخول : 100.00\n🛑 وقف الخسارة : 95.00\n🥇 الهدف الأول : 105.00\n👇 اضغط الزر للمتابعة الخاصة بالصفقة:"
-    else:
-        short_card = f"🚀 **إشارة جديدة | TEST.CA**\n💵 سعر الدخول : 100.00\n🛑 وقف الخسارة : 95.00\n🥇 الهدف الأول : 105.00\n👇 اضغط الزر للمتابعة الخاصة بالصفقة:"
+    """Send unified teaser card (format_channel_short_card) + single join_trade button."""
+    # Unified template: ALL signal broadcasts route through
+    # egx_quant.utils.telegram_notifier.format_channel_short_card
+    try:
+        from types import SimpleNamespace
 
-    # Single button via build_join_markup (ensures no legacy 3-button)
-    if build_join_markup is not None:
+        from egx_quant.utils.telegram_notifier import TelegramNotifier as _TN
+
+        plan = SimpleNamespace(
+            symbol="TEST.CA",
+            entry_price=100.0,
+            stop_loss=95.0,
+            take_profit=105.0,
+            target_1=105.0,
+            target_2=107.0,
+            target_3=110.0,
+            tqi_score=8.5,
+            strategy_type="scalping",
+        )
+        short_card = "\n".join(_TN().format_channel_short_card(plan, trade_id))
+    except Exception as exc:
+        print(f"[WARN] format_channel_short_card failed: {exc}, using minimal fallback")
+        short_card = (
+            "🚀 <b>إشارة جديدة | TEST</b>\n"
+            "💵 <b>سعر الدخول:</b> 100.00 EGP\n"
+            "🛑 <b>وقف الخسارة (SL):</b> 95.00 EGP\n"
+            "🎯 <b>الهدف الأول:</b> 105.00 EGP\n"
+            "👇 اضغط الزر للمتابعة وتلقي التحديثات والتحليل المفصل في الخاص:"
+        )
+
+    # Single button with trade_id attached: join_trade:{TICKER_BARE}:{TRADE_ID}
+    bare = ticker.replace(".CA", "")
+    if eq_build_join_markup is not None:
         try:
-            markup = build_join_markup(ticker)
-            # Ensure markup is single button - override if legacy (safety)
-            # build_join_markup now returns single join_trade button; verify
-            kbd = markup.get("inline_keyboard", [])
-            # If trade_id provided, enrich callback_data to include trade_id for precise webhook lookup
-            if trade_id and kbd and kbd[0] and kbd[0][0]:
-                # Original is join_trade:TEST.CA ; we append :{trade_id} if not already
-                cb = kbd[0][0].get("callback_data", "")
-                if cb == "join_trade:TEST.CA" and trade_id:
-                    kbd[0][0]["callback_data"] = f"join_trade:TEST.CA:{trade_id}"
-            print(f"[MARKUP] {json.dumps(markup, ensure_ascii=False)}")
-            # Validate strictly single button
-            assert len(kbd) == 1 and len(kbd[0]) == 1 and "join_trade" in kbd[0][0].get("callback_data",""), "Legacy 3-button detected!"
-        except Exception as exc:
-            print(f"[WARN] build_join_markup validation failed: {exc}")
-            markup = {"inline_keyboard": [[{"text": "📥 انضم للصفقة | Track Signal", "callback_data": f"join_trade:{ticker}:{trade_id}" if trade_id else f"join_trade:{ticker}"}]]}
-    elif eq_build_join_markup is not None:
-        try:
-            # egx_quant path expects (trade_id, ticker_bare)
-            markup = eq_build_join_markup(trade_id, ticker.replace(".CA",""))
-            print(f"[MARKUP] {json.dumps(markup, ensure_ascii=False)}")
+            markup = eq_build_join_markup(trade_id, bare)
         except Exception as exc:
             print(f"[WARN] eq_build_join_markup failed: {exc}")
-            markup = {"inline_keyboard": [[{"text": "📥 انضم للصفقة | Track Signal", "callback_data": f"join_trade:{ticker}:{trade_id}"}]]}
+            markup = {"inline_keyboard": [[{"text": "📥 انضم للصفقة | Track Signal", "callback_data": f"join_trade:{bare}:{trade_id}"}]]}
+    elif build_join_markup is not None:
+        markup = build_join_markup(ticker, trade_id)
     else:
-        markup = {"inline_keyboard": [[{"text": "📥 انضم للصفقة | Track Signal", "callback_data": f"join_trade:{ticker}:{trade_id}" if trade_id else f"join_trade:{ticker}"}]]}
-        print(f"[MARKUP] Fallback {json.dumps(markup, ensure_ascii=False)}")
+        markup = {"inline_keyboard": [[{"text": "📥 انضم للصفقة | Track Signal", "callback_data": f"join_trade:{bare}:{trade_id}"}]]}
+    print(f"[MARKUP] {json.dumps(markup, ensure_ascii=False)}")
 
     print(f"[TELEGRAM] Channel: {channel} | Card preview (first 200 chars): {short_card[:200]}")
-    # Ensure teaser is concise - must contain single button text only
-    btn_text = markup["inline_keyboard"][0][0]["text"]
-    assert btn_text == "📥 انضم للصفقة | Track Signal", f"Button text mismatch: {btn_text}"
+    # Strict single-button validation with trade_id attached
+    kbd = markup.get("inline_keyboard", [])
+    assert len(kbd) == 1 and len(kbd[0]) == 1, "Legacy multi-button layout detected!"
+    btn = kbd[0][0]
+    assert btn.get("text") == "📥 انضم للصفقة | Track Signal", f"Button text mismatch: {btn.get('text')}"
+    assert f":{trade_id}" in str(btn.get("callback_data", "")), f"trade_id missing from callback_data: {btn.get('callback_data')}"
 
     if dry_run:
         print("[DRY-RUN] Skipping Telegram send")
@@ -283,20 +279,20 @@ def broadcast_teaser(ticker: str, trade_id: int, token: str, channel: str, dry_r
         print("[FAIL] TELEGRAM_BOT_TOKEN or TELEGRAM_CHANNEL_SCALPING missing")
         return False
 
-    # Use main.send_telegram if available (handles Markdown + reply_markup)
+    # Use main.send_telegram if available (supports parse_mode="HTML")
     if send_telegram is not None:
         try:
-            ok = send_telegram(channel, short_card, token, reply_markup=markup)
+            ok = send_telegram(channel, short_card, token, reply_markup=markup, parse_mode="HTML")
             print(f"[TELEGRAM] send_telegram -> {ok} (HTTP 200/201 expected)")
             return bool(ok)
         except Exception as exc:
             print(f"[ERROR] send_telegram failed: {exc}")
             return False
 
-    # Fallback direct POST
+    # Fallback direct POST (HTML parse mode to match the unified template)
     assert requests is not None
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {"chat_id": channel, "text": short_card, "parse_mode": "Markdown", "reply_markup": markup}
+    payload = {"chat_id": channel, "text": short_card, "parse_mode": "HTML", "reply_markup": markup}
     try:
         resp = requests.post(url, json=payload, timeout=15)
         print(f"[TELEGRAM] POST sendMessage -> HTTP {resp.status_code}")

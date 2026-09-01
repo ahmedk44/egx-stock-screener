@@ -277,21 +277,18 @@ class SessionDaemon:
             opened.append(position_id)
             logger.info("[CYCLE] Opened #%d %s x%d @ %.2f TQI=%.1f", position_id, plan.symbol, plan.quantity, plan.entry_price, sig.tqi_score)
             # Publish card fields so the Vercel webhook can DM the full card on join.
+            # Schema-aligned payload (live trade_signals: ticker/tqi_score, no
+            # execution metrics - trade_id/quantity/allocated_cost/risk_amount stripped).
             await asyncio.to_thread(
                 supabase_sync.publish_trade_signal,
                 {
-                    "trade_id": position_id,
-                    "symbol": plan.symbol,
-                    "ticker_bare": clean_ticker(plan.symbol),
+                    "ticker": plan.symbol,
                     "entry_price": plan.entry_price,
                     "stop_loss": plan.stop_loss,
                     "target_1": plan.target_1,
                     "target_2": plan.target_2,
                     "target_3": plan.target_3,
-                    "tqi": plan.tqi_score,
-                    "quantity": plan.quantity,
-                    "allocated_cost": plan.allocated_cost,
-                    "risk_amount": plan.risk_amount,
+                    "tqi_score": plan.tqi_score,
                     "shariah_status": shariah.get_status(plan.symbol).value,
                 },
             )

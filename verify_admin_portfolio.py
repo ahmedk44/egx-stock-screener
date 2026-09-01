@@ -4,8 +4,8 @@ Verification script for Admin Commands and User Portfolio system.
 
 Tests:
   1. Admin guard: is_admin returns True for configured IDs, False for others
-  2. /close command: validates ticker, builds close card, calls close_trade
-  3. /update command: validates parameters, builds update card, calls update_trade
+  2. /close command: any user force-closes their OWN user_portfolio position
+  3. /update command: any user sets personal sl/target overrides on their own row
   4. /portfolio command: builds portfolio card with mock positions
   5. Card format completeness: verify all required fields present
   6. format_* functions render correctly
@@ -48,9 +48,14 @@ def test_admin_guard():
     assert is_admin("") is False, "Empty ID should NOT be admin"
     print("[PASS] Admin guard works correctly")
 
-    # Test with empty admin list
+    # Test with empty admin list (is_admin re-reads env dynamically, so patch the loader)
     ac.ADMIN_IDS = []
-    assert is_admin("123456789") is False, "Empty admin list should return False"
+    _orig_loader = ac._load_admin_ids
+    ac._load_admin_ids = lambda: []
+    try:
+        assert is_admin("123456789") is False, "Empty admin list should return False"
+    finally:
+        ac._load_admin_ids = _orig_loader
     print("[PASS] Empty admin list returns False")
 
     return True
@@ -162,11 +167,11 @@ def test_slash_command_parse():
     # Should attempt close (may fail without Supabase, but should not crash)
     print(f"[PASS] /close parsed: ok={ok}, text_len={len(text)}")
 
-    # /close without ticker
+    # /close without ticker -> interactive own-position close menu (graceful everywhere)
     ok, text = handle_slash_command("/close", from_user, "")
     assert ok is False, "/close without ticker should return False"
-    assert "استعمال" in text or "TICKER" in text, "/close missing usage hint"
-    print("[PASS] /close without ticker shows usage")
+    assert isinstance(text, str) and text.strip(), "/close without ticker returns a message"
+    print(f"[PASS] /close without ticker shows menu/message: {text[:40]}")
 
     # /update
     ok, text = handle_slash_command("/update TEST3.CA sl=95 target1=110", from_user, "")
@@ -179,13 +184,25 @@ def test_slash_command_parse():
     assert ok is False, "/update without params should return False"
     print("[PASS] /update without params shows usage")
 
-    # Non-admin access
+    # Non-admin access: /close & /update have NO admin gate - every user operates
+    # on their OWN user_portfolio row (graceful without Supabase, never "denied")
     ac.ADMIN_IDS = ["999999999"]
     from_user_non = {"id": 123456789, "first_name": "User"}
     ok, text = handle_slash_command("/close TEST3.CA", from_user_non, "")
-    assert ok is False, "Non-admin should be denied"
-    assert "مسؤولين" in text or "⛔" in text, "Non-admin should see forbidden message"
-    print("[PASS] Non-admin denied for /close")
+    assert isinstance(ok, bool), "Non-admin /close returns (bool, str)"
+    assert "مسؤولين" not in text and "⛔" not in text, "Non-admin should NOT be denied for own-position close"
+    print(f"[PASS] Non-admin /close allowed on own position: ok={ok}")
+
+    ok, text = handle_slash_command("/update TEST3.CA sl=95", from_user_non, "")
+    assert isinstance(ok, bool), "Non-admin /update returns (bool, str)"
+    assert "مسؤولين" not in text and "⛔" not in text, "Non-admin should NOT be denied for own-position update"
+    print(f"[PASS] Non-admin /update allowed on own position: ok={ok}")
+
+    # Admin users get the SAME own-position behavior (no global broadcast path)
+    ac.ADMIN_IDS = ["123456789"]
+    ok, text = handle_slash_command("/close TEST3.CA", from_user, "")
+    assert isinstance(ok, bool), "Admin /close returns (bool, str)"
+    print(f"[PASS] Admin /close routed to own-position handler: ok={ok}")
 
     return True
 

@@ -189,7 +189,22 @@ def test_short_card_and_button() -> None:
     check("no allocation pct in short card", "نسبة الدخول من المحفظه" not in card)
     check("no news summary block in short card", "ملخص الأخبار" not in card)
     check("no macro block in short card", "التحليل الكلي" not in card)
-    check("no target_2/target_3 lines in short card", "الهدف الثاني" not in card and "الهدف الثالث" not in card)
+    # Unified template renders dynamic targets 1..N (Target 2/3 included).
+    check("dynamic target_2/target_3 lines in card", "الهدف الثاني" in card and "الهدف الثالث" in card)
+
+    # Unified template: ALL broadcasts route through format_channel_short_card.
+    unified = screener.build_unified_channel_card(
+        strategy="swing",
+        ticker="COMI.CA",
+        entry_price=42.5,
+        stop_loss=39.95,
+        targets=(44.63, 46.75, 49.73),
+        tqi_score=7.0,
+        ctx=CTX,
+    )
+    check("unified card is HTML", "<b>" in unified)
+    check("unified card has dynamic targets", "الهدف الأول" in unified and "الهدف الثاني" in unified)
+    check("unified card has TQI", "تقييم الجودة (TQI)" in unified)
 
     markup = screener.build_join_markup("comi.ca")
     btn = markup["inline_keyboard"][0][0]
@@ -208,10 +223,11 @@ def test_process_ticker_sends_short_card_only() -> None:
     state: Dict[str, Any] = {"last_alerts": {}}
     sent: Dict[str, Any] = {}
 
-    def fake_send(chat_id: Optional[str], message: str, token: Optional[str], reply_markup: Any = None) -> bool:
+    def fake_send(chat_id: Optional[str], message: str, token: Optional[str], reply_markup: Any = None, parse_mode: str = "Markdown") -> bool:
         sent["chat_id"] = chat_id
         sent["message"] = message
         sent["markup"] = reply_markup
+        sent["parse_mode"] = parse_mode
         return True
 
     # Minimal daily frame so indicator helpers / synthetic delta run offline.
@@ -259,12 +275,14 @@ def test_process_ticker_sends_short_card_only() -> None:
     check("a message was dispatched to the routed channel", bool(sent))
     check("routed to swing strategy channel", sent.get("chat_id") == "-100222")
     msg = str(sent.get("message", ""))
-    check("dispatched text is the SHORT card", "إشارة جديدة" in msg and "اضغط الزر" in msg)
+    check("dispatched text is the unified SHORT card", "إشارة جديدة" in msg and "اضغط الزر" in msg)
+    check("unified card sent with HTML parse mode", sent.get("parse_mode") == "HTML")
     check("full detail card NOT dispatched", "سبب دخول الصفقه فنيا" not in msg)
     check("news block NOT dispatched", "ملخص الأخبار" not in msg)
     markup = sent.get("markup") or {}
     btn = ((markup.get("inline_keyboard") or [[]])[0] or [{}])[0]
     check("join button attached to broadcast", btn.get("callback_data") == "join_trade:SWDY.CA")
+    check("join button carries canonical text", btn.get("text") == "📥 انضم للصفقة | Track Signal")
 
 
 # --------------------------------------------------------------------------

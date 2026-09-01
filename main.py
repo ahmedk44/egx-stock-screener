@@ -52,6 +52,16 @@ import requests
 import yfinance as yf
 from google import genai
 
+# Unified channel broadcast template (egx_quant engine) - guarded import so the
+# screener still runs if the engine package is unavailable.
+try:
+    from egx_quant.utils.telegram_notifier import TelegramNotifier as _EQTelegramNotifier
+
+    _EQ_NOTIFIER_AVAILABLE = True
+except Exception:  # pragma: no cover - degrade gracefully to legacy card
+    _EQTelegramNotifier = None  # type: ignore[assignment,misc]
+    _EQ_NOTIFIER_AVAILABLE = False
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-7s | %(message)s",
@@ -1049,6 +1059,118 @@ def record_sent_alert_supabase(
         logger.warning("[DEDUP] Unexpected insert error for %s/%s: %s", ticker, strategy, exc)
         print(f"[DEDUP ERROR] Unexpected: {exc}")
         return False
+
+
+def publish_signal_to_trade_signals(
+    ticker: str,
+    strategy_type: str,
+    entry_price: Optional[float] = None,
+    stop_loss: Optional[float] = None,
+    target_1: Optional[float] = None,
+    target_2: Optional[float] = None,
+    target_3: Optional[float] = None,
+    tqi_score: Optional[float] = None,
+) -> int:
+    """Upsert the broadcast signal into Supabase trade_signals (schema-aligned).
+
+    Payload strictly matches the live table (ticker/strategy_type/tqi_score; no
+    trade_id/quantity/allocated_cost/risk_amount). Check-then-PATCH dedup on
+    ticker, then on_conflict=ticker upsert, then plain POST. Returns the row id
+    (used as trade_id on join buttons) or 0 on failure. Never raises.
+    """
+    try:
+        if not _is_supabase_configured():
+            return 0
+        nt = normalize_ticker(ticker)
+        if not nt:
+            return 0
+        if nt in NON_COMPLIANT_TICKERS:
+            shariah_status = "NON_COMPLIANT"
+        elif nt in EGX33_SHARIAH_TICKERS:
+            shariah_status = "COMPLIANT"
+        else:
+            shariah_status = "NEEDS_REVIEW"
+        payload: Dict[str, Any] = {
+            "ticker": nt,
+            "strategy_type": str(strategy_type or "").strip(),
+            "entry_price": float(entry_price) if entry_price is not None else None,
+            "stop_loss": float(stop_loss) if stop_loss is not None else None,
+            "target_1": float(target_1) if target_1 is not None else None,
+            "target_2": float(target_2) if target_2 is not None else None,
+            "target_3": float(target_3) if target_3 is not None else None,
+            "tqi_score": float(tqi_score) if tqi_score is not None else None,
+            "shariah_status": shariah_status,
+        }
+        payload = {k: v for k, v in payload.items() if v is not None}
+        base = _supabase_base_url()
+        if not base:
+            return 0
+        headers = _supabase_headers()
+        # 1) Dedup: existing signal for same ticker -> PATCH it (no duplicate rows)
+        try:
+            check = requests.get(
+                f"{base}/rest/v1/trade_signals?ticker=eq.{nt}&order=created_at.desc&limit=1&select=id",
+                headers=headers,
+                timeout=10,
+            )
+            if check.status_code == 200:
+                rows = check.json()
+                if isinstance(rows, list) and rows and rows[0].get("id") is not None:
+                    existing_id = int(rows[0]["id"])
+                    patch = requests.patch(
+                        f"{base}/rest/v1/trade_signals?id=eq.{existing_id}",
+                        json=payload,
+                        headers={**headers, "Prefer": "return=representation"},
+                        timeout=15,
+                    )
+                    if patch.status_code in (200, 204):
+                        logger.info("[TRADE_SIGNALS] Upserted %s (existing id=%s)", nt, existing_id)
+                        return existing_id
+        except Exception as exc:
+            logger.warning("[TRADE_SIGNALS] dedup check failed for %s: %s", nt, exc)
+        # 2) on_conflict=ticker upsert (handles races)
+        try:
+            up = requests.post(
+                f"{base}/rest/v1/trade_signals?on_conflict=ticker",
+                json=payload,
+                headers={**headers, "Prefer": "resolution=merge-duplicates,return=representation"},
+                timeout=15,
+            )
+            if up.status_code in (200, 201):
+                data = up.json()
+                if isinstance(data, list) and data and isinstance(data[0], dict):
+                    return int(data[0].get("id") or 0)
+                if isinstance(data, dict) and data.get("id"):
+                    return int(data["id"])
+        except Exception as exc:
+            logger.warning("[TRADE_SIGNALS] on_conflict upsert failed for %s: %s", nt, exc)
+        # 3) Plain POST fallback
+        try:
+            resp = requests.post(
+                f"{base}/rest/v1/trade_signals",
+                json=payload,
+                headers={**headers, "Prefer": "return=representation"},
+                timeout=15,
+            )
+            if resp.status_code in (200, 201):
+                data = resp.json()
+                if isinstance(data, list) and data and isinstance(data[0], dict):
+                    return int(data[0].get("id") or 0)
+                if isinstance(data, dict) and data.get("id"):
+                    return int(data["id"])
+            else:
+                logger.warning(
+                    "[TRADE_SIGNALS] insert failed for %s (%s): %s",
+                    nt,
+                    resp.status_code,
+                    (resp.text or "")[:200],
+                )
+        except Exception as exc:
+            logger.warning("[TRADE_SIGNALS] insert request failed for %s: %s", nt, exc)
+        return 0
+    except Exception as exc:
+        logger.warning("[TRADE_SIGNALS] publish_signal_to_trade_signals failed for %s: %s", ticker, exc)
+        return 0
 
 
 # --------------------------------------------------------------------------
@@ -3434,24 +3556,34 @@ def build_trade_keyboard(
         return {"inline_keyboard": []}
 
 
-def build_join_markup(ticker: str) -> Dict[str, Any]:
+def build_join_markup(ticker: str, trade_id: int = 0) -> Dict[str, Any]:
     """Inline keyboard with the unified [ 📥 انضم للصفقة | Track Signal ] button.
 
-    callback_data format: join_trade:{TICKER} (kept well under Telegram's
-    64-byte limit). The Vercel webhook resolves the latest sent_alert specs for
-    the ticker, registers the pressing user in Supabase user_portfolio and DMs
-    them the FULL detail card privately.
+    callback_data format: join_trade:{TICKER_BARE}:{TRADE_ID} whenever a trade_id
+    is available (precise webhook lookup by trade_signals.id); falls back to
+    join_trade:{TICKER} (webhook resolves the latest signal for the ticker).
+    Kept well under Telegram's 64-byte callback_data limit. The Vercel webhook
+    parses the callback, registers the pressing user in Supabase user_portfolio
+    and DMs them the FULL detail card privately.
     """
     try:
         safe_ticker = normalize_ticker(ticker)
         if not safe_ticker:
             safe_ticker = str(ticker).strip().upper()
+        try:
+            tid = int(trade_id)
+        except (TypeError, ValueError):
+            tid = 0
+        if tid > 0:
+            callback_data = f"join_trade:{safe_ticker.replace('.CA', '')}:{tid}"
+        else:
+            callback_data = f"join_trade:{safe_ticker}"
         return {
             "inline_keyboard": [
                 [
                     {
                         "text": "📥 انضم للصفقة | Track Signal",
-                        "callback_data": f"join_trade:{safe_ticker}",
+                        "callback_data": callback_data,
                     }
                 ]
             ]
@@ -3625,6 +3757,62 @@ def build_channel_short_card(strategy: Any, ticker: Any, ctx: Any, sentiment: An
     return build_channel_signal_card(strategy, ticker, ctx, sentiment)
 
 
+_EQ_NOTIFIER_INSTANCE: Optional[Any] = None
+
+
+def _get_eq_notifier() -> Optional[Any]:
+    """Lazily instantiate the egx_quant TelegramNotifier (canonical template source)."""
+    global _EQ_NOTIFIER_INSTANCE
+    if _EQ_NOTIFIER_INSTANCE is None and _EQ_NOTIFIER_AVAILABLE:
+        try:
+            _EQ_NOTIFIER_INSTANCE = _EQTelegramNotifier()
+        except Exception as exc:
+            logger.warning("Failed to initialize egx_quant TelegramNotifier: %s", exc)
+            return None
+    return _EQ_NOTIFIER_INSTANCE
+
+
+def build_unified_channel_card(
+    strategy: Any,
+    ticker: Any,
+    entry_price: Any,
+    stop_loss: Any,
+    targets: Any,
+    tqi_score: Any,
+    sentiment: Any = None,
+    ctx: Any = None,
+) -> str:
+    """Route ALL public channel signal broadcasts through
+    egx_quant.utils.telegram_notifier.format_channel_short_card (single template).
+
+    Builds a lightweight plan view from the screener context and renders the
+    canonical card. Falls back to build_channel_signal_card only when the
+    engine package is unavailable. Output is HTML (send with parse_mode="HTML").
+    """
+    notifier = _get_eq_notifier()
+    if notifier is not None:
+        try:
+            from types import SimpleNamespace
+
+            tvals = [float(t) for t in (targets or []) if t is not None]
+            entry_f = float(entry_price) if entry_price is not None else 0.0
+            plan = SimpleNamespace(
+                symbol=normalize_ticker(str(ticker)),
+                entry_price=entry_f,
+                stop_loss=float(stop_loss) if stop_loss is not None else 0.0,
+                take_profit=tvals[0] if tvals else entry_f,
+                target_1=tvals[0] if len(tvals) > 0 else None,
+                target_2=tvals[1] if len(tvals) > 1 else None,
+                target_3=tvals[2] if len(tvals) > 2 else None,
+                tqi_score=float(tqi_score) if tqi_score is not None else 5.0,
+                strategy_type=str(strategy or ""),
+            )
+            return "\n".join(notifier.format_channel_short_card(plan, 0))
+        except Exception as exc:
+            logger.warning("format_channel_short_card failed (%s); using legacy card", exc)
+    return build_channel_signal_card(strategy, ticker, ctx or {}, sentiment)
+
+
 def build_full_dm_card(ticker: str, alert: Optional[Dict[str, Any]]) -> str:
     """Full private DM card (main.py alias) - dynamic targets + AI intelligence.
 
@@ -3676,10 +3864,12 @@ def build_full_dm_card(ticker: str, alert: Optional[Dict[str, Any]]) -> str:
             return f"🟢 [كارت انضمام للصفقة]\n{ticker} - {alert}"
 
 
-def send_telegram(chat_id: Optional[str], message: str, bot_token: Optional[str], reply_markup: Optional[Dict[str, Any]] = None) -> bool:
-    """Send a Markdown-formatted message to a Telegram chat/channel.
+def send_telegram(chat_id: Optional[str], message: str, bot_token: Optional[str], reply_markup: Optional[Dict[str, Any]] = None, parse_mode: str = "Markdown") -> bool:
+    """Send a message to a Telegram chat/channel.
 
-    Optionally attaches InlineKeyboardMarkup via reply_markup.
+    Optionally attaches InlineKeyboardMarkup via reply_markup. parse_mode defaults
+    to "Markdown" for legacy plain-text sends; unified channel cards (HTML) pass
+    parse_mode="HTML".
     """
     if not bot_token:
         logger.error("TELEGRAM_BOT_TOKEN is not set; cannot send alerts.")
@@ -3690,7 +3880,7 @@ def send_telegram(chat_id: Optional[str], message: str, bot_token: Optional[str]
     payload: Dict[str, Any] = {
         "chat_id": chat_id,
         "text": message,
-        "parse_mode": "Markdown",
+        "parse_mode": parse_mode,
     }
     if reply_markup:
         try:
@@ -5225,10 +5415,6 @@ def process_ticker(ticker: str, state: Dict[str, Any]) -> None:
         if tqi_for_filter < TQI_MIN_THRESHOLD:
             logger.info("[FILTERED] Signal for %s skipped (TQI: %.1f/10 < 5.0)", ticker, tqi_for_filter)
             continue
-        # Public channels receive the UNIFIED SHORT CARD ONLY + [Track Signal] join
-        # button - full detail cards are NEVER posted to public channels.
-        short_card = build_channel_short_card(strategy, normalized_ticker, ctx, sentiment)
-        join_keyboard = build_join_markup(normalized_ticker)
         # Dynamic Channel Routing: pick channel by strategy_type FIRST
         # (TELEGRAM_CHANNEL_SCALPING / _SWING / _INVESTMENT), then fall back to
         # trade-track routing and finally the general TELEGRAM_CHAT_ID.
@@ -5273,9 +5459,35 @@ def process_ticker(ticker: str, state: Dict[str, Any]) -> None:
                 entry_price_pos = 0.0
                 t1_pos = t2_pos = t3_pos = sl_price_pos = 0.0
                 trade_track_pos = TQI_TRACK_LABELS.get(strategy, str(strategy))
+        # Publish the signal to trade_signals (schema-aligned upsert) so the Vercel
+        # webhook resolves the exact row (and full card data) via the button's trade_id.
+        trade_id_pos = publish_signal_to_trade_signals(
+            ticker=normalized_ticker,
+            strategy_type=str(strategy),
+            entry_price=entry_price_pos,
+            stop_loss=sl_price_pos,
+            target_1=t1_pos,
+            target_2=t2_pos,
+            target_3=t3_pos,
+            tqi_score=tqi_for_filter,
+        )
+        # Public channels receive the UNIFIED SHORT CARD ONLY + [Track Signal] join
+        # button - full detail cards are NEVER posted to public channels.
+        short_card = build_unified_channel_card(
+            strategy=strategy,
+            ticker=normalized_ticker,
+            entry_price=entry_price_pos,
+            stop_loss=sl_price_pos,
+            targets=(t1_pos, t2_pos, t3_pos),
+            tqi_score=tqi_for_filter,
+            sentiment=sentiment,
+            ctx=ctx,
+        )
+        join_keyboard = build_join_markup(normalized_ticker, trade_id_pos)
         # Publish the SHORT card + [ 📥 انضم للصفقة | Track Signal ] button only.
         # act_/dis_/cls keyboards and full detail cards never reach public channels.
-        if send_telegram(chat_id, short_card, bot_token, reply_markup=join_keyboard):
+        # Unified template renders HTML tags -> must send with parse_mode="HTML".
+        if send_telegram(chat_id, short_card, bot_token, reply_markup=join_keyboard, parse_mode="HTML"):
             # Atomic / Pre-Send State Update – update local sent_alerts memory set IMMEDIATELY
             # so subsequent iterations in same loop skip it instantly (prevents duplicate loop for ELWA.CA/COMI/CERA.CA)
             try:

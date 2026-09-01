@@ -142,7 +142,7 @@ def _record_target_hit(ticker: str, target_level: int, target_price: float, curr
 
 
 def _mark_trade_closed(ticker: str, trade_id: Optional[int], reason: str) -> bool:
-    """Update trade_signals status to CLOSED and user_portfolio status to EXITED."""
+    """Update trade_signals status to CLOSED and user_portfolio status to CLOSED (remaining=0)."""
     cfg = _cfg()
     if requests is None or cfg is None:
         logger.warning("No Supabase config - cannot mark trade closed")
@@ -172,14 +172,21 @@ def _mark_trade_closed(ticker: str, trade_id: Optional[int], reason: str) -> boo
                 updated = True
         except Exception as e:
             logger.warning(f"[CLOSED] trade_signals exception: {e}")
-    # Update user_portfolio
+    # Update user_portfolio: standardize full closes to status='CLOSED' (+ remaining 0)
+    # Legacy EXITED fallback only for pre-migration DBs (old check constraint).
     try:
         patch_url = f"{url}/rest/v1/{USER_PORTFOLIO_TABLE}?symbol=eq.{ticker}&status=eq.TRACKING"
-        resp = requests.patch(patch_url, json={"status": "EXITED"}, headers=headers, timeout=10)
-        if resp.status_code in (200, 204):
-            logger.info(f"[CLOSED] user_portfolio ticker={ticker} -> EXITED")
-        else:
-            logger.warning(f"[CLOSED] user_portfolio patch failed {resp.status_code}")
+        for payload in ({"status": "CLOSED", "remaining_qty_pct": 0}, {"status": "CLOSED"}, {"status": "EXITED"}):
+            try:
+                resp = requests.patch(patch_url, json=payload, headers=headers, timeout=10)
+                if resp.status_code in (200, 204):
+                    if payload.get("status") == "EXITED":
+                        logger.warning("[CLOSED] legacy DB check-constraint - marked EXITED (run supabase_migration_remaining_qty.sql)")
+                    logger.info(f"[CLOSED] user_portfolio ticker={ticker} -> {payload.get('status')}")
+                    break
+            except Exception as e:
+                logger.warning(f"[CLOSED] user_portfolio exception: {e}")
+                break
     except Exception as e:
         logger.warning(f"[CLOSED] user_portfolio exception: {e}")
     return updated

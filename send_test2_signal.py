@@ -143,11 +143,11 @@ if not trade_id:
     print("[FAIL] No trade_id generated")
     sys.exit(1)
 
-# 2. Verify markup format
-markup_callback=f"join_trade:TEST2.CA:{trade_id}"
+# 2. Verify markup format - canonical: join_trade:{TICKER_BARE}:{TRADE_ID}
+markup_callback=f"join_trade:TEST2:{trade_id}"
 print(f"\n[MARKUP] Canonical single-button callback_data: {markup_callback}")
-assert markup_callback==f"join_trade:TEST2.CA:{trade_id}", "markup mismatch"
-print(f"[VERIFY] Markup format OK: join_trade:TEST2.CA:{{trade_id}}")
+assert markup_callback==f"join_trade:TEST2:{trade_id}", "markup mismatch"
+print(f"[VERIFY] Markup format OK: join_trade:TEST2:{{trade_id}} (webhook normalizes TEST2 -> TEST2.CA)")
 
 # 3. Verify table integrity: readable by trade_id
 verify_url=f"{url}/rest/v1/trade_signals?id=eq.{trade_id}&select=*"
@@ -178,14 +178,30 @@ else:
     sys.exit(1)
 
 # 4. Broadcast to Telegram channel with single button
-# Build short card (concise teaser)
-short_card=f"🚀 إشارة جديدة | TEST2.CA\n💵 سعر الدخول: 150.00 EGP\n🛑 وقف الخسارة: 142.00 EGP\n🥇 الهدف الأول: 158.00 EGP\n👇 اضغط الزر للمتابعة الخاصة:"
-markup={"inline_keyboard": [[{"text": "📥 انضم للصفقة | Track Signal", "callback_data": markup_callback}]]}
+# Unified template: ALL broadcasts route through format_channel_short_card
+from types import SimpleNamespace
+from egx_quant.utils.telegram_notifier import TelegramNotifier, build_join_markup as eq_join_markup
+
+plan_ns=SimpleNamespace(
+    symbol="TEST2.CA",
+    entry_price=150.0,
+    stop_loss=142.0,
+    take_profit=158.0,
+    target_1=158.0,
+    target_2=162.0,
+    target_3=168.0,
+    tqi_score=9.1,
+    strategy_type="Scalping",
+)
+notifier=TelegramNotifier()
+short_card=notifier.format_channel_broadcast(plan_ns, trade_id)
+markup=eq_join_markup(trade_id, "TEST2")
+assert markup["inline_keyboard"][0][0]["callback_data"]==markup_callback, "markup callback mismatch"
 print(f"\n[TELEGRAM] Channel={channel} Card preview: {short_card[:120]}")
 print(f"[TELEGRAM] Markup: {json.dumps(markup, ensure_ascii=False)}")
 
 tg_url=f"https://api.telegram.org/bot{token}/sendMessage"
-tg_payload={"chat_id": channel, "text": short_card, "parse_mode": "Markdown", "reply_markup": markup}
+tg_payload={"chat_id": channel, "text": short_card, "parse_mode": "HTML", "reply_markup": markup}
 tg_resp=requests.post(tg_url, json=tg_payload, timeout=15)
 print(f"[TELEGRAM] POST sendMessage -> HTTP {tg_resp.status_code}")
 print(f"[TELEGRAM] Body: {tg_resp.text[:1000]}")

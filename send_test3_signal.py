@@ -325,20 +325,33 @@ def main():
     if args.dry_run:
         print("[DRY-RUN] Skipping Telegram send")
     else:
-        # Build channel card for broadcast (use webhook builder with full payload + trade_id)
-        broadcast_payload=dict(base_payload)
-        # For broadcast we need card text; use webhook's builder which already verified
-        short_card=mod.build_channel_signal_card("TEST3.CA", broadcast_payload)
-        # Build markup with real trade_id
-        markup={"inline_keyboard": [[{"text": "📥 انضم للصفقة | Track Signal", "callback_data": f"join_trade:TEST3.CA:{trade_id}"}]]}
+        # Unified template: broadcast routes through format_channel_short_card
+        # + canonical join markup join_trade:{TICKER_BARE}:{TRADE_ID}
+        from types import SimpleNamespace
+        from egx_quant.utils.telegram_notifier import TelegramNotifier, build_join_markup as eq_join_markup
+        plan_ns=SimpleNamespace(
+            symbol="TEST3.CA",
+            entry_price=200.0,
+            stop_loss=191.0,
+            take_profit=208.0,
+            target_1=208.0,
+            target_2=215.0,
+            target_3=224.0,
+            tqi_score=9.4,
+            strategy_type="Scalp",
+        )
+        notifier=TelegramNotifier()
+        short_card=notifier.format_channel_broadcast(plan_ns, trade_id)
+        markup=eq_join_markup(trade_id, "TEST3")
         print(f"[TELEGRAM] Channel={channel} Card preview: {short_card[:200]}")
         print(f"[MARKUP] {json.dumps(markup, ensure_ascii=False)}")
-        # Validate single button
+        # Validate single button with trade_id attached
         assert markup["inline_keyboard"][0][0]["text"]=="📥 انضم للصفقة | Track Signal"
+        assert markup["inline_keyboard"][0][0]["callback_data"]==f"join_trade:TEST3:{trade_id}"
         # Try main.send_telegram first
         try:
             from main import send_telegram as main_send
-            ok=main_send(channel, short_card, token, reply_markup=markup)
+            ok=main_send(channel, short_card, token, reply_markup=markup, parse_mode="HTML")
             print(f"[TELEGRAM] main.send_telegram -> {ok}")
         except Exception as e:
             print(f"[WARN] main_send failed {e}, fallback direct POST")

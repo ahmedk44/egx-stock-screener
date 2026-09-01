@@ -30,6 +30,53 @@ load_dotenv()
 TRADE_SIGNALS_TABLE = "trade_signals"
 USER_PORTFOLIO_TABLE = "user_portfolio"
 
+# Active trade_signals schema (live introspection + migrations/001):
+#   id (auto PK), ticker, strategy_type, entry_price, stop_loss,
+#   target_1..target_4, tqi_score, shariah_status,
+#   status, exit_reason, current_stop_loss, created_at (default NOW()).
+_TRADE_SIGNALS_COLUMNS = {
+    "ticker",
+    "strategy_type",
+    "entry_price",
+    "stop_loss",
+    "target_1",
+    "target_2",
+    "target_3",
+    "target_4",
+    "tqi_score",
+    "shariah_status",
+    "status",
+    "exit_reason",
+    "current_stop_loss",
+}
+# Legacy key -> live schema column mapping.
+_TRADE_SIGNALS_COLUMN_ALIASES = {
+    "symbol": "ticker",
+    "tqi": "tqi_score",
+    "strategy": "strategy_type",
+}
+
+
+def _sanitize_trade_signals_payload(payload: Any) -> Dict[str, Any]:
+    """Align an arbitrary trade payload with the live trade_signals schema.
+
+    - Renames legacy keys: symbol -> ticker, tqi -> tqi_score, strategy -> strategy_type.
+    - Strips execution metrics (trade_id, quantity, allocated_cost, risk_amount)
+      and any non-schema field so PostgREST never rejects the write (PGRST204).
+    Returns a fresh dict; never raises.
+    """
+    clean: Dict[str, Any] = {}
+    try:
+        if not isinstance(payload, dict):
+            return clean
+        for key, value in payload.items():
+            col = _TRADE_SIGNALS_COLUMN_ALIASES.get(str(key), str(key))
+            if col in _TRADE_SIGNALS_COLUMNS and value is not None and col not in clean:
+                clean[col] = value
+    except Exception as exc:
+        logger.warning("[SYNC] _sanitize_trade_signals_payload failed: %s", exc)
+    return clean
+
 
 def _cfg() -> Optional[Tuple[str, str]]:
     url = (os.environ.get("SUPABASE_URL") or "").strip().rstrip("/")
@@ -84,7 +131,14 @@ def publish_trade_signal(payload: Dict[str, Any]) -> bool:
         logger.warning("[SYNC][ENV AUDIT] Supabase not configured - skipping trade_signals publish (check SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY)")
         return False
     url, _ = cfg
-    ticker = (payload.get("ticker") or payload.get("symbol") or "").strip()
+    # Strict schema alignment: rename legacy keys (symbol/tqi/strategy) and strip
+    # execution metrics (trade_id, quantity, allocated_cost, risk_amount) plus any
+    # non-schema field so Supabase accepts the write (PGRST204 fix).
+    payload = _sanitize_trade_signals_payload(payload)
+    if not payload:
+        logger.warning("[SYNC] publish_trade_signal received empty payload after schema sanitization - skipping")
+        return False
+    ticker = (payload.get("ticker") or "").strip()
     # 1) Check if active signal for same ticker already exists - if so, update instead of insert
     if ticker:
         try:
@@ -186,8 +240,9 @@ def get_trade_signal(trade_id: int) -> Optional[Dict[str, Any]]:
         return None
     url, _ = cfg
     try:
+        # Live schema uses auto-generated `id` as PK (no trade_id column).
         resp = requests.get(
-            f"{url}/rest/v1/{TRADE_SIGNALS_TABLE}?trade_id=eq.{int(trade_id)}&limit=1&select=*",
+            f"{url}/rest/v1/{TRADE_SIGNALS_TABLE}?id=eq.{int(trade_id)}&limit=1&select=*",
             headers=_headers(prefer="return=minimal"),
             timeout=10,
         )
@@ -216,12 +271,14 @@ def save_user_join(user_id: str, trade_id: int, symbol: str, ticker_bare: str, t
     url, _ = cfg
     # Idempotent upsert path: on_conflict covers UNIQUE(user_id, symbol) constraint
     # (see setup_db.sql). Handles duplicate clicks gracefully via 409/merge-duplicates.
+    # Schema-aligned: live user_portfolio has no ticker_bare/tqi columns - they ride
+    # inside the snapshot JSONB instead (prevents PGRST204 rejection).
     payload = {
         "user_id": str(user_id),
         "trade_id": int(trade_id),
         "symbol": symbol,
-        "ticker_bare": ticker_bare,
-        "tqi": float(tqi),
+        "status": "TRACKING",
+        "snapshot": {"ticker_bare": ticker_bare, "tqi": float(tqi)},
         "joined_at": datetime.now(timezone.utc).isoformat(),
     }
     # Preferred: upsert with merge-duplicates
