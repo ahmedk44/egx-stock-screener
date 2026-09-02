@@ -1,9 +1,11 @@
 name: EGX Stock Screener
 
 on:
-  # schedule: DISABLED — migrated to Vercel Cron / cron-job.org (see vercel.json crons & scripts/setup_cronjobs.py)
-  # Previous: */15 7-11 * * 0-4 → 07:00-11:30 UTC (10:00-14:30 Cairo / 11:00-15:30 Oman Sun-Thu) — now triggers via https://.../api/cron/scanner
-  # Keeping workflow_dispatch for manual runs only (prevents double-posting & GH queue delays)
+  # PRIMARY: Vercel/external cron hits /api/scanner every 15m (low latency, publishes via Supabase+Telegram).
+  # GHA schedule restored 2026-09-02 as REDUNDANT fallback (was disabled 2026-08-30 in 09a4026 due to GH queue delays).
+  # Dedup: scanner publishes are per-ticker upserts in Supabase; main.py dedups via state.json (committed back).
+  schedule:
+    - cron: "*/15 7-11 * * 0-4" # 07:00-11:30 UTC (10:00-14:30 Cairo) Sun-Thu
   workflow_dispatch:
 
 permissions:
@@ -51,6 +53,7 @@ jobs:
         run: python main.py
 
       - name: Persist Active Positions State
+        continue-on-error: true # best-effort state persistence — must not fail the run (GH push races caused the 08/30 failure)
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
@@ -64,6 +67,7 @@ jobs:
           fi
 
       - name: Commit updated state back to repo
+        continue-on-error: true # best-effort state persistence — must not fail the run
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"

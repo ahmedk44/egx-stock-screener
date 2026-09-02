@@ -124,7 +124,11 @@ def get_news_channel_id() -> Optional[str]:
     return NEWS_FALLBACK
 
 def fetch_indices_performance() -> Dict[str, Dict[str, Any]]:
-    """Fetch closing prices & performance for EGX30/EGX70/EGX100 via yfinance."""
+    """Fetch closing prices & performance for EGX30/EGX70/EGX100 via yfinance.
+
+    Optimized: ONE batched yf.download for every candidate index ticker
+    (threads=True) instead of sequential per-candidate Ticker.history calls.
+    """
     result: Dict[str, Dict[str, Any]] = {}
     if yf is None:
         logger.warning("yfinance not available, using synthetic indices")
@@ -132,27 +136,65 @@ def fetch_indices_performance() -> Dict[str, Dict[str, Any]]:
             result[name] = {"close": 28000 + hash(name) % 5000, "prev_close": 27800 + hash(name) % 5000, "change_pct": 0.85, "volume": 0}
         return result
 
+    # One batched download for all candidate index tickers
+    candidates: List[str] = []
+    for tickers in INDICES_MAP.values():
+        for t in tickers:
+            if t not in candidates:
+                candidates.append(t)
+    frames: Dict[str, Any] = {}
+    try:
+        import pandas as pd  # type: ignore
+        logger.info(f"Batched index download: {candidates}")
+        data = yf.download(
+            tickers=candidates,
+            period="5d",
+            interval="1d",
+            group_by="ticker",
+            threads=True,
+            progress=False,
+            auto_adjust=True,
+        )
+        multi = isinstance(data.columns, pd.MultiIndex)
+        level0 = set(data.columns.get_level_values(0)) if multi else set()
+        for t in candidates:
+            try:
+                if multi:
+                    if t not in level0:
+                        continue
+                    frame = data[t]
+                else:
+                    frame = data if t == candidates[0] else None
+                if frame is None or frame.empty:
+                    continue
+                if hasattr(frame.columns, "levels"):
+                    frame.columns = [c[0] if isinstance(c, tuple) else c for c in frame.columns]
+                frames[t] = frame
+            except Exception as e:
+                logger.warning(f"index frame {t} extract failed: {e}")
+        logger.info(f"Batched index download resolved {len(frames)}/{len(candidates)} frames")
+    except Exception as e:
+        logger.warning(f"Batched index download failed ({e}) - falling back to synthetic")
+
     for idx_name, tickers in INDICES_MAP.items():
         fetched = False
         for ticker in tickers:
+            frame = frames.get(ticker)
             try:
-                logger.info(f"Trying {idx_name} via yfinance ticker {ticker}")
-                t = yf.Ticker(ticker)
-                hist = t.history(period="5d", auto_adjust=True)
-                if hist is not None and not hist.empty and len(hist) >= 2:
-                    # handle multi-index columns
-                    if hasattr(hist.columns, "levels"):
-                        hist.columns = [c[0] if isinstance(c, tuple) else c for c in hist.columns]
-                    close = float(hist["Close"].iloc[-1])
-                    prev_close = float(hist["Close"].iloc[-2])
-                    change_pct = (close - prev_close) / prev_close * 100 if prev_close else 0
-                    volume = int(hist["Volume"].iloc[-1]) if "Volume" in hist.columns else 0
-                    result[idx_name] = {"ticker": ticker, "close": close, "prev_close": prev_close, "change_pct": change_pct, "volume": volume}
-                    logger.info(f"{idx_name} {ticker}: {close:.2f} ({change_pct:+.2f}%)")
-                    fetched = True
-                    break
-                else:
-                    logger.warning(f"{idx_name} {ticker}: no history or insufficient data")
+                if frame is None or frame.empty or len(frame) < 2:
+                    if frame is None:
+                        logger.warning(f"{idx_name} {ticker}: no frame from batch")
+                    else:
+                        logger.warning(f"{idx_name} {ticker}: no history or insufficient data")
+                    continue
+                close = float(frame["Close"].iloc[-1])
+                prev_close = float(frame["Close"].iloc[-2])
+                change_pct = (close - prev_close) / prev_close * 100 if prev_close else 0
+                volume = int(frame["Volume"].iloc[-1]) if "Volume" in frame.columns else 0
+                result[idx_name] = {"ticker": ticker, "close": close, "prev_close": prev_close, "change_pct": change_pct, "volume": volume}
+                logger.info(f"{idx_name} {ticker}: {close:.2f} ({change_pct:+.2f}%)")
+                fetched = True
+                break
             except Exception as e:
                 logger.warning(f"{idx_name} {ticker} failed: {e}")
                 continue
@@ -166,6 +208,9 @@ def fetch_indices_performance() -> Dict[str, Dict[str, Any]]:
 def fetch_top_movers() -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Aggregate top gainers, top losers, highest turnover from TICKERS.
 
+    Optimized: ONE batched yf.download for the whole universe (threads=True)
+    instead of a sequential per-ticker Ticker.history loop (~20x fewer HTTP calls).
+
     Returns (gainers, losers, turnover) each as list of dicts {symbol, name, close, change_pct, volume, turnover}
     """
     stocks: List[Dict[str, Any]] = []
@@ -175,34 +220,62 @@ def fetch_top_movers() -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List
             change = (5 - i) * 1.2  # descending
             stocks.append({"symbol": t, "name": STOCK_NAMES_AR.get(t, t), "close": 50 + i, "prev_close": 50, "change_pct": change, "volume": 1000000 - i*50000, "turnover": (50+i)*(1000000 - i*50000)})
     else:
-        for ticker in TICKERS:
-            try:
-                t = yf.Ticker(ticker)
-                hist = t.history(period="5d", auto_adjust=True)
-                if hist is None or hist.empty or len(hist) < 2:
-                    logger.debug(f"{ticker}: no history")
+        # Dedupe while preserving order (fallback TICKERS list may repeat entries)
+        universe = list(dict.fromkeys(t.strip().upper() for t in TICKERS if t))
+        try:
+            import pandas as pd  # type: ignore
+            import time as _time
+            _t0 = _time.monotonic()
+            logger.info(f"Batched movers download: {len(universe)} tickers")
+            data = yf.download(
+                tickers=universe,
+                period="7d",
+                interval="1d",
+                group_by="ticker",
+                threads=True,
+                progress=False,
+                auto_adjust=True,
+            )
+            logger.info(f"Batched movers download completed in {_time.monotonic() - _t0:.1f}s")
+            multi = isinstance(data.columns, pd.MultiIndex)
+            level0 = set(data.columns.get_level_values(0)) if multi else set()
+            for ticker in universe:
+                try:
+                    if multi:
+                        if ticker not in level0:
+                            continue
+                        frame = data[ticker]
+                    else:
+                        frame = data
+                    if frame is None or frame.empty or len(frame) < 2:
+                        logger.debug(f"{ticker}: no history")
+                        continue
+                    frame = frame.dropna(subset=["Close"])
+                    if len(frame) < 2:
+                        continue
+                    close = float(frame["Close"].iloc[-1])
+                    prev_close = float(frame["Close"].iloc[-2])
+                    if not prev_close or prev_close == 0:
+                        continue
+                    change_pct = (close - prev_close) / prev_close * 100
+                    volume = int(frame["Volume"].iloc[-1]) if "Volume" in frame.columns and not frame["Volume"].empty else 0
+                    turnover = volume * close if volume and close else 0
+                    stocks.append({
+                        "symbol": ticker,
+                        "name": STOCK_NAMES_AR.get(ticker, ticker.replace(".CA", "")),
+                        "close": close,
+                        "prev_close": prev_close,
+                        "change_pct": change_pct,
+                        "volume": volume,
+                        "turnover": turnover,
+                    })
+                except Exception as e:
+                    logger.debug(f"{ticker} extract failed: {e}")
                     continue
-                if hasattr(hist.columns, "levels"):
-                    hist.columns = [c[0] if isinstance(c, tuple) else c for c in hist.columns]
-                close = float(hist["Close"].iloc[-1])
-                prev_close = float(hist["Close"].iloc[-2])
-                if not prev_close or prev_close == 0:
-                    continue
-                change_pct = (close - prev_close) / prev_close * 100
-                volume = int(hist["Volume"].iloc[-1]) if "Volume" in hist.columns and not hist["Volume"].empty else 0
-                turnover = volume * close if volume and close else 0
-                stocks.append({
-                    "symbol": ticker,
-                    "name": STOCK_NAMES_AR.get(ticker, ticker.replace(".CA","")),
-                    "close": close,
-                    "prev_close": prev_close,
-                    "change_pct": change_pct,
-                    "volume": volume,
-                    "turnover": turnover,
-                })
-            except Exception as e:
-                logger.debug(f"{ticker} fetch failed: {e}")
-                continue
+            logger.info(f"Batched movers parsed: {len(stocks)}/{len(universe)} usable")
+        except Exception as e:
+            logger.warning(f"Batched movers download failed: {e}")
+            stocks = []
 
     if not stocks:
         logger.warning("No stocks fetched, using synthetic fallback")
@@ -230,10 +303,14 @@ def generate_ai_sentiment(
     gainers: List[Dict[str, Any]],
     losers: List[Dict[str, Any]],
     turnover: List[Dict[str, Any]],
+    budget_seconds: float = 25.0,
 ) -> str:
     """Generate AI Market Sentiment summary via Gemini (Bullet points: Market Trend, Liquidity, Top Headlines).
 
-    Falls back to heuristic if Gemini not available.
+    Serverless-safe: each Gemini attempt runs under a HARD wall-clock budget
+    (budget_seconds total for all attempts) — the google-genai SDK can internally
+    retry/backoff for minutes, which previously stalled the whole pipeline ~197s
+    and got the Vercel function killed before publishing. Falls back to heuristic.
     """
     # Collect top headlines via main's news fetcher if possible
     headlines_sample = []
@@ -271,24 +348,42 @@ def generate_ai_sentiment(
         "اجعلها موجزة جداً (كل نقطة سطر واحد)."
     )
 
-    # Try Gemini
+    # Try Gemini — under a hard wall-clock budget (serverless-safe)
     try:
+        import time as _time
+        from concurrent.futures import ThreadPoolExecutor
+
         api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
         if api_key and api_key.strip():
             from google import genai  # type: ignore
             client = genai.Client(api_key=api_key.strip())
             # Use available model - main.py uses gemini-3.6-flash, fallback chain accordingly
             model = os.environ.get("GEMINI_MODEL") or "gemini-3.6-flash"
-            for m in [model, "gemini-3.6-flash", "gemini-2.0-flash", "gemini-1.5-flash"]:
-                try:
-                    resp = client.models.generate_content(model=m, contents=prompt)
-                    text = getattr(resp, "text", None) or (resp.candidates[0].content.parts[0].text if getattr(resp, "candidates", None) else None)
-                    if text and len(text.strip()) > 20:
-                        logger.info(f"Gemini AI sentiment generated via {m}")
-                        return text.strip()
-                except Exception as e:
-                    logger.warning(f"Gemini {m} failed: {e}")
-                    continue
+            deadline = _time.monotonic() + float(budget_seconds)
+            pool = ThreadPoolExecutor(max_workers=1)
+            try:
+                for m in [model, "gemini-2.0-flash", "gemini-1.5-flash"]:
+                    remaining = deadline - _time.monotonic()
+                    if remaining <= 3:
+                        logger.warning(f"[AI-BUDGET] Gemini budget exhausted before {m} - falling back to heuristic")
+                        break
+                    try:
+                        fut = pool.submit(client.models.generate_content, model=m, contents=prompt)
+                        resp = fut.result(timeout=remaining)
+                        text = getattr(resp, "text", None) or (resp.candidates[0].content.parts[0].text if getattr(resp, "candidates", None) else None)
+                        if text and len(text.strip()) > 20:
+                            logger.info(f"Gemini AI sentiment generated via {m}")
+                            return text.strip()
+                        logger.warning(f"Gemini {m} returned empty/short text")
+                    except TimeoutError:
+                        logger.warning(f"[AI-BUDGET] Gemini {m} exceeded {remaining:.0f}s budget - trying next / fallback")
+                        continue
+                    except Exception as e:
+                        logger.warning(f"Gemini {m} failed: {e}")
+                        continue
+            finally:
+                # Never block on hung Gemini calls — abandon them
+                pool.shutdown(wait=False, cancel_futures=True)
         else:
             logger.warning("GEMINI_API_KEY not set, using heuristic sentiment")
     except Exception as e:
@@ -637,13 +732,22 @@ def main(dry_run: bool = False, broadcast: bool = True) -> int:
         except Exception as e:
             logger.warning(f"Idempotency check failed (proceeding): {e}")
     try:
+        import time as _time
+        _t_fetch = _time.monotonic()
         indices = fetch_indices_performance()
+        print(f"[TIMING] fetch_indices_performance: {_time.monotonic() - _t_fetch:.1f}s")
+        _t_movers = _time.monotonic()
         gainers, losers, turnover = fetch_top_movers()
+        print(f"[TIMING] fetch_top_movers: {_time.monotonic() - _t_movers:.1f}s")
+        _t_ai = _time.monotonic()
         ai_summary = generate_ai_sentiment(indices, gainers, losers, turnover)
+        print(f"[TIMING] generate_ai_sentiment: {_time.monotonic() - _t_ai:.1f}s")
         # Fetch active signals tracker
         try:
+            _t_sig = _time.monotonic()
             raw_signals = fetch_active_signals(limit=10)
             active_enriched = enrich_active_signals_with_prices(raw_signals)
+            print(f"[TIMING] active signals fetch+enrich: {_time.monotonic() - _t_sig:.1f}s ({len(active_enriched)} signals)")
             logger.info(f"Active signals fetched: {len(active_enriched)}")
         except Exception as e:
             logger.warning(f"Active signals fetch failed: {e}")
