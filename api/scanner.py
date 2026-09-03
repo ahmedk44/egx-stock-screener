@@ -13,11 +13,12 @@ Pipeline (official project modules only — no hardcoded logic):
                            and stored on the Supabase row
   c. Core strategy       : StrategyEngine.evaluate() (Donchian+Volume+RSI confluence,
                            TQI score) + RiskManager.build_plan() (ATR SL/TP guardrails)
-  c+.Live Price Guard    : fresh intraday quote (YFinanceDataFetcher.fetch_latest_prices)
-                           at dispatch time; entry is re-anchored to the LIVE price and
-                           SL/TP1-3 are recalculated dynamically from it. Signals whose
-                           live price already moved beyond TP1 or dropped >1% below the
-                           calculated entry are DISCARDED (EXPIRED_ENTRY).
+  c+.Live Price Guard    : MARKET HOURS GATE (is_market_open) aborts all live signal
+                           emissions outside the EGX session; real-time quote via
+                           fast_info.last_price (1m ticker fallback) validated to the
+                           CURRENT session date; entry re-anchored to the LIVE price
+                           and SL/TP1-3 recalculated dynamically from it. Stale-bar
+                           frames and pre-open placeholder quotes DROP the candidate.
   d. Official card       : TelegramNotifier.format_channel_broadcast() — full channel
                            signal card (Shariah badge, TQI, targets, CTA) + join button
   e. Dispatch            : Supabase trade_signals publish (schema-aligned upsert) +
@@ -39,6 +40,7 @@ Behavior:
 Timing budget (Fluid compute): target <30s; vercel.json sets maxDuration=60.
 """
 import json
+import math
 import os
 import sys
 # Ensure project root is on sys.path for Vercel runtime (/var/task)
@@ -48,6 +50,7 @@ from http.server import BaseHTTPRequestHandler
 from typing import Any, Dict, List, Optional, Tuple
 
 from egx_quant.core.shariah_filter import ShariahFilter
+from egx_quant.utils.egx_calendar import is_market_open, now_cairo, session_label
 
 # Batch size tuned so each yf.download returns in ~2-4s and progress is logged
 BATCH_SIZE = 9
@@ -122,22 +125,60 @@ class _TransparentShariahGate(ShariahFilter):
         return True
 
 
-def _fetch_live_quote(symbol: str, fetcher: "Any" = None) -> "Any":
-    """Fresh intraday PriceQuote (last traded price) via the official data engine.
+def _bar_session_date(ts: "Any") -> Optional["Any"]:
+    """Session (Africa/Cairo) date of a bar timestamp. Naive = exchange-local."""
+    try:
+        import pytz  # type: ignore
+        ts = ts.to_pydatetime() if hasattr(ts, "to_pydatetime") else ts
+        if getattr(ts, "tzinfo", None) is None:
+            return ts.date()
+        return ts.astimezone(pytz.timezone("Africa/Cairo")).date()
+    except Exception:
+        return None
 
-    Uses YFinanceDataFetcher.fetch_latest_prices — a fresh 5d/1d download whose
-    last bar is the in-progress session candle during market hours.
+
+def _fetch_live_quote(symbol: str) -> Tuple[Optional[float], str]:
+    """Live execution price: fast_info.last_price primary, 1m ticker fallback.
+
+    Session validation: the supporting bar MUST belong to the CURRENT Cairo
+    session date. Stale bars from yesterday or pre-open placeholders return
+    (None, reason) so the candidate is dropped immediately.
     """
     try:
-        if fetcher is None:
-            from egx_quant.core.data_engine import YFinanceDataFetcher
-            fetcher = YFinanceDataFetcher()
-        from egx_quant.config.stocks_registry import StocksRegistry
-        quotes = fetcher.fetch_latest_prices([symbol])
-        return quotes.get(StocksRegistry.normalize(symbol))
+        import yfinance as yf  # type: ignore
+    except Exception as exc:
+        return None, f"yfinance-unavailable: {exc}"
+    today = now_cairo().date()
+    try:
+        t = yf.Ticker(symbol)
+        # Primary: fast_info.last_price, validated against the latest daily bar date
+        try:
+            fi_price = float(t.fast_info.last_price)
+        except Exception:
+            fi_price = None
+        if fi_price and math.isfinite(fi_price) and fi_price > 0:
+            try:
+                d = t.history(period="5d", interval="1d", auto_adjust=False)
+                if d is not None and not d.empty:
+                    if _bar_session_date(d.index[-1]) == today:
+                        return round(fi_price, 2), "fast_info"
+            except Exception:
+                pass
+        # Fallback: 1m intraday last close (self-timestamped)
+        try:
+            hist = t.history(period="1d", interval="1m")
+            if hist is not None and not hist.empty:
+                closes = hist["Close"].dropna()
+                if not closes.empty and _bar_session_date(hist.index[-1]) == today:
+                    px = float(closes.iloc[-1])
+                    if math.isfinite(px) and px > 0:
+                        return round(px, 2), "intraday_1m"
+        except Exception:
+            pass
     except Exception as exc:
         print(f"[CRON][SCANNER][WARN] live quote fetch failed for {symbol}: {exc}")
-        return None
+        return None, "fetch-error"
+    return None, "stale-or-pre-open (no same-session bar)"
 
 
 def _has_active_signal(ticker: str) -> bool:
@@ -228,6 +269,12 @@ def _run_strategy_batch(
             df = _ticker_frame(data, ticker, multi, level0)
             if df is None or len(df) < MIN_BARS:
                 continue
+            # Same-day validation: the latest bar MUST belong to the CURRENT
+            # Cairo session date. Yesterday's bar / pre-open placeholder = stale.
+            bar_date = _bar_session_date(df.index[-1])
+            if bar_date != now_cairo().date():
+                print(f"[CRON][SCANNER][STALE-FRAME] {ticker} last bar {bar_date} != session {now_cairo().date()} - candidate dropped")
+                continue
             evaluated += 1
             signal = strategy.evaluate(ticker, df)
             if signal is None:
@@ -305,15 +352,17 @@ def _publish_signal(
     notifier: "Any",
     risk: "Any",
     dry_run: bool,
-    quote_fetcher: "Any" = None,
 ) -> Dict[str, Any]:
-    """Dispatch one approved plan: Live Price Guard -> reprice -> card -> dispatch.
+    """Dispatch one approved plan: market gate -> Live Price Guard -> reprice -> card -> dispatch.
 
     Order:
+      0. MARKET HOURS GATE: if is_market_open() is False the live dispatch is
+         IMMEDIATELY ABORTED — no Telegram/Supabase signal emission after close.
       1. Dedup: skip when an ACTIVE/TRACKING signal already exists for the ticker.
-      2. Live Price Guard: fetch a fresh intraday quote (last traded price). If the
-         live price already moved beyond TP1 or dropped >1% below the calculated
-         entry, the signal is DISCARDED as stale (EXPIRED_ENTRY).
+      2. Live Price Guard: fetch a real-time quote (fast_info.last_price / 1m
+         fallback, same-session validated). If the live price already moved beyond
+         TP1 or dropped >1% below the calculated entry, the signal is DISCARDED
+         as stale (EXPIRED_ENTRY).
       3. Dynamic reprice: entry is re-anchored to the LIVE price and SL/TP1/TP2/TP3
          are recalculated from it (official RiskManager + fib_targets).
       4. Official Signal Card Formatter (features the real Shariah status) and
@@ -327,6 +376,15 @@ def _publish_signal(
     ticker = str(plan.symbol)
     outcome: Dict[str, Any] = {"ticker": ticker, "guard": "pending", "supabase": "skipped", "telegram": "skipped"}
 
+    # 0) MARKET HOURS GATE — no live signal emissions outside the EGX session
+    if not dry_run and not is_market_open():
+        outcome["guard"] = (
+            f"aborted-market-closed (session={session_label()} at "
+            f"{now_cairo().strftime('%H:%M')} Cairo)"
+        )
+        print(f"[CRON][SCANNER] {ticker} dispatch ABORTED: EGX market closed - no live Telegram emission")
+        return outcome
+
     # 1) Dedup (repeated 15-min cron hits never spam)
     if _has_active_signal(ticker):
         outcome["guard"] = "dedup-active-exists"
@@ -336,13 +394,13 @@ def _publish_signal(
         return outcome
 
     # 2) Live Price Guard — entry must match the CURRENT live price, not a lagging bar
-    quote = _fetch_live_quote(ticker, fetcher=quote_fetcher)
-    if quote is None or float(getattr(quote, "price", 0) or 0) <= 0:
-        outcome["guard"] = "skipped-no-live-quote"
-        print(f"[CRON][SCANNER] {ticker} no live quote available - publish skipped (cannot validate entry)")
+    live_price, quote_source = _fetch_live_quote(ticker)
+    if live_price is None or live_price <= 0:
+        outcome["guard"] = f"skipped-no-live-quote ({quote_source})"
+        print(f"[CRON][SCANNER] {ticker} no valid live quote ({quote_source}) - publish skipped (cannot validate entry)")
         return outcome
-    live_price = round(float(quote.price), 2)
     rec["live_price"] = live_price
+    rec["quote_source"] = quote_source
     calc_entry = float(plan.entry_price)
     tp1 = float(plan.target_1 or 0)
     if tp1 > 0 and live_price > tp1:
@@ -440,10 +498,16 @@ def run_scan_pipeline(dry_run: bool = False) -> Dict[str, Any]:
             pass
     universe = _universe()
     print(f"[CRON][SCANNER] pipeline start | universe={len(universe)} tickers | batch_size={BATCH_SIZE} | dry_run={dry_run}")
+    print(
+        f"[CRON][SCANNER] market hours gate: is_market_open={is_market_open()} "
+        f"(session={session_label()} at {now_cairo().strftime('%H:%M')} Cairo) - "
+        f"live signal emissions {'ACTIVE' if is_market_open() else 'SUPPRESSED'}"
+    )
     result: Dict[str, Any] = {
         "mode": "full-egx-batched" + (" (dry-run)" if dry_run else ""),
         "universe_size": len(universe),
         "universe": universe,
+        "session": {"is_market_open": is_market_open(), "cairo_local": now_cairo().isoformat()},
         "shariah": {"policy": "transparent-scan", "counts": {}, "statuses": {}},
         "evaluated": 0,
         "batches": [],
@@ -551,6 +615,7 @@ def run_scan_pipeline(dry_run: bool = False) -> Dict[str, Any]:
             "entry_price": plan.entry_price,
             "entry_source": rec.get("entry_source", "daily_close"),
             "live_price": rec.get("live_price"),
+            "quote_source": rec.get("quote_source"),
             "stop_loss": plan.stop_loss,
             "target_1": plan.target_1,
             "target_2": plan.target_2,

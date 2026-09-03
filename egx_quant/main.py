@@ -43,7 +43,7 @@ from egx_quant.core.strategy_engine import StrategyEngine
 from egx_quant.core.weekly_reporter import WeeklyReportEngine
 from egx_quant.database.db_manager import DatabaseManager, DEFAULT_DB_PATH
 from egx_quant.database.models import PriceQuote, RiskPlan, TradeSignal
-from egx_quant.utils.egx_calendar import now_cairo, session_label
+from egx_quant.utils.egx_calendar import is_market_open, now_cairo, session_label
 from egx_quant.utils.telegram_notifier import TelegramNotifier
 
 logger = logging.getLogger("egx_quant.main")
@@ -141,7 +141,14 @@ def run_simulation(source: str = "synthetic", capital: float = 100_000.0, max_po
         position_id = tracker.open(plan)
         risk.allocate(plan.allocated_cost)
         opened.append(position_id)
-        notifier.send_text(notifier.format_buy_alert(plan))
+        # MARKET HOURS GATE: no live Telegram signal emissions outside EGX session
+        if is_market_open():
+            notifier.send_text(notifier.format_buy_alert(plan))
+        else:
+            print(
+                f"[MARKET-CLOSED] {plan.symbol} buy alert SUPPRESSED "
+                f"(session={session_label()} at {now_cairo().strftime('%H:%M')} Cairo) - no Telegram emission"
+            )
         print(
             f"[OPEN] Position #{position_id}: LONG {plan.symbol} x{plan.quantity} @ {plan.entry_price:.2f} EGP "
             f"| SL={plan.stop_loss:.2f} TP={plan.take_profit:.2f} (ATR14={plan.atr:.3f}) "

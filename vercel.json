@@ -52,6 +52,14 @@
     {
       "path": "/api/post_market",
       "schedule": "30 12 * * 0-4"
+    },
+    {
+      "path": "/api/scanner",
+      "schedule": "*/15 7-10 * * 0-4"
+    },
+    {
+      "path": "/api/scanner",
+      "schedule": "0,15,30 11 * * 0-4"
     }
   ]
 }

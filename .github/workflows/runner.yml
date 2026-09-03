@@ -1,11 +1,10 @@
 name: EGX Stock Screener
 
 on:
-  # PRIMARY: Vercel/external cron hits /api/scanner every 15m (low latency, publishes via Supabase+Telegram).
-  # GHA schedule restored 2026-09-02 as REDUNDANT fallback (was disabled 2026-08-30 in 09a4026 due to GH queue delays).
-  # Dedup: scanner publishes are per-ticker upserts in Supabase; main.py dedups via state.json (committed back).
-  schedule:
-    - cron: "*/15 7-11 * * 0-4" # 07:00-11:30 UTC (10:00-14:30 Cairo) Sun-Thu
+  # INTRADAY SCANNER MIGRATED TO VERCEL CRON (2026-09-03): the */15 schedule now
+  # lives in vercel.json crons (07:00-11:30 UTC / 10:00-14:30 Cairo Sun-Thu) and
+  # pings /api/scanner directly — GitHub Actions is unreliable for intraday
+  # scalping latency. workflow_dispatch kept for manual backfill runs only.
   workflow_dispatch:
 
 permissions:

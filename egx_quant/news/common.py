@@ -32,7 +32,16 @@ LOCAL_LOG_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "news_publi
 
 def get_supabase_config() -> Optional[Tuple[str, str]]:
     url = (os.environ.get("SUPABASE_URL") or "").strip().rstrip("/")
-    key = (os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get("SUPABASE_KEY") or "").strip().strip('"').strip("'")
+    service_role = (os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or "").strip()
+    fallback_key = (os.environ.get("SUPABASE_KEY") or "").strip()
+    # SERVICE_ROLE_KEY always wins: the SUPABASE_KEY fallback is frequently the
+    # ANON key, whose RLS policies mask rows as empty in production reads.
+    if not service_role and fallback_key:
+        logger.warning(
+            "[SUPABASE][ENV AUDIT] SUPABASE_SERVICE_ROLE_KEY missing - falling back to SUPABASE_KEY "
+            "(possibly ANON key: RLS may mask rows as empty / break idempotency checks)."
+        )
+    key = (service_role or fallback_key).strip('"').strip("'")
     if not url or not key:
         return None
     return url, key
@@ -131,7 +140,12 @@ def check_already_published(bulletin_type: str) -> bool:
         return False
 
 def mark_published(bulletin_type: str) -> bool:
-    """Write log record after successful broadcast. Returns True on success (or fallback)."""
+    """Write log record after successful broadcast. Returns True on success (or fallback).
+
+    Idempotency: prefers an upsert on (bulletin_type, publish_date) so concurrent
+    triggers (Vercel cron + GHA fallback) can never create duplicate publish rows.
+    Falls back to check-then-insert when no unique constraint exists (HTTP 400).
+    """
     publish_date = get_cairo_date_str()
     cfg = get_supabase_config()
     if requests is None or cfg is None:
@@ -146,26 +160,57 @@ def mark_published(bulletin_type: str) -> bool:
         "created_at": datetime.now().isoformat(),
     }
     endpoint = f"{url}/rest/v1/{NEWS_PUBLISH_LOG_TABLE}"
+    # 1) Idempotent upsert: merge-duplicates on (bulletin_type, publish_date)
+    try:
+        upsert_headers = dict(headers)
+        upsert_headers["Prefer"] = "resolution=merge-duplicates,return=representation"
+        resp = requests.post(
+            f"{endpoint}?on_conflict=bulletin_type,publish_date",
+            json=payload,
+            headers=upsert_headers,
+            timeout=10,
+        )
+        if resp.status_code in (200, 201, 204):
+            logger.info(f"[IDEMPOTENT] Marked published {bulletin_type} {publish_date} (Supabase upsert)")
+            print(f"[LOG] Marked {bulletin_type} published for {publish_date} (upsert)")
+            _write_local_log(bulletin_type, publish_date)
+            return True
+        if resp.status_code == 400:
+            # No unique constraint matching on_conflict -> check-then-insert
+            if not check_already_published(bulletin_type):
+                return _insert_publish_row(endpoint, headers, payload, bulletin_type, publish_date)
+            logger.info(f"[IDEMPOTENT] {bulletin_type} {publish_date} row already exists - insert skipped")
+            _write_local_log(bulletin_type, publish_date)
+            return True
+    except Exception as e:
+        logger.warning(f"[IDEMPOTENT] Upsert mark exception: {e}")
+    # 2) Fallback: plain insert (409 = already exists, treat as success)
+    return _insert_publish_row(endpoint, headers, payload, bulletin_type, publish_date)
+
+
+def _insert_publish_row(endpoint: str, headers: Dict[str, str], payload: Dict[str, Any], bulletin_type: str, publish_date: str) -> bool:
+    """Plain insert of a publish-log row; 409 treated as already-marked success."""
     try:
         resp = requests.post(endpoint, json=payload, headers=headers, timeout=10)
         if resp.status_code in (200, 201, 204):
-            logger.info(f"[IDEMPOTENT] Marked published {bulletin_type} {publish_date} (Supabase)")
+            logger.info(f"[IDEMPOTENT] Marked published {bulletin_type} {publish_date} (Supabase insert)")
             print(f"[LOG] Marked {bulletin_type} published for {publish_date}")
-            # Also write local for redundancy
             _write_local_log(bulletin_type, publish_date)
             return True
-        elif resp.status_code == 404 and "PGRST205" in (resp.text or ""):
-            logger.warning(f"[IDEMPOTENT] Table not found on mark, using local log")
-            print(f"[WARN] news_publish_log table missing on mark - using local fallback. Run SQL migration.")
+        if resp.status_code == 409:
+            logger.info(f"[IDEMPOTENT] {bulletin_type} {publish_date} already logged (409) - ok")
             _write_local_log(bulletin_type, publish_date)
             return True
-        else:
-            body = (resp.text or "")[:500]
-            logger.warning(f"[IDEMPOTENT] Mark failed HTTP {resp.status_code}: {body}")
-            # Try local fallback still
+        if resp.status_code == 404 and "PGRST205" in (resp.text or ""):
+            logger.warning(f"[IDEMPOTENT] Table {NEWS_PUBLISH_LOG_TABLE} not found - using local log")
+            print(f"[WARN] news_publish_log table missing - using local fallback. Run supabase_setup_news_log.sql.")
             _write_local_log(bulletin_type, publish_date)
-            # Consider success if broadcast already succeeded, even if log failed
-            return False
+            return True
+        body = (resp.text or "")[:500]
+        logger.warning(f"[IDEMPOTENT] Mark failed HTTP {resp.status_code}: {body}")
+        _write_local_log(bulletin_type, publish_date)
+        # Broadcast already succeeded; log failure must not fail the pipeline
+        return False
     except Exception as e:
         logger.warning(f"[IDEMPOTENT] Mark exception: {e}")
         _write_local_log(bulletin_type, publish_date)

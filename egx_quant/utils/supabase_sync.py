@@ -80,8 +80,17 @@ def _sanitize_trade_signals_payload(payload: Any) -> Dict[str, Any]:
 
 def _cfg() -> Optional[Tuple[str, str]]:
     url = (os.environ.get("SUPABASE_URL") or "").strip().rstrip("/")
-    # Prioritize SERVICE_ROLE_KEY for all REST API headers (apikey + Authorization Bearer)
-    key = (os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get("SUPABASE_KEY") or "").strip().strip('"').strip("'")
+    service_role = (os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or "").strip()
+    fallback_key = (os.environ.get("SUPABASE_KEY") or "").strip()
+    # SERVICE_ROLE_KEY always wins: the SUPABASE_KEY fallback is frequently the
+    # ANON key, whose RLS policies mask rows as empty in production reads.
+    if not service_role and fallback_key:
+        logger.warning(
+            "[SUPABASE][ENV AUDIT] SUPABASE_SERVICE_ROLE_KEY missing - falling back to SUPABASE_KEY "
+            "(possibly ANON key: RLS may mask rows as empty). Set SUPABASE_SERVICE_ROLE_KEY in the runtime env."
+        )
+        print("[SUPABASE][ENV AUDIT] SUPABASE_SERVICE_ROLE_KEY missing - SUPABASE_KEY fallback in use (RLS risk)")
+    key = (service_role or fallback_key).strip('"').strip("'")
     if not url or not key:
         # Explicit environment audit warnings per spec
         if not url:
