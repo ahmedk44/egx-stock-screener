@@ -1,12 +1,11 @@
 name: Post-Market News Scan
 
 on:
-  # PRIMARY: Vercel Cron 30 12 * * 0-4 -> /api/post_market.
-  # GHA schedule restored 2026-09-02 as REDUNDANT fallback, staggered +15m after Vercel.
-  # Idempotency: Supabase news_publish_log skips if Vercel already published; 12:45 is still
-  # inside the 60-min window and before the 14:00 UTC strict cutoff (see check_execution_window).
-  schedule:
-    - cron: "45 12 * * 0-4" # 12:45 UTC (15:45 Cairo) Sun-Thu — 15m after Vercel 12:30
+  # POST-MARKET SCHEDULE REMOVED FROM GITHUB ACTIONS (2026-09-03): GHA runner-queue
+  # bursts caused late bulletin execution. The trigger is now EXCLUSIVELY
+  # Vercel Cron "30 12 * * 0-4" (12:30 UTC = 15:30 Cairo Sun-Thu) on /api/post_market,
+  # with the external cron-job.org schedule as backup (scripts/setup_cronjobs.py).
+  # Stale executions (>60m past schedule) are silently suppressed in the pipeline.
   workflow_dispatch:
 
 permissions:

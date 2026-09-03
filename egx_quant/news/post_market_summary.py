@@ -514,7 +514,7 @@ def format_post_market_card(
 
     card = (
         f"{POST_MARKET_TITLE}\n"
-        f"📅 **التاريخ:** {date_str} | ⏰ **الإغلاق:** 15:30 بتوقيت القاهرة / 16:30 بتوقيت عمان (النشرة الختامية)\n"
+        f"📅 **التاريخ:** {date_str} | ⏰ **الإغلاق:** 15:30 بتوقيت القاهرة (النشرة الختامية)\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📊 **أداء المؤشرات:**\n"
         f"{idx_block}\n"
@@ -611,28 +611,12 @@ def check_execution_window(
             return False, 0.0, datetime.now(timezone.utc), datetime.now(timezone.utc), "window check critical error"
 
 
-def format_late_banner(delay_minutes: float, scheduled: datetime, now_utc: datetime) -> str:
-    """Build late-run indicator banner for Telegram card."""
-    try:
-        delay_h = int(delay_minutes // 60)
-        delay_m = int(delay_minutes % 60)
-        delay_str = f"{delay_h}h {delay_m}m" if delay_h else f"{delay_m}m"
-        # Show both UTC and local conversions
-        # Scheduled 12:30 UTC = 15:30 Cairo / 16:30 Oman
-        return (
-            f"⚠️ **تنبيه تأخر التنفيذ | Late Run Detected**\n"
-            f"⏰ الموعد المقرر: **12:30 UTC** (15:30 القاهرة / 16:30 مسقط)\n"
-            f"⏰ وقت التنفيذ الفعلي: **{now_utc.strftime('%H:%M UTC')}** ({now_utc.astimezone(timezone(timedelta(hours=3))).strftime('%H:%M Cairo')} / {now_utc.astimezone(timezone(timedelta(hours=4))).strftime('%H:%M Oman')})\n"
-            f"⏱️ مدة التأخر: **{delay_str}** (≈{delay_minutes:.0f} دقيقة) — تجاوز النافذة المسموحة 60 دقيقة\n"
-            f"📌 السبب المحتمل: تأخر طابور GitHub Actions (public runner queue)\n"
-            f"━━━━━━━━━━━━━━━━━━━━"
-        )
-    except Exception:
-        return f"⚠️ **تأخر التنفيذ** — تأخر {delay_minutes:.0f} دقيقة عن الموعد 12:30 UTC"
-
-
 def trigger_stale_retry_alert(delay_minutes: float, scheduled: datetime, now_utc: datetime, reason: str) -> None:
-    """Strict retry alert: log and optionally notify admin Telegram chat."""
+    """Internal-only stale diagnostics: server log + best-effort admin chat DM.
+
+    NEVER touches the public news channel — subscribers must not receive
+    orchestration/delay notifications (audit: diagnostics live in server logs).
+    """
     try:
         msg = f"[STALE-ALERT] Post-Market bulletin delayed {delay_minutes:.0f}m (scheduled {scheduled.isoformat()}, now {now_utc.isoformat()}) reason={reason}"
         logger.warning(msg)
@@ -705,10 +689,13 @@ def publish_to_news_channel(text: str, parse_mode: str = "Markdown", dry_run: bo
 def main(dry_run: bool = False, broadcast: bool = True) -> int:
     """Run full post-market pipeline: fetch -> AI -> format -> publish."""
     logger.info("Starting post-market summary pipeline")
-    # ── Time-Window Guard: detect stale GitHub queue delay (>60m past 12:30 UTC / past 14:00 UTC) ──
+    # ── Time-Window Guard: STALE EXECUTION SUPPRESSION ──
+    # Scheduled bulletin: 12:30 UTC (15:30 Cairo) Sun-Thu. If the trigger arrives
+    # more than 60 minutes late (past 13:30 UTC / 16:30 Cairo), the PUBLIC Telegram
+    # broadcast is silently SUPPRESSED — the delay is logged internally only
+    # (console + admin alert); subscribers never receive stale late-night bulletins.
     is_stale = False
     delay_minutes = 0.0
-    late_banner = ""
     try:
         is_stale, delay_minutes, now_utc, scheduled_utc, reason = check_execution_window()
         # Audit log for GH Created vs Started — GH runners log UTC; we emit both
@@ -716,23 +703,18 @@ def main(dry_run: bool = False, broadcast: bool = True) -> int:
             gh_created = os.environ.get("GITHUB_RUN_CREATED_AT") or os.environ.get("GITHUB_EVENT_CREATED_AT") or "n/a"
         except Exception:
             gh_created = "n/a"
-        print(f"[TIMESTAMP-AUDIT] Scheduled=12:30 UTC (15:30 Cairo/16:30 Oman) | Now={now_utc.strftime('%Y-%m-%d %H:%M:%S UTC')} | Delay={delay_minutes:.0f}m | Reason={reason} | GH_EVENT={os.environ.get('GITHUB_EVENT_NAME','local')} | GH_CREATED={gh_created}")
+        print(f"[TIMESTAMP-AUDIT] Scheduled=12:30 UTC (15:30 Cairo) | Now={now_utc.strftime('%Y-%m-%d %H:%M:%S UTC')} | Delay={delay_minutes:.0f}m | Reason={reason} | GH_EVENT={os.environ.get('GITHUB_EVENT_NAME','local')} | GH_CREATED={gh_created}")
         logger.info("Timestamp audit: now=%s scheduled=%s delay=%.0fm stale=%s reason=%s", now_utc.isoformat(), scheduled_utc.isoformat(), delay_minutes, is_stale, reason)
         if is_stale:
-            late_banner = format_late_banner(delay_minutes, scheduled_utc, now_utc)
-            logger.warning("Stale execution detected: delay %.0fm — will append late-run indicator to Telegram card", delay_minutes)
+            logger.error("STALE execution (%s) — public post-market broadcast will be SUPPRESSED", reason)
             print(f"[STALE-DETECTED] {reason}")
-            # Trigger strict retry alert (admin notify)
+            # Internal diagnostics only (server log + admin chat) — never the public channel
             try:
                 trigger_stale_retry_alert(delay_minutes, scheduled_utc, now_utc, reason)
             except Exception as e:
                 logger.warning(f"Stale alert trigger failed: {e}")
-            # Note: we do NOT abort — we still publish but marked as late (fallback). Alternative is to exit and let external cron retry.
-            # To enforce strict abort, set env STRICT_STALE_ABORT=1
-            if (os.environ.get("STRICT_STALE_ABORT") or "").strip() in ("1", "true", "True"):
-                print("[STRICT-ABORT] STRICT_STALE_ABORT=1 — aborting stale bulletin (no Telegram send)")
-                logger.error("Aborting stale post-market bulletin due to STRICT_STALE_ABORT")
-                return 2
+            print(f"[STALE-SUPPRESSED] Public post-market broadcast suppressed (delay {delay_minutes:.0f}m > 60m window). No Telegram message sent to subscribers.")
+            return 2
     except Exception as e:
         logger.warning(f"Time-window guard failed (proceeding without stale check): {e}")
         is_stale = False
@@ -768,11 +750,6 @@ def main(dry_run: bool = False, broadcast: bool = True) -> int:
             logger.warning(f"Active signals fetch failed: {e}")
             active_enriched = []
         card = format_post_market_card(indices, gainers, losers, turnover, ai_summary, active_signals=active_enriched)
-        # Append late-run indicator if stale (>60m past 12:30 UTC) — requirement: stale handling not silent
-        if is_stale and late_banner:
-            card = f"{late_banner}\n\n{card}"
-            print(f"[LATE-BANNER] Appended late-run indicator to card (delay {delay_minutes:.0f}m)")
-            logger.warning("Appended late-run banner to post-market card")
         print(card)
         if broadcast:
             ok = publish_to_news_channel(card, dry_run=dry_run)
