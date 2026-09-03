@@ -7,11 +7,17 @@ Triggered by:
 
 Pipeline (official project modules only — no hardcoded logic):
   a. Ticker ingestion    : StocksRegistry.all_symbols() (26 registered EGX stocks)
-  b. Shariah gate        : ShariahFilter.filter_universe() — strict default-deny,
-                           NON_COMPLIANT / NEEDS_REVIEW dropped BEFORE any signal
+  b. Shariah transparency: ALL tickers processed (non-compliant / needs-review are
+                           NOT dropped); the real status (✅ متوافق / ⚠️ يحتاج مراجعة /
+                           ❌ غير متوافق) is featured on the official Telegram card
+                           and stored on the Supabase row
   c. Core strategy       : StrategyEngine.evaluate() (Donchian+Volume+RSI confluence,
-                           TQI score, Entry/SL/TP1-3 Fibonacci) + RiskManager.build_plan()
-                           (ATR SL/TP guardrails, sizing, R/R)
+                           TQI score) + RiskManager.build_plan() (ATR SL/TP guardrails)
+  c+.Live Price Guard    : fresh intraday quote (YFinanceDataFetcher.fetch_latest_prices)
+                           at dispatch time; entry is re-anchored to the LIVE price and
+                           SL/TP1-3 are recalculated dynamically from it. Signals whose
+                           live price already moved beyond TP1 or dropped >1% below the
+                           calculated entry are DISCARDED (EXPIRED_ENTRY).
   d. Official card       : TelegramNotifier.format_channel_broadcast() — full channel
                            signal card (Shariah badge, TQI, targets, CTA) + join button
   e. Dispatch            : Supabase trade_signals publish (schema-aligned upsert) +
@@ -40,6 +46,8 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler
 from typing import Any, Dict, List, Optional, Tuple
+
+from egx_quant.core.shariah_filter import ShariahFilter
 
 # Batch size tuned so each yf.download returns in ~2-4s and progress is logged
 BATCH_SIZE = 9
@@ -99,6 +107,39 @@ def _get_scalping_channel_id() -> str:
     return SCALPING_FALLBACK
 
 
+class _TransparentShariahGate(ShariahFilter):
+    """Scanner-level Shariah TRANSPARENCY policy (per task spec).
+
+    The execution engine keeps its strict default-deny gate; the SCANNER, however,
+    must process ALL registry tickers and surface the exact compliance status on
+    every card (✅ متوافق / ⚠️ يحتاج مراجعة / ❌ غير متوافق) instead of silently
+    dropping non-compliant symbols. Subclassing ShariahFilter keeps get_status()
+    (the official evaluator) fully intact — only the blocking behavior is relaxed
+    at this scan boundary.
+    """
+
+    def is_execution_allowed(self, symbol: str) -> bool:
+        return True
+
+
+def _fetch_live_quote(symbol: str, fetcher: "Any" = None) -> "Any":
+    """Fresh intraday PriceQuote (last traded price) via the official data engine.
+
+    Uses YFinanceDataFetcher.fetch_latest_prices — a fresh 5d/1d download whose
+    last bar is the in-progress session candle during market hours.
+    """
+    try:
+        if fetcher is None:
+            from egx_quant.core.data_engine import YFinanceDataFetcher
+            fetcher = YFinanceDataFetcher()
+        from egx_quant.config.stocks_registry import StocksRegistry
+        quotes = fetcher.fetch_latest_prices([symbol])
+        return quotes.get(StocksRegistry.normalize(symbol))
+    except Exception as exc:
+        print(f"[CRON][SCANNER][WARN] live quote fetch failed for {symbol}: {exc}")
+        return None
+
+
 def _has_active_signal(ticker: str) -> bool:
     """True when an ACTIVE/TRACKING trade_signals row already exists for ticker."""
     try:
@@ -156,16 +197,29 @@ def _run_strategy_batch(
     data: "Any",
     strategy: "Any",
     risk: "Any",
-) -> Tuple[List[Dict[str, Any]], int]:
+) -> Tuple[List[Dict[str, Any]], int, List[Dict[str, Any]]]:
     """Run the official StrategyEngine + RiskManager over one batch frame.
 
     Shariah compliance is enforced inside StrategyEngine.evaluate BEFORE any
-    technical computation (default-deny). Returns (records, evaluated_count).
+    technical computation (default-deny). Returns (records, evaluated_count,
+    near_misses) — near_misses carry live values for tickers that met 2/3
+    confluence checks but failed the strict entry criteria.
     """
+    import math
     import pandas as pd  # type: ignore
-    from egx_quant.core.strategy_engine import MIN_BARS, rsi as rsi_fn, sma as sma_fn
+    from egx_quant.core.strategy_engine import (
+        MIN_BARS,
+        DONCHIAN_PERIOD,
+        RSI_LOWER_BOUND,
+        RSI_UPPER_BOUND,
+        VOLUME_SPIKE_MULT,
+        donchian_high,
+        rsi as rsi_fn,
+        sma as sma_fn,
+    )
 
     records: List[Dict[str, Any]] = []
+    near_misses: List[Dict[str, Any]] = []
     evaluated = 0
     multi = isinstance(data.columns, pd.MultiIndex)
     level0 = set(data.columns.get_level_values(0)) if multi else set()
@@ -177,6 +231,39 @@ def _run_strategy_batch(
             evaluated += 1
             signal = strategy.evaluate(ticker, df)
             if signal is None:
+                # Per-ticker rejection diagnostics (same formulas as the engine)
+                close = df["Close"].astype(float)
+                high = df["High"].astype(float)
+                volume = df["Volume"].astype(float)
+                last_close = float(close.iloc[-1])
+                don = float(donchian_high(high).iloc[-1])
+                vol_avg = float(sma_fn(volume, DONCHIAN_PERIOD).iloc[-1])
+                last_vol = float(volume.iloc[-1])
+                last_rsi = float(rsi_fn(close).iloc[-1])
+                last_sma20 = float(sma_fn(close, 20).iloc[-1])
+                checks = {
+                    "donchian": math.isfinite(don) and last_close > don,
+                    "volume": math.isfinite(vol_avg) and vol_avg > 0 and last_vol > VOLUME_SPIKE_MULT * vol_avg,
+                    "rsi": RSI_LOWER_BOUND < last_rsi < RSI_UPPER_BOUND,
+                }
+                met = sum(checks.values())
+                print(
+                    f"[CRON][SCANNER][DIAG] {ticker} | close={last_close:.2f} sma20={last_sma20:.2f} "
+                    f"rsi={last_rsi:.1f} | donchian: close>{don:.2f}={checks['donchian']} | "
+                    f"volume: {last_vol:.0f}>{VOLUME_SPIKE_MULT}x{vol_avg:.0f}={checks['volume']} | "
+                    f"rsi-band(50-70)={checks['rsi']} | confluence={met}/3"
+                )
+                if met >= 2:
+                    failed = [k for k, v in checks.items() if not v]
+                    near_misses.append({
+                        "ticker": ticker,
+                        "close": round(last_close, 2),
+                        "sma20": round(last_sma20, 2),
+                        "rsi": round(last_rsi, 1),
+                        "checks_met": met,
+                        "failed": failed,
+                        "tqi": "not scored (entry confluence incomplete)",
+                    })
                 continue
             plan = risk.build_plan(
                 ticker,
@@ -196,6 +283,7 @@ def _run_strategy_batch(
                 "ticker": ticker,
                 "plan": plan,
                 "signal": signal,
+                "df": df,
                 "rr_tp1": _rr_ratio(plan),
                 "rsi": round(last_rsi, 1),
                 "sma20": round(last_sma20, 2),
@@ -208,22 +296,99 @@ def _run_strategy_batch(
         except Exception as e_ticker:
             print(f"[CRON][SCANNER] ticker {ticker} evaluation failed: {e_ticker}")
             continue
-    return records, evaluated
+    return records, evaluated, near_misses
 
 
-def _publish_signal(rec: Dict[str, Any], shariah: "Any", notifier: "Any", dry_run: bool) -> Dict[str, Any]:
-    """Dispatch one approved plan: official card -> Telegram broadcast + Supabase upsert.
+def _publish_signal(
+    rec: Dict[str, Any],
+    shariah: "Any",
+    notifier: "Any",
+    risk: "Any",
+    dry_run: bool,
+    quote_fetcher: "Any" = None,
+) -> Dict[str, Any]:
+    """Dispatch one approved plan: Live Price Guard -> reprice -> card -> dispatch.
 
-    Dedup: skips both when an ACTIVE/TRACKING signal already exists for the ticker
-    (repeated 15-min cron hits, or the daemon/GH screener already signaled it).
-    Dry-run prints the exact Telegram payload (card + button) instead of sending.
+    Order:
+      1. Dedup: skip when an ACTIVE/TRACKING signal already exists for the ticker.
+      2. Live Price Guard: fetch a fresh intraday quote (last traded price). If the
+         live price already moved beyond TP1 or dropped >1% below the calculated
+         entry, the signal is DISCARDED as stale (EXPIRED_ENTRY).
+      3. Dynamic reprice: entry is re-anchored to the LIVE price and SL/TP1/TP2/TP3
+         are recalculated from it (official RiskManager + fib_targets).
+      4. Official Signal Card Formatter (features the real Shariah status) and
+         Telegram broadcast + Supabase upsert.
     """
+    from egx_quant.core.risk_engine import atr as atr_fn
+    from egx_quant.core.strategy_engine import fib_targets, impulse_swings
     from egx_quant.utils.telegram_notifier import build_join_markup, clean_ticker
 
     plan = rec["plan"]
     ticker = str(plan.symbol)
-    outcome: Dict[str, Any] = {"ticker": ticker, "supabase": "skipped", "telegram": "skipped"}
-    # Official Signal Card Formatter — no custom message text constructed here.
+    outcome: Dict[str, Any] = {"ticker": ticker, "guard": "pending", "supabase": "skipped", "telegram": "skipped"}
+
+    # 1) Dedup (repeated 15-min cron hits never spam)
+    if _has_active_signal(ticker):
+        outcome["guard"] = "dedup-active-exists"
+        outcome["supabase"] = "dedup-active-exists"
+        outcome["telegram"] = "dedup-active-exists"
+        print(f"[CRON][SCANNER] {ticker} already has an ACTIVE signal - publish skipped (dedup)")
+        return outcome
+
+    # 2) Live Price Guard — entry must match the CURRENT live price, not a lagging bar
+    quote = _fetch_live_quote(ticker, fetcher=quote_fetcher)
+    if quote is None or float(getattr(quote, "price", 0) or 0) <= 0:
+        outcome["guard"] = "skipped-no-live-quote"
+        print(f"[CRON][SCANNER] {ticker} no live quote available - publish skipped (cannot validate entry)")
+        return outcome
+    live_price = round(float(quote.price), 2)
+    rec["live_price"] = live_price
+    calc_entry = float(plan.entry_price)
+    tp1 = float(plan.target_1 or 0)
+    if tp1 > 0 and live_price > tp1:
+        outcome["guard"] = f"EXPIRED_ENTRY (live {live_price} already beyond TP1 {tp1:.2f})"
+        print(f"[CRON][SCANNER] {ticker} DISCARDED: {outcome['guard']}")
+        return outcome
+    if live_price < calc_entry * 0.99:
+        outcome["guard"] = f"EXPIRED_ENTRY (live {live_price} dropped >1% below calculated entry {calc_entry:.2f})"
+        print(f"[CRON][SCANNER] {ticker} DISCARDED: {outcome['guard']}")
+        return outcome
+
+    # 3) Dynamic reprice — SL/TP1-3 recalculated from the CURRENT LIVE price
+    df = rec.get("df")
+    t1 = t2 = t3 = None
+    if df is not None:
+        try:
+            swing_low, swing_high = impulse_swings(df)
+            range_ = swing_high - swing_low
+            atr_val = atr_fn(df)
+            t1, t2, t3 = fib_targets(live_price, swing_high, range_, atr_val)
+        except Exception as exc:
+            print(f"[CRON][SCANNER][WARN] {ticker} fib reprice failed ({exc}) - falling back to ATR-only plan")
+            t1 = t2 = t3 = None
+    final_plan = risk.build_plan(
+        ticker,
+        live_price,
+        df,
+        take_profit_override=t3,
+        tqi_score=rec["signal"].tqi_score,
+        targets=[t for t in (t1, t2, t3) if t is not None],
+    )
+    if not final_plan.approved:
+        outcome["guard"] = "passed"
+        outcome["supabase"] = f"skipped-risk-reject: {final_plan.rejection_reason_en}"
+        print(f"[CRON][SCANNER] {ticker} plan rejected after live reprice: {final_plan.rejection_reason_en}")
+        return outcome
+    rec["plan"] = final_plan
+    rec["entry_source"] = "live_intraday_quote"
+    outcome["guard"] = f"passed (entry re-anchored {calc_entry:.2f} -> live {live_price})"
+    plan = final_plan
+    print(
+        f"[CRON][SCANNER] LIVE-REPRICE {ticker} | entry={plan.entry_price} sl={plan.stop_loss} "
+        f"tp1={plan.target_1} tp2={plan.target_2} tp3={plan.target_3} rr_tp1={_rr_ratio(plan)}"
+    )
+
+    # 4) Official Signal Card Formatter — real Shariah status featured on the card
     card = notifier.format_channel_broadcast(plan, 0)
     markup = build_join_markup(0, clean_ticker(plan.symbol))
     if dry_run:
@@ -232,13 +397,6 @@ def _publish_signal(rec: Dict[str, Any], shariah: "Any", notifier: "Any", dry_ru
         print(f"[CRON][SCANNER][DRY-RUN][TELEGRAM MARKUP] {json.dumps(markup, ensure_ascii=False)}")
         outcome["supabase"] = "dry-run (would upsert trade_signals)"
         outcome["telegram"] = "dry-run (would broadcast official card)"
-    if _has_active_signal(ticker):
-        outcome["supabase"] = "dedup-active-exists"
-        outcome["telegram"] = "dedup-active-exists"
-        print(f"[CRON][SCANNER] {ticker} already has an ACTIVE signal - publish skipped (dedup)")
-        return outcome
-    if dry_run:
-        print(f"[CRON][SCANNER][DRY-RUN] would publish {ticker} -> Supabase + Telegram")
         return outcome
     try:
         from egx_quant.utils import supabase_sync
@@ -286,7 +444,7 @@ def run_scan_pipeline(dry_run: bool = False) -> Dict[str, Any]:
         "mode": "full-egx-batched" + (" (dry-run)" if dry_run else ""),
         "universe_size": len(universe),
         "universe": universe,
-        "shariah": {"compliant_size": len(universe), "dropped": []},
+        "shariah": {"policy": "transparent-scan", "counts": {}, "statuses": {}},
         "evaluated": 0,
         "batches": [],
         "signals": [],
@@ -300,27 +458,36 @@ def run_scan_pipeline(dry_run: bool = False) -> Dict[str, Any]:
         result["error"] = f"deps: {exc}"
         return result
 
-    # --- (b) Strict Shariah compliance gate BEFORE any signal generation ---
+    # --- (b) Shariah TRANSPARENCY: all registry tickers are processed; the real
+    #     status (COMPLIANT / NEEDS_REVIEW / NON_COMPLIANT) is featured on every card
     try:
-        from egx_quant.core.shariah_filter import ShariahFilter
         from egx_quant.core.strategy_engine import StrategyEngine
         from egx_quant.core.risk_engine import RiskManager
-        shariah = ShariahFilter()
+        shariah = _TransparentShariahGate()
         strategy = StrategyEngine(shariah_filter=shariah)
         risk = RiskManager()
     except Exception as exc:
         print(f"[CRON][SCANNER][ERROR] engine modules unavailable: {exc}")
         result["error"] = f"engines: {exc}"
         return result
-    compliant = shariah.filter_universe(universe)
-    dropped = [(s, shariah.get_status(s).value) for s in universe if s not in set(compliant)]
-    result["shariah"] = {"compliant_size": len(compliant), "dropped": [{"ticker": s, "status": st} for s, st in dropped]}
-    for s, st in dropped:
-        print(f"[CRON][SCANNER][SHARIAH] drop {s} ({st}) - excluded before signal generation")
-    print(f"[CRON][SCANNER] shariah gate: {len(compliant)}/{len(universe)} compliant -> strategy universe")
+    statuses = {s: shariah.get_status(s).value for s in universe}
+    status_counts: Dict[str, int] = {}
+    for st in statuses.values():
+        status_counts[st] = status_counts.get(st, 0) + 1
+    result["shariah"] = {
+        "policy": "transparent-scan (all tickers processed; exact status featured on card)",
+        "counts": status_counts,
+        "statuses": statuses,
+    }
+    print(
+        f"[CRON][SCANNER] shariah transparency: processing ALL {len(universe)} tickers "
+        f"({status_counts.get('COMPLIANT', 0)} compliant, {status_counts.get('NEEDS_REVIEW', 0)} needs-review, "
+        f"{status_counts.get('NON_COMPLIANT', 0)} non-compliant) - status featured on card"
+    )
 
-    batches = [compliant[i:i + BATCH_SIZE] for i in range(0, len(compliant), BATCH_SIZE)]
+    batches = [universe[i:i + BATCH_SIZE] for i in range(0, len(universe), BATCH_SIZE)]
     all_records: List[Dict[str, Any]] = []
+    all_near_misses: List[Dict[str, Any]] = []
     for idx, batch in enumerate(batches, start=1):
         t0 = datetime.now(timezone.utc)
         try:
@@ -335,8 +502,9 @@ def run_scan_pipeline(dry_run: bool = False) -> Dict[str, Any]:
                 auto_adjust=True,
             )
             b_secs = (datetime.now(timezone.utc) - t0).total_seconds()
-            records, evaluated = _run_strategy_batch(batch, data, strategy, risk)
+            records, evaluated, near_misses = _run_strategy_batch(batch, data, strategy, risk)
             all_records.extend(records)
+            all_near_misses.extend(near_misses)
             result["batches"].append({
                 "batch": idx,
                 "tickers": len(batch),
@@ -352,6 +520,17 @@ def run_scan_pipeline(dry_run: bool = False) -> Dict[str, Any]:
             result["batches"].append({"batch": idx, "tickers": len(batch), "download_seconds": round(b_secs, 1), "error": str(exc)[:150]})
 
     print(f"[CRON][SCANNER] evaluation complete: {result['evaluated']} evaluated, {len(all_records)} signal(s)")
+    result["near_miss"] = all_near_misses
+    for nm in all_near_misses:
+        print(
+            f"[CRON][SCANNER][NEAR-MISS] {nm['ticker']} | Price={nm['close']} SMA20={nm['sma20']} "
+            f"RSI={nm['rsi']} | confluence {nm['checks_met']}/3 | failed: {', '.join(nm['failed'])} | TQI: {nm['tqi']}"
+        )
+    if not all_records:
+        print(
+            f"NO_LIVE_SIGNALS_TODAY: Evaluated {result['evaluated']}/{len(universe)} "
+            f"registry tickers, 0 satisfied strict entry criteria."
+        )
     try:
         from egx_quant.utils.telegram_notifier import TelegramNotifier
         notifier = TelegramNotifier(channel_id=_get_scalping_channel_id())
@@ -361,21 +540,23 @@ def run_scan_pipeline(dry_run: bool = False) -> Dict[str, Any]:
 
     for rec in all_records:
         if notifier is None:
-            outcome: Dict[str, Any] = {"ticker": rec["ticker"], "supabase": "skipped (no notifier)", "telegram": "skipped (no notifier)"}
+            outcome: Dict[str, Any] = {"ticker": rec["ticker"], "guard": "skipped-no-notifier", "supabase": "skipped", "telegram": "skipped"}
         else:
-            outcome = _publish_signal(rec, shariah, notifier, dry_run)
+            outcome = _publish_signal(rec, shariah, notifier, risk, dry_run)
         plan = rec["plan"]
         result["signals"].append({
             "ticker": rec["ticker"],
             "strategy_tag": rec["signal"].strategy_tag,
             "signal": "confluence_buy",
             "entry_price": plan.entry_price,
+            "entry_source": rec.get("entry_source", "daily_close"),
+            "live_price": rec.get("live_price"),
             "stop_loss": plan.stop_loss,
             "target_1": plan.target_1,
             "target_2": plan.target_2,
             "target_3": plan.target_3,
             "tqi_score": plan.tqi_score,
-            "rr_tp1": rec["rr_tp1"],
+            "rr_tp1": _rr_ratio(plan),
             "rsi": rec["rsi"],
             "sma20": rec["sma20"],
             "shariah_status": shariah.get_status(rec["ticker"]).value,
