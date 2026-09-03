@@ -1,10 +1,13 @@
 name: EGX Stock Screener
 
 on:
-  # INTRADAY SCANNER MIGRATED TO VERCEL CRON (2026-09-03): the */15 schedule now
-  # lives in vercel.json crons (07:00-11:30 UTC / 10:00-14:30 Cairo Sun-Thu) and
-  # pings /api/scanner directly — GitHub Actions is unreliable for intraday
-  # scalping latency. workflow_dispatch kept for manual backfill runs only.
+  # INTRADAY SCANNER SCHEDULE REMOVED FROM GITHUB ACTIONS (2026-09-03): GHA is
+  # unreliable for intraday scalping latency. The */15 trigger now runs EXCLUSIVELY
+  # via the external cron-job.org schedule (see scripts/setup_cronjobs.py — 15-min
+  # pings to /api/scanner, 07:00-11:30 UTC / 10:00-14:30 Cairo Sun-Thu).
+  # NOTE: vercel.json crons cannot host */15 on the Hobby plan (daily-only crons);
+  # re-add there after a Pro upgrade if Vercel-native scheduling is wanted.
+  # Dedup: scanner publishes are per-ticker upserts in Supabase; main.py dedups via state.json.
   workflow_dispatch:
 
 permissions:
