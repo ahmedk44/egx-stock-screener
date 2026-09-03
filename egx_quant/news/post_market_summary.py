@@ -52,6 +52,9 @@ try:
         get_cairo_date_str,
         build_context_aware_categories,
         format_context_aware_section,
+        _verified_session_headlines,
+        _is_sanctioned_ticker,
+        LLM_GUARDRAILS_AR,
     )
 except ImportError:
     try:
@@ -64,6 +67,9 @@ except ImportError:
             get_cairo_date_str,
             build_context_aware_categories,
             format_context_aware_section,
+            _verified_session_headlines,
+            _is_sanctioned_ticker,
+            LLM_GUARDRAILS_AR,
         )
     except:
         check_already_published = lambda x: False  # type: ignore
@@ -74,6 +80,9 @@ except ImportError:
         build_context_aware_categories = lambda x, **kw: {"active": [], "watchlist": [], "avoid": []}  # type: ignore
         format_context_aware_section = lambda x: "🎯 **متابعة أسهم المنظومة والفرص | System Signals & Opportunities**\nلا توجد صفقات مفتوحة حالياً في المنظومة."  # type: ignore
         get_cairo_date_str = lambda: datetime.now().strftime("%Y-%m-%d")  # type: ignore
+        _verified_session_headlines = lambda h: list(h or [])  # type: ignore
+        _is_sanctioned_ticker = lambda t: False  # type: ignore
+        LLM_GUARDRAILS_AR = ""  # type: ignore
 
 logger = logging.getLogger("egx_news.post_market")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-7s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
@@ -312,16 +321,21 @@ def generate_ai_sentiment(
     retry/backoff for minutes, which previously stalled the whole pipeline ~197s
     and got the Vercel function killed before publishing. Falls back to heuristic.
     """
-    # Collect top headlines via main's news fetcher if possible
+    # Collect VERIFIED same-session headlines via main's news fetcher — only for
+    # registry-sanctioned (non-test/mock) tickers; stale/unparsable dates rejected.
     headlines_sample = []
     try:
         # Try to import main's headline fetcher
-        from main import fetch_arabic_headlines, build_news_prompt, STOCK_NAMES_AR as MAIN_NAMES  # type: ignore
+        from main import fetch_arabic_headlines, STOCK_NAMES_AR as MAIN_NAMES  # type: ignore
         for g in gainers[:2]:
+            sym = str(g.get("symbol") or "")
+            if not _is_sanctioned_ticker(sym):
+                logger.info(f"[SANITIZE] {sym}: unknown/mock/test ticker - excluded from AI sentiment context")
+                continue
             try:
-                h = fetch_arabic_headlines(MAIN_NAMES.get(g["symbol"], g["symbol"]), g["symbol"])
+                h = fetch_arabic_headlines(MAIN_NAMES.get(sym, sym), sym)
                 if h:
-                    headlines_sample.extend([hh.get("title","") if isinstance(hh, dict) else str(hh) for hh in h[:1]])
+                    headlines_sample.extend([hh for hh in _verified_session_headlines(h)[:1]])
             except:
                 continue
     except:
@@ -346,6 +360,7 @@ def generate_ai_sentiment(
         "• السيولة: (نشطة/ضعيفة/متوسطة مع حجم)\n"
         "• أبرز العناوين: (تلخيص 1-2 خبر)\n"
         "اجعلها موجزة جداً (كل نقطة سطر واحد)."
+        + LLM_GUARDRAILS_AR
     )
 
     # Try Gemini — under a hard wall-clock budget (serverless-safe)

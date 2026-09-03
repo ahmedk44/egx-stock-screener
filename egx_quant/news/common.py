@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import json
 import logging
 from datetime import datetime
@@ -445,93 +446,193 @@ def _extract_short_reason(text: str, max_len: int = 80) -> str:
         text = text[:max_len].rstrip() + "…"
     return text if text else "تطور إخباري"
 
-def get_news_impact_for_ticker(ticker: str, company_name: Optional[str] = None) -> Dict[str, Any]:
-    """Evaluate today's news/sentiment for a specific ticker.
+# ==============================================================================
+# Strict Pre-AI Context Sanitization + Sector/Leadership Correlation
+# (Anti-hallucination audit: LLM sees ONLY verified same-session news for
+# registry-sanctioned tickers; everything else gets code-set neutral facts.)
+# ==============================================================================
 
-    Returns dict with impact_label, emoji, short_reason
-    Uses LLM/Sentiment module (Gemini) if available, else heuristic + mock for TEST tickers.
+NO_NEWS_IMPACT: Dict[str, Any] = {
+    "impact": "محايد",
+    "emoji": "⚖️",
+    "short_reason": "لا توجد أخبار جوهرية اليوم",
+}
+
+# Anti-hallucination system instructions appended to EVERY LLM prompt
+LLM_GUARDRAILS_AR = (
+    "\n\nقواعد صارمة (إلزامية — مخالفتها تُبطل التحليل):\n"
+    "- لا تخترع أي أخبار أو أرقام أو أحداث لم ترد صراحةً في العناوين/البيانات المذكورة أعلاه.\n"
+    "- ممنوع منعاً باتاً إعادة استخدام عبارات جاهزة أو قوالب عامة مثل: "
+    "«نتائج أعمال قوية وتوزيعات أرباح مقترحة» أو «نمو أرباح وتوزيعات مقترحة» — كل جملة يجب أن تستند إلى المحتوى المرفق فقط.\n"
+    "- إذا لم يوجد خبر جوهري اليوم في العناوين، اكتب حرفياً: «لا توجد أخبار جوهرية اليوم» واكتفِ بحقائق سعرية صريحة (نسبة التغير، السيولة، أداء المؤشرات).\n"
+    "- قائد السوق: إذا كان الخبر عن سهم قائد (COMI / SWDY / ABUK / TMGH / ETEL) فحلّل الأثر غير المباشر (Spillover) على قطاعه وأسهمه التابعة فقط — ولا تخترع أخباراً فردية لأسهم غير نشطة.\n"
+)
+
+
+def _is_sanctioned_ticker(ticker: Any) -> bool:
+    """True only for registry-verified, non-test/mock tickers."""
+    t = str(ticker or "").strip().upper()
+    if not t:
+        return False
+    bare = t[:-3] if t.endswith(".CA") else t
+    if t.startswith(("TEST", "MOCK")) or bare.startswith(("TEST", "MOCK")):
+        return False
+    try:
+        from egx_quant.config.stocks_registry import StocksRegistry
+        return StocksRegistry.get(t) is not None
+    except Exception:
+        return False
+
+
+def _verified_session_headlines(headlines: Any) -> List[str]:
+    """Keep only headlines whose embedded publish date falls on the CURRENT Cairo session date.
+
+    fetch_arabic_headlines appends "(RFC822 date)" to each title; unparsable or
+    stale-dated headlines are rejected so the LLM never sees yesterday's news.
     """
-    ticker = ticker.strip().upper()
-    bare = ticker.replace(".CA", "")
-    # Mock handling for TEST tickers and verification mocks
-    # Deterministic mock to ensure each category has data in tests
-    if ticker.startswith("TEST") or bare.startswith("TEST") or bare.startswith("MOCK"):
-        # Use hash to distribute, but ensure TEST3 (active) is positive, WATCH is positive, RISK is negative
-        if "RISK" in bare or "AVOID" in bare or bare in ["EAST"]:
-            return {"impact": "سلبي", "emoji": "⚠️", "short_reason": "إفصاح سلبي عن نتائج ضعيفة واستقالة تنفيذية"}
-        # For active TEST tickers, return positive to show impact
-        return {"impact": "إيجابي", "emoji": "🚀", "short_reason": "نتائج أعمال قوية وتوزيعات أرباح مقترحة"}
+    import re
+    from email.utils import parsedate_to_datetime
 
-    # Special mock for verification tickers if provided via env
-    # Try to fetch real news
-    news_text = ""
-    headlines = []
+    try:
+        from egx_quant.utils.egx_calendar import now_cairo
+        today = now_cairo().date()
+    except Exception:
+        today = datetime.now().date()
+    verified: List[str] = []
+    for h in headlines or []:
+        title = str(h or "").strip()
+        if not title:
+            continue
+        m = re.search(r"\(([^()]*)\)\s*$", title)
+        if not m:
+            continue
+        try:
+            dt = parsedate_to_datetime(m.group(1))
+        except Exception:
+            continue
+        try:
+            from egx_quant.utils.egx_calendar import CAIRO_TZ
+            pub_date = dt.astimezone(CAIRO_TZ).date() if dt.tzinfo else dt.date()
+        except Exception:
+            pub_date = dt.date() if hasattr(dt, "date") else None
+        if pub_date == today:
+            verified.append(title)
+    return verified
+
+
+def _extract_sentiment_label(text: Any) -> str:
+    """Pull the explicit sentiment label from LLM output; default محايد (never guess up)."""
+    t = str(text or "")
+    import re
+    m = re.search(r"التصنيف\s*[:：\-]*\s*(إيجابي|سلبي|محايد)", t)
+    if m:
+        return m.group(1)
+    for token in ("إيجابي", "سلبي", "محايد"):
+        if token in t:
+            return token
+    return "محايد"
+
+
+def get_news_impact_for_ticker(ticker: str, company_name: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Verified-news-only sentiment with strict anti-hallucination rules.
+
+    - Unknown / mock / test tickers -> None (excluded from AI analysis entirely).
+    - NO verified raw news for the current session date -> exact code-set neutral
+      («محايد ⚖️ - لا توجد أخبار جوهرية اليوم») WITHOUT calling the LLM.
+    - LLM invoked ONLY when same-session verified headlines exist, under
+      LLM_GUARDRAILS_AR (no invention, no generic templates, leader spillover only).
+    """
+    ticker = str(ticker or "").strip().upper()
+    bare = ticker.replace(".CA", "")
+    if not _is_sanctioned_ticker(ticker):
+        logger.info(f"[SANITIZE] {ticker}: unknown/mock/test ticker - excluded from AI news analysis")
+        return None
+
+    raw_headlines: List[Any] = []
     try:
         sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
-        from main import fetch_arabic_headlines, build_news_prompt  # type: ignore
-        from main import STOCK_NAMES_AR as MAIN_NAMES  # type: ignore
+        from main import fetch_arabic_headlines, STOCK_NAMES_AR as MAIN_NAMES  # type: ignore
         name = (company_name or MAIN_NAMES.get(ticker, bare))
-        headlines = fetch_arabic_headlines(name, ticker)  # type: ignore
-        if headlines:
-            # Build prompt and summarize via Gemini if possible
-            try:
-                from main import _summarize_with_gemini  # type: ignore
-                prompt = build_news_prompt(headlines)  # type: ignore
-                news_text = _summarize_with_gemini(prompt, ticker)  # type: ignore
-            except:
-                # Fallback to raw headlines
-                news_text = " | ".join([h.get("title","") if isinstance(h, dict) else str(h) for h in headlines[:2]])
-        else:
-            news_text = ""
+        raw_headlines = fetch_arabic_headlines(name, ticker) or []
     except Exception as e:
         logger.debug(f"News fetch for {ticker} failed: {e}")
+        raw_headlines = []
+
+    verified = _verified_session_headlines(raw_headlines)
+    if not verified:
+        logger.info(f"[NO-NEWS] {ticker}: 0 verified same-session headlines - code-set neutral (no LLM call)")
+        return dict(NO_NEWS_IMPACT)
+
+    news_text = ""
+    try:
+        from main import build_news_prompt, _summarize_with_gemini  # type: ignore
+        prompt = build_news_prompt(verified) + LLM_GUARDRAILS_AR
+        news_text = _summarize_with_gemini(prompt, ticker) or ""
+    except Exception as e:
+        logger.debug(f"Gemini for {ticker} failed: {e}")
         news_text = ""
 
-    # If still empty, try heuristic based on recent price action or fallback mock
-    if not news_text:
-        # Heuristic fallback: use synthetic based on ticker hash to avoid all neutral
-        h = hash(ticker) % 3
-        if h == 0:
-            news_text = "أداء مستقر مع سيولة متوسطة"
-        elif h == 1:
-            news_text = "إيجابي: نمو أرباح وتوزيعات مقترحة"
-        else:
-            news_text = "سلبي: ضغوط بيعية وتراجع"
-
-    sentiment = _classify_sentiment_simple(news_text)
-    short_reason = _extract_short_reason(news_text)
+    sentiment = _extract_sentiment_label(news_text)
+    short_reason = _extract_short_reason(news_text) if news_text.strip() else NO_NEWS_IMPACT["short_reason"]
     emoji = "🚀" if sentiment == "إيجابي" else "⚠️" if sentiment == "سلبي" else "⚖️"
-    return {"impact": sentiment, "emoji": emoji, "short_reason": short_reason, "raw_text": news_text}
+    return {
+        "impact": sentiment,
+        "emoji": emoji,
+        "short_reason": short_reason,
+        "raw_text": news_text,
+        "verified_headlines": verified,
+    }
+
 
 def build_context_aware_categories(
     active_enriched: List[Dict[str, Any]],
     watchlist_limit: int = 3,
     avoid_limit: int = 3,
 ) -> Dict[str, List[Dict[str, Any]]]:
-    """Map news sentiment to 3 categories: Active, Watchlist (Bullish), Avoid (Risk).
+    """Map verified news to 3 categories: Active, Watchlist (Bullish), Avoid (Risk).
 
-    - Active: for each active trade in trade_signals, evaluate today's news/sentiment
-    - Watchlist: tickers with top positive news/high TQI (scan non-active tickers)
-    - Avoid: tickers with adverse disclosures / heavy selloff sentiment
-
-    Uses LLM/Sentiment module to categorize before formatting.
-    Returns dict with keys 'active', 'watchlist', 'avoid'
+    STRICT CONTEXT RULES (anti-hallucination audit):
+    - Sanitization: unknown / mock / test tickers never reach the LLM or the report.
+    - Rule A (Sector Correlation): "Impact on Active Trades" covers ONLY tickers
+      stored in active_positions plus registry stocks in the SAME sector as an
+      active position.
+    - Rule B (Leadership Spillover): a Market Leader headline (COMI / SWDY / ABUK /
+      TMGH / ETEL) is analyzed as spillover on its sector followers ONLY — never
+      invented as individual fake news for non-active stocks.
+    - Watchlist/Avoid entries REQUIRE verified same-session headlines; when a
+      bucket has no qualifying news it stays EMPTY (no synthetic fills, no
+      generic templates).
     """
-    # A. Active Trades Impact
+    try:
+        from egx_quant.config.stocks_registry import StocksRegistry, HEAVYWEIGHT_SYMBOLS
+    except Exception:
+        StocksRegistry = None  # type: ignore
+        HEAVYWEIGHT_SYMBOLS: tuple = ("COMI.CA", "SWDY.CA", "ABUK.CA", "TMGH.CA", "ETEL.CA")
+
+    # ── A. Active Trades Impact (sanitized active positions only) ──
     active_list: List[Dict[str, Any]] = []
-    for sig in active_enriched:
-        ticker = sig.get("ticker") or sig.get("ticker_bare") or "UNKNOWN"
-        # Get company name if available
-        company = None
+    active_tickers: set = set()
+    active_sectors: set = set()
+    for sig in active_enriched or []:
+        ticker = str(sig.get("ticker") or sig.get("full_ticker") or sig.get("ticker_bare") or "").strip().upper()
+        if not ticker:
+            continue
+        if not _is_sanctioned_ticker(ticker):
+            logger.info(f"[SANITIZE] active signal {ticker}: unknown/mock/test - excluded from report")
+            continue
         try:
-            sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
-            from main import STOCK_NAMES_AR  # type: ignore
-            company = STOCK_NAMES_AR.get(ticker, ticker)
-        except:
-            company = ticker
-        impact = get_news_impact_for_ticker(ticker, company)
+            from egx_quant.config.stocks_registry import StocksRegistry as _SR
+            meta = _SR.get(ticker)
+            if meta is not None:
+                active_sectors.add(meta.sector)
+        except Exception:
+            pass
+        active_tickers.add(ticker)
+        impact = get_news_impact_for_ticker(ticker)
+        if impact is None:
+            impact = dict(NO_NEWS_IMPACT)
         active_list.append({
-            "ticker": sig.get("ticker_bare") or ticker.replace(".CA",""),
+            "ticker": (ticker[:-3] if ticker.endswith(".CA") else ticker),
             "full_ticker": ticker,
             "price": sig.get("current_price"),
             "strategy_type": sig.get("strategy_type"),
@@ -541,86 +642,87 @@ def build_context_aware_categories(
             "raw_impact": impact,
         })
 
-    # For watchlist/avoid, scan non-active tickers
-    # Get all TICKERS and exclude active
-    try:
-        sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
-        from main import TICKERS as ALL_TICKERS  # type: ignore
-    except:
-        ALL_TICKERS = ["COMI.CA","ABUK.CA","SWDY.CA","TMGH.CA","HELI.CA","ORAS.CA","ETEL.CA","FWRY.CA","EAST.CA","JUFO.CA"]
-
-    active_tickers = set([s.get("ticker") or s.get("full_ticker") for s in active_list] + [s.get("ticker_bare") for s in active_list])
-    # Normalize
-    active_set = set([t.strip().upper() for t in active_tickers if t])
-
-    candidates = [t for t in ALL_TICKERS if t.strip().upper() not in active_set]
-    # Limit scan to avoid Gemini quota: sample 8 tickers
-    sample = candidates[:8] if len(candidates) > 8 else candidates
-
+    # ── B. Sector Correlation + Leadership Spillover (verified news only) ──
     watchlist: List[Dict[str, Any]] = []
     avoid: List[Dict[str, Any]] = []
+    sector_notes: List[Dict[str, Any]] = []
 
-    for ticker in sample:
-        try:
-            # Get company name
-            try:
-                from main import STOCK_NAMES_AR  # type: ignore
-                comp = STOCK_NAMES_AR.get(ticker, ticker)
-            except:
-                comp = ticker
-            impact = get_news_impact_for_ticker(ticker, comp)
-            # Categorize
-            if impact["impact"] == "إيجابي":
-                # For watchlist, need positive_news_trigger
-                watchlist.append({
-                    "ticker": ticker.replace(".CA",""),
-                    "full_ticker": ticker,
-                    "positive_news_trigger": impact["short_reason"],
-                    "impact": impact["impact"],
-                })
-            elif impact["impact"] == "سلبي":
-                avoid.append({
-                    "ticker": ticker.replace(".CA",""),
-                    "full_ticker": ticker,
-                    "negative_news_trigger": impact["short_reason"],
-                    "impact": impact["impact"],
-                })
-            # Neutral goes nowhere (skip)
-            if len(watchlist) >= watchlist_limit and len(avoid) >= avoid_limit:
-                break
-        except Exception as e:
-            logger.debug(f"Watchlist categorize failed for {ticker}: {e}")
+    universe = StocksRegistry.all_symbols() if StocksRegistry else []
+    candidates: List[Dict[str, Any]] = []
+    for ticker in universe:
+        if ticker in active_tickers:
             continue
+        meta = StocksRegistry.get(ticker) if StocksRegistry else None
+        if meta is None:
+            continue
+        is_leader = ticker in set(HEAVYWEIGHT_SYMBOLS)
+        same_sector = bool(active_sectors) and meta.sector in active_sectors
+        if is_leader or same_sector:
+            candidates.append({"ticker": ticker, "meta": meta, "is_leader": is_leader, "same_sector": same_sector})
 
-    # Ensure at least one per bucket for demo if empty (using synthetic fallback for verification)
-    # This ensures layout readability in tests even with limited real news
-    if not watchlist:
-        # Fallback: pick first non-active ticker as mock bullish
-        fallback_ticker = sample[0] if sample else "ORAS.CA"
-        watchlist.append({
-            "ticker": fallback_ticker.replace(".CA",""),
-            "full_ticker": fallback_ticker,
-            "positive_news_trigger": "إفصاح إيجابي عن نتائج قوية ونمو أرباح",
-            "impact": "إيجابي",
-        })
-    if not avoid:
-        # Fallback: use EAST as known risk or second sample
-        fallback_ticker = sample[1] if len(sample) > 1 else "EAST.CA"
-        # Ensure not same as watchlist
-        if fallback_ticker.replace(".CA","") == watchlist[0]["ticker"]:
-            fallback_ticker = sample[2] if len(sample) > 2 else "JUFO.CA"
-        avoid.append({
-            "ticker": fallback_ticker.replace(".CA",""),
-            "full_ticker": fallback_ticker,
-            "negative_news_trigger": "تحذير مالي وإفصاح سلبي عن تراجع الأرباح",
-            "impact": "سلبي",
-        })
+    for cand in candidates:
+        ticker = cand["ticker"]
+        meta = cand["meta"]
+        try:
+            impact = get_news_impact_for_ticker(ticker)
+        except Exception as e:
+            logger.debug(f"Sector candidate {ticker} analysis failed: {e}")
+            continue
+        if impact is None:
+            continue
+        # No verified same-session news -> code-set neutral -> NOT reportable
+        if impact.get("short_reason") == NO_NEWS_IMPACT["short_reason"]:
+            continue
+        followers = [
+            s.symbol for s in (StocksRegistry.all_stocks() if StocksRegistry else [])
+            if s.sector == meta.sector and s.symbol != ticker
+        ]
+        note = {
+            "ticker": (ticker[:-3] if ticker.endswith(".CA") else ticker),
+            "full_ticker": ticker,
+            "sector": meta.sector,
+            "impact": impact["impact"],
+            "short_reason": impact["short_reason"],
+            "is_leader": cand["is_leader"],
+            "same_sector_as_active": cand["same_sector"],
+            "sector_followers": followers,
+        }
+        sector_notes.append(note)
+        bare = note["ticker"]
+        if cand["is_leader"]:
+            rel = f"قائد قطاع {meta.sector} - تأثير غير مباشر محتمل على: {', '.join(f[:-3] for f in followers) or 'لا يوجد'}"
+        elif cand["same_sector"]:
+            rel = f"نفس قطاع صفقة نشطة ({meta.sector})"
+        else:
+            rel = meta.sector
+        if impact["impact"] == "إيجابي":
+            if len(watchlist) < watchlist_limit:
+                watchlist.append({
+                    "ticker": bare,
+                    "full_ticker": ticker,
+                    "positive_news_trigger": f"{impact['short_reason']} | {rel}",
+                    "impact": impact["impact"],
+                })
+        elif impact["impact"] == "سلبي":
+            if len(avoid) < avoid_limit:
+                avoid.append({
+                    "ticker": bare,
+                    "full_ticker": ticker,
+                    "negative_news_trigger": f"{impact['short_reason']} | {rel}",
+                    "impact": impact["impact"],
+                })
 
-    # Trim to limits
-    watchlist = watchlist[:watchlist_limit]
-    avoid = avoid[:avoid_limit]
-
-    return {"active": active_list, "watchlist": watchlist, "avoid": avoid}
+    logger.info(
+        f"[CONTEXT] active={len(active_list)} sector_candidates={len(candidates)} "
+        f"verified_notes={len(sector_notes)} watchlist={len(watchlist)} avoid={len(avoid)} "
+        f"(no synthetic fills - empty buckets stay empty)"
+    )
+    return {
+        "active": active_list,
+        "watchlist": watchlist,
+        "avoid": avoid,
+        "sector_notes": sector_notes,
+    }
 
 def format_context_aware_section(categories: Dict[str, List[Dict[str, Any]]]) -> str:
     """Format the 🎯 System Signals & Opportunities section with 3 clean parts.
