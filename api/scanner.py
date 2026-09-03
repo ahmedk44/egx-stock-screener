@@ -343,12 +343,12 @@ class handler(BaseHTTPRequestHandler):
             self.wfile.write(json.dumps({"ok": False, "error": "unauthorized", "reason": auth_reason}).encode())
             return
 
-        # Window guard: only run during active session 07:00-11:30 UTC Sun-Thu
+        # Window guard: only run during active session 06:00-12:30 UTC (09:00-15:30 Cairo) Sun-Thu
         try:
             hour = started.hour + started.minute / 60.0
             gh_dow = (started.weekday() + 1) % 7  # Sun=0
-            in_window = 7.0 <= hour <= 11.5 and gh_dow in (0, 1, 2, 3, 4)
-            print(f"[CRON][AUDIT] Scheduled */15 7-11 UTC (10:00-14:30 Cairo) | Now {started.strftime('%H:%M UTC')} dow={gh_dow} | in_window={in_window}")
+            in_window = 6.0 <= hour <= 12.5 and gh_dow in (0, 1, 2, 3, 4)
+            print(f"[CRON][AUDIT] Scheduled */15 6-12 UTC (09:00-15:30 Cairo) | Now {started.strftime('%H:%M UTC')} dow={gh_dow} | in_window={in_window}")
         except Exception as e:
             print(f"[CRON][AUDIT] window check failed: {e}")
             in_window = True
@@ -365,7 +365,7 @@ class handler(BaseHTTPRequestHandler):
                 "now": datetime.now(timezone.utc).isoformat(),
                 "duration_seconds": duration,
                 "auth": auth_reason,
-                "schedule": "external cron */15 7-11 * * 0-4 -> every 15m 07:00-11:30 UTC (10:00-14:30 Cairo) Sun-Thu",
+                "schedule": "external cron */15 6-12 * * 0-4 -> every 15m 06:00-12:30 UTC (09:00-15:30 Cairo) Sun-Thu",
                 "result": scan,
             }
         else:
@@ -375,7 +375,7 @@ class handler(BaseHTTPRequestHandler):
                 "now": datetime.now(timezone.utc).isoformat(),
                 "duration_seconds": round((datetime.now(timezone.utc) - started).total_seconds(), 2),
                 "auth": auth_reason,
-                "schedule": "*/15 7-11 * * 0-4 -> every 15m 07:00-11:30 UTC (10:00-14:30 Cairo) Sun-Thu",
+                "schedule": "*/15 6-12 * * 0-4 -> every 15m 06:00-12:30 UTC (09:00-15:30 Cairo) Sun-Thu",
             }
 
         try:
