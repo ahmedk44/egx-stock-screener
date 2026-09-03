@@ -31,5 +31,82 @@
     "trade_track": "⚡ مضاربة لحظية (Scalp)",
     "timestamp": "2026-08-23T08:51:41.399213+00:00",
     "status": "PENDING"
+  },
+  {
+    "ticker": "ABUK.CA",
+    "entry_price": 94.0,
+    "current_stop_loss": 91.17999999999999,
+    "target_1": 96.35,
+    "target_2": 98.7,
+    "target_3": 101.52000000000001,
+    "trade_track": "⚡ مضاربة لحظية (Scalp)",
+    "timestamp": "2026-09-03T11:54:23.954203+00:00",
+    "status": "PENDING"
+  },
+  {
+    "ticker": "ALCN.CA",
+    "entry_price": 32.7400016784668,
+    "current_stop_loss": 31.75780162811279,
+    "target_1": 33.55850172042847,
+    "target_2": 34.37700176239014,
+    "target_3": 35.359201812744146,
+    "trade_track": "📈 تداول سوينغ (Swing)",
+    "timestamp": "2026-09-03T11:55:31.752502+00:00",
+    "status": "PENDING"
+  },
+  {
+    "ticker": "AMOC.CA",
+    "entry_price": 13.5,
+    "current_stop_loss": 13.094999999999999,
+    "target_1": 13.837499999999999,
+    "target_2": 14.175,
+    "target_3": 14.580000000000002,
+    "trade_track": "📈 تداول سوينغ (Swing)",
+    "timestamp": "2026-09-03T11:56:14.212237+00:00",
+    "status": "PENDING"
+  },
+  {
+    "ticker": "CERA.CA",
+    "entry_price": 1.399999976158142,
+    "current_stop_loss": 1.3579999768733977,
+    "target_1": 1.4349999755620955,
+    "target_2": 1.4699999749660493,
+    "target_3": 1.5119999742507935,
+    "trade_track": "📈 تداول سوينغ (Swing)",
+    "timestamp": "2026-09-03T11:56:25.710795+00:00",
+    "status": "PENDING"
+  },
+  {
+    "ticker": "HELI.CA",
+    "entry_price": 8.100000381469727,
+    "current_stop_loss": 7.857000370025634,
+    "target_1": 8.302500391006468,
+    "target_2": 8.505000400543214,
+    "target_3": 8.748000411987306,
+    "trade_track": "📈 تداول سوينغ (Swing)",
+    "timestamp": "2026-09-03T11:57:32.038901+00:00",
+    "status": "PENDING"
+  },
+  {
+    "ticker": "HRHO.CA",
+    "entry_price": 25.700000762939453,
+    "current_stop_loss": 23.644000701904297,
+    "target_1": 28.2700008392334,
+    "target_2": 30.84000091552734,
+    "target_3": 34.69500102996827,
+    "trade_track": "📈 تداول سوينغ (Swing)",
+    "timestamp": "2026-09-03T11:57:47.047438+00:00",
+    "status": "PENDING"
+  },
+  {
+    "ticker": "PHDC.CA",
+    "entry_price": 14.399999618530273,
+    "current_stop_loss": 13.247999649047852,
+    "target_1": 15.839999580383303,
+    "target_2": 17.27999954223633,
+    "target_3": 19.43999948501587,
+    "trade_track": "📈 تداول سوينغ (Swing)",
+    "timestamp": "2026-09-03T11:58:05.953161+00:00",
+    "status": "PENDING"
   }
 ]
