@@ -2,18 +2,36 @@
 """
 Real-Time Target Hit & Stop-Loss Monitor Engine.
 
-Scans active trade_signals against live market prices, detects target hits
-and stop-loss breaches, updates state, and dispatches alerts to public
-channels and private DMs.
+Scans active trade_signals against live market prices, detects target hits,
+stop-loss breaches and trailing-stop moves, updates state, and dispatches
+alerts as PRIVATE DMs to tracking users only.
 
-Idempotency:
-  - Uses public.sent_alerts table to record every (ticker, target_level) hit
-    so the same target level is never announced twice.
-  - Tracks SL hits via trade_signals.status -> 'CLOSED' guard.
+Routing policy (per system agreement):
+  - Open-trade management alerts (targets / SL / trailing) are PRIVATE per
+    user - they NEVER go to public broadcast channels. Public channels carry
+    only NEW signal teasers from the scanner.
+
+Idempotency (claim-first, per EVENT - fixes the 15-minute alert loop):
+  - public.notified_events.event_key is a UNIQUE claim store:
+      SL:{ticker}:{signal_id}              - one SL exit alert per trade, ever
+      T{level}:{ticker}:{signal_id}        - one alert per target level per trade
+          (the old date-scoped sent_alerts check re-announced T1 every new day)
+      TRAIL:{ticker}:{signal_id}:{new_sl}  - one alert per actual stop move
+  - SL close PATCHes by PRIMARY KEY `id` (the live schema has no `trade_id`
+    column - the old `?trade_id=eq.` filter returned HTTP 400, kept the trade
+    ACTIVE forever, and was the root cause of the 15-minute SL loop).
+  - Trailing moves persist current_stop_loss BEFORE announcing; if the
+    persist fails the alert is suppressed (never a phantom stop move).
+  - Suppressed alerts (failed close/persist/delivery) trigger a throttled
+    admin alert so signals never die silently.
+
+Rate limiting:
+  - DM loops sleep RATE_LIMIT_DELAY_SECONDS between sends (~20 msg/sec) and
+    back off on Telegram 429 flood responses (bot cap ~30 msg/sec).
 
 Schedule:
-  - .github/workflows/trade_monitor.yml runs every 5 minutes during
-    market hours (Sun-Thu 10:00 AM - 02:30 PM Cairo, UTC+3).
+  - Runs every 15 minutes inside the scanner session window
+    (Sun-Thu 10:00-14:30 Cairo) - see api/scanner.py / scripts/setup_cronjobs.py.
 """
 from __future__ import annotations
 
@@ -21,6 +39,7 @@ import json
 import logging
 import os
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -56,6 +75,12 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-7s | 
 TARGET_HIT_TABLE = "sent_alerts"
 TRADE_SIGNALS_TABLE = "trade_signals"
 USER_PORTFOLIO_TABLE = "user_portfolio"
+NOTIFIED_EVENTS_TABLE = "notified_events"
+
+# Telegram rate-limit guard: the bot-wide broadcast cap is ~30 msg/sec.
+# 0.05s spacing caps every DM loop at ~20 msg/sec; 429 responses additionally
+# back off using the retry_after the API returns.
+RATE_LIMIT_DELAY_SECONDS = 0.05
 
 
 def get_supabase_config() -> Optional[Tuple[str, str]]:
@@ -90,124 +115,356 @@ from egx_quant.utils.supabase_sync import list_subscribers, broadcast_trade_upda
 notifier = TelegramNotifier()
 
 
-def _record_target_hit(ticker: str, target_level: int, target_price: float, current_price: float) -> bool:
-    """Insert into sent_alerts to record that ticker reached target_level.
+def _was_notified(event_key: str) -> bool:
+    """True when event_key already exists in notified_events (claim store).
 
-    Returns True if newly inserted (first time), False if already recorded
-    (duplicate - should NOT re-alert).
+    Fail-open: unreachable Supabase returns False (proceed to notify) with a
+    loud log - a missed dedup check is safer than silently dropping alerts.
     """
     cfg = _cfg()
     if requests is None or cfg is None:
-        logger.warning("No Supabase config - cannot record target hit idempotency")
-        return True  # optimistic: proceed
-    url, key = cfg
-    headers = _headers(prefer="return=minimal")
-    payload = {
-        "ticker": ticker,
-        "strategy": "monitor",
-        "date_sent": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-        "entry_price": target_price,
-        "current_stop_loss": 0.0,
-        "target_1": target_price if target_level == 1 else None,
-        "target_2": target_price if target_level == 2 else None,
-        "target_3": target_price if target_level == 3 else None,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    }
-    # Try UPSERT on_conflict=(ticker, target_level equivalent)
-    # sent_alerts has no unique constraint on (ticker, date_sent), so we check first
+        logger.warning("[IDEMPOTENT] No Supabase config - cannot check %s (fail-open)", event_key)
+        return False
+    url, _ = cfg
     try:
-        check_url = f"{url}/rest/v1/{TARGET_HIT_TABLE}?ticker=eq.{ticker}&date_sent=eq.{payload['date_sent']}&select=id,target_1,target_2,target_3"
-        resp = requests.get(check_url, headers=headers, timeout=10)
+        resp = requests.get(
+            f"{url}/rest/v1/{NOTIFIED_EVENTS_TABLE}?event_key=eq.{event_key}&select=id",
+            headers=_headers(prefer="return=minimal"),
+            timeout=10,
+        )
         if resp.status_code == 200:
             rows = resp.json()
             if isinstance(rows, list) and rows:
-                for r in rows:
-                    existing_target = r.get(f"target_{target_level}")
-                    if existing_target is not None and float(existing_target) >= target_price * 0.99:
-                        logger.info(f"[IDEMPOTENT] Target {target_level} for {ticker} already recorded - skip")
-                        return False
+                logger.info("[IDEMPOTENT] %s already notified - skip", event_key)
+                return True
+            return False
+        logger.warning("[IDEMPOTENT] check %s failed HTTP %s: %s", event_key, resp.status_code, resp.text[:150])
+        return False
     except Exception as e:
-        logger.debug(f"Check sent_alerts failed: {e}")
+        logger.warning("[IDEMPOTENT] check %s exception: %s", event_key, e)
+        return False
 
+
+def _record_event(event_key: str, event_type: str, ticker: str,
+                  signal_id: Optional[int] = None, payload: Optional[Dict[str, Any]] = None) -> bool:
+    """Insert a claim row. False on duplicate/race (caller must NOT notify)."""
+    cfg = _cfg()
+    if requests is None or cfg is None:
+        return False
+    url, _ = cfg
+    body = {
+        "event_key": event_key,
+        "event_type": event_type,
+        "ticker": ticker,
+        "signal_id": signal_id,
+        "payload": payload or {},
+    }
     try:
-        resp = requests.post(f"{url}/rest/v1/{TARGET_HIT_TABLE}", json=payload, headers=headers, timeout=10)
+        resp = requests.post(
+            f"{url}/rest/v1/{NOTIFIED_EVENTS_TABLE}?on_conflict=event_key",
+            json=body,
+            headers=_headers(prefer="resolution=ignore-duplicates,return=minimal"),
+            timeout=10,
+        )
         if resp.status_code in (200, 201, 204):
-            logger.info(f"[SENT_ALERT] Recorded target {target_level} hit for {ticker} @ {target_price}")
+            logger.info("[EVENT] recorded %s", event_key)
             return True
-        logger.warning(f"[SENT_ALERT] Insert failed {resp.status_code}: {resp.text[:200]}")
+        if resp.status_code == 409:
+            logger.info("[EVENT] %s already recorded (409 race) - skip", event_key)
+            return False
+        logger.warning("[EVENT] record %s failed HTTP %s: %s", event_key, resp.status_code, resp.text[:150])
         return False
     except Exception as e:
-        logger.warning(f"[SENT_ALERT] Exception: {e}")
+        logger.warning("[EVENT] record %s exception: %s", event_key, e)
         return False
 
 
-def _mark_trade_closed(ticker: str, trade_id: Optional[int], reason: str) -> bool:
-    """Update trade_signals status to CLOSED and user_portfolio status to CLOSED (remaining=0)."""
+def _unclaim_event(event_key: str) -> None:
+    """Remove a claim so a failed delivery can be retried next cycle."""
+    cfg = _cfg()
+    if requests is None or cfg is None:
+        return
+    url, _ = cfg
+    try:
+        requests.delete(
+            f"{url}/rest/v1/{NOTIFIED_EVENTS_TABLE}?event_key=eq.{event_key}",
+            headers=_headers(prefer="return=minimal"),
+            timeout=10,
+        )
+        logger.info("[EVENT] unclaimed %s (delivery failed - will retry)", event_key)
+    except Exception as e:
+        logger.warning("[EVENT] unclaim %s exception: %s", event_key, e)
+
+
+def _event_key(kind: str, ticker: str, signal_id: Optional[int], suffix: str = "") -> str:
+    sid = signal_id if signal_id is not None else "NA"
+    return f"{kind}:{ticker}:{sid}{suffix}"
+
+
+def _record_target_hit(ticker: str, target_level: int, target_price: float,
+                       current_price: float, signal_id: Optional[int] = None) -> bool:
+    """Claim (ticker, target_level) hit. True if newly claimed, False if duplicate.
+
+    Replaces the old date-scoped sent_alerts dedup (which re-announced the same
+    target on every new day) with a per-trade notified_events claim.
+    """
+    key = _event_key(f"T{target_level}", ticker, signal_id)
+    if _was_notified(key):
+        return False
+    return _record_event(key, "TARGET_HIT", ticker, signal_id,
+                         {"target_price": target_price, "current_price": current_price})
+
+
+def _check_sent_alert(ticker: str, target_level: int, target_price: float,
+                      signal_id: Optional[int] = None) -> bool:
+    """True when (ticker, target_level) already recorded.
+
+    Legacy name kept for verify_trade_monitor compatibility; now backed by
+    notified_events (the old body referenced an undefined `payload` variable,
+    raised NameError, and was swallowed into always-False).
+    """
+    key = _event_key(f"T{target_level}", ticker, signal_id)
+    return _was_notified(key)
+
+
+def _admin_chat_ids() -> List[str]:
+    """Admin recipients: ADMIN_USER_IDS / ADMIN_TELEGRAM_IDS (comma separated),
+    falling back to TELEGRAM_USER_CHAT_ID / TELEGRAM_CHAT_ID."""
+    ids: List[str] = []
+    raw = (os.environ.get("ADMIN_USER_IDS") or os.environ.get("ADMIN_TELEGRAM_IDS") or "")
+    for part in raw.replace(" ", "").split(","):
+        p = part.strip()
+        if p and p not in ids:
+            ids.append(p)
+    fallback = (os.environ.get("TELEGRAM_USER_CHAT_ID") or os.environ.get("TELEGRAM_CHAT_ID") or "").strip()
+    if fallback and fallback not in ids:
+        ids.append(fallback)
+    return ids
+
+
+def _notify_admin(subject: str, detail: str, throttle_key: Optional[str] = None) -> bool:
+    """Push a system-failure alert to the admin(s).
+
+    Used whenever a DB write fails and the user-facing alert gets suppressed
+    (SL close / trailing persist / DM delivery) so signals never die silently.
+    Throttled to ONE alert per key per UTC day via notified_events - a
+    persistently failing PATCH must not spam the admin every monitor cycle.
+    Always logged at ERROR level regardless of delivery.
+    """
+    logger.error("[ADMIN-ALERT] %s: %s", subject, detail)
+    if throttle_key:
+        day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if _was_notified(_event_key("ADMIN", "SYSTEM", None, f":{throttle_key}:{day}")):
+            return True
+        _record_event(_event_key("ADMIN", "SYSTEM", None, f":{throttle_key}:{day}"),
+                      "ADMIN_ALERT", "SYSTEM", None, {"subject": subject})
+    token = (os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
+    if not token:
+        logger.warning("[ADMIN-ALERT] no TELEGRAM_BOT_TOKEN - logged only")
+        return False
+    text = (
+        "⚠️ <b>[تنبيه النظام] فشل في محرك متابعة الصفقات</b>\n"
+        "------------------------------------\n"
+        f"📌 <b>{subject}</b>\n"
+        f"{detail}\n"
+        "------------------------------------\n"
+        "⚠️ التنبيه الخاص بهذا الحدث تم كبحه هذه الدورة لتجنب إعادة الإرسال - راجع النظام.\n"
+        f"🕐 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
+    )
+    sent = False
+    ids = _admin_chat_ids()
+    for idx, uid in enumerate(ids):
+        if idx:
+            time.sleep(RATE_LIMIT_DELAY_SECONDS)
+        try:
+            resp = requests.post(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                json={"chat_id": uid, "text": text, "parse_mode": "HTML"},
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                sent = True
+            else:
+                logger.warning("[ADMIN-ALERT] send to %s failed HTTP %s", uid[:8], resp.status_code)
+        except Exception as e:
+            logger.warning("[ADMIN-ALERT] send to %s exception: %s", uid[:8], e)
+    return sent
+
+
+def _dm_subscribers(ticker: str, signal_id: Optional[int], card: str,
+                    footer: str = "", dry_run: bool = False) -> Tuple[bool, int, int]:
+    """DM-only dispatch of a trade-management card to tracking users.
+
+    Policy: open-trade management alerts NEVER go to public channels - the
+    public feed carries only new-signal teasers from the scanner.
+    Rate-limited: sleeps RATE_LIMIT_DELAY_SECONDS between sends and backs off
+    on Telegram 429 (retry_after) to respect the ~30 msg/sec bot cap.
+    Returns (ok, delivered, total_subscribers). Zero subscribers is success
+    (nothing to do); total>0 with delivered==0 is a failure.
+    """
+    subscribers: List[str] = []
+    try:
+        if signal_id is not None:
+            subscribers = list_subscribers(signal_id)
+    except Exception as e:
+        logger.warning("[DM] list_subscribers failed: %s", e)
+    if not subscribers:
+        try:
+            subscribers = list_subscribers_by_symbol(ticker)
+        except Exception as e:
+            logger.warning("[DM] list_subscribers_by_symbol failed: %s", e)
+    if not subscribers:
+        logger.info("[DM] no tracking users for %s (signal_id=%s) - nothing sent", ticker, signal_id)
+        return (True, 0, 0)
+    text = f"{card}\n{footer}" if footer else card
+    if dry_run:
+        logger.info("[DRY-RUN DM] would send to %d subscriber(s) for %s", len(subscribers), ticker)
+        for uid in subscribers:
+            print(f"[DRY-RUN DM -> {uid[:8]}]\n{text[:400]}")
+        return (True, len(subscribers), len(subscribers))
+    token = (os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
+    delivered = 0
+    for idx, uid in enumerate(subscribers):
+        if idx:
+            time.sleep(RATE_LIMIT_DELAY_SECONDS)
+        try:
+            resp = requests.post(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                json={"chat_id": uid, "text": text, "parse_mode": "HTML"},
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                delivered += 1
+                continue
+            if resp.status_code == 429:
+                # Flood control: honor retry_after, back off, retry once
+                try:
+                    retry_after = float(resp.json().get("parameters", {}).get("retry_after", 1.0))
+                except Exception:
+                    retry_after = 1.0
+                retry_after = min(retry_after, 5.0)
+                logger.warning("[DM] 429 flood for %s - backing off %.1fs", uid[:8], retry_after)
+                time.sleep(retry_after)
+                try:
+                    retry = requests.post(
+                        f"https://api.telegram.org/bot{token}/sendMessage",
+                        json={"chat_id": uid, "text": text, "parse_mode": "HTML"},
+                        timeout=10,
+                    )
+                    if retry.status_code == 200:
+                        delivered += 1
+                except Exception:
+                    pass
+                continue
+            logger.warning("[DM] send to %s failed HTTP %s: %s", uid[:8], resp.status_code, resp.text[:120])
+        except Exception as e:
+            logger.warning("[DM] exception sending to %s: %s", uid[:8], e)
+    logger.info("[DM] %s: delivered %d/%d", ticker, delivered, len(subscribers))
+    return (delivered > 0, delivered, len(subscribers))
+
+
+def _resolve_signal_id(ticker: str) -> Optional[int]:
+    """Latest ACTIVE/TRACKING/OPEN trade_signals.id for ticker (PK for PATCHes)."""
+    cfg = _cfg()
+    if requests is None or cfg is None:
+        return None
+    url, _ = cfg
+    headers = _headers(prefer="return=minimal")
+    for status_q in ("&status=in.(ACTIVE,TRACKING,OPEN)", ""):
+        try:
+            resp = requests.get(
+                f"{url}/rest/v1/{TRADE_SIGNALS_TABLE}?ticker=eq.{ticker}{status_q}"
+                f"&order=created_at.desc&limit=1&select=id",
+                headers=headers, timeout=10,
+            )
+            if resp.status_code == 200:
+                rows = resp.json()
+                if isinstance(rows, list) and rows:
+                    return rows[0].get("id")
+        except Exception as e:
+            logger.warning("[RESOLVE] %s failed: %s", ticker, e)
+    return None
+
+
+def _mark_trade_closed(ticker: str, signal_id: Optional[int], reason: str) -> bool:
+    """Close the trade_signals row (by PRIMARY KEY `id`) and mirror-close
+    user_portfolio rows.
+
+    Root-cause fix: the live schema has NO `trade_id` column (PK is `id`) - the
+    previous `?trade_id=eq.` PATCH returned HTTP 400 on every cycle, the trade
+    stayed ACTIVE, and the SL alert looped every 15 minutes.
+    """
     cfg = _cfg()
     if requests is None or cfg is None:
         logger.warning("No Supabase config - cannot mark trade closed")
         return False
-    url, key = cfg
+    url, _ = cfg
     headers = _headers(prefer="return=minimal")
     updated = False
-    # Update trade_signals
-    if trade_id is not None:
+
+    # Resolve the real PK when not provided (PATCH must filter id=eq.)
+    if signal_id is None:
+        signal_id = _resolve_signal_id(ticker)
+        if signal_id is None:
+            logger.error("[CLOSED] cannot close %s: no ACTIVE signal row found", ticker)
+
+    if signal_id is not None:
         try:
-            patch_url = f"{url}/rest/v1/{TRADE_SIGNALS_TABLE}?trade_id=eq.{trade_id}"
-            resp = requests.patch(patch_url, json={"status": "CLOSED", "exit_reason": reason}, headers=headers, timeout=10)
+            resp = requests.patch(
+                f"{url}/rest/v1/{TRADE_SIGNALS_TABLE}?id=eq.{signal_id}",
+                json={"status": "CLOSED", "exit_reason": reason},
+                headers=headers, timeout=10,
+            )
             if resp.status_code in (200, 204):
-                logger.info(f"[CLOSED] trade_signals trade_id={trade_id} -> CLOSED ({reason})")
+                logger.info("[CLOSED] trade_signals id=%s (%s) -> CLOSED (%s)", signal_id, ticker, reason)
                 updated = True
             else:
-                logger.warning(f"[CLOSED] trade_signals patch failed {resp.status_code}: {resp.text[:200]}")
+                logger.error("[CLOSED] trade_signals PATCH id=%s failed HTTP %s: %s",
+                             signal_id, resp.status_code, resp.text[:200])
         except Exception as e:
-            logger.warning(f"[CLOSED] trade_signals exception: {e}")
-    else:
-        # Fallback: update by ticker
-        try:
-            patch_url = f"{url}/rest/v1/{TRADE_SIGNALS_TABLE}?ticker=eq.{ticker}&order=created_at.desc&limit=1"
-            resp = requests.patch(patch_url, json={"status": "CLOSED", "exit_reason": reason}, headers=headers, timeout=10)
-            if resp.status_code in (200, 204):
-                logger.info(f"[CLOSED] trade_signals ticker={ticker} -> CLOSED ({reason})")
-                updated = True
-        except Exception as e:
-            logger.warning(f"[CLOSED] trade_signals exception: {e}")
-    # Update user_portfolio: standardize full closes to status='CLOSED' (+ remaining 0)
-    # Legacy EXITED fallback only for pre-migration DBs (old check constraint).
+            logger.error("[CLOSED] trade_signals PATCH id=%s exception: %s", signal_id, e)
+
+    # Mirror close on user_portfolio (symbol stored WITH the .CA suffix).
+    # EXITED is the legacy check-constraint fallback for pre-005-migration DBs.
     try:
-        patch_url = f"{url}/rest/v1/{USER_PORTFOLIO_TABLE}?symbol=eq.{ticker}&status=eq.TRACKING"
-        for payload in ({"status": "CLOSED", "remaining_qty_pct": 0}, {"status": "CLOSED"}, {"status": "EXITED"}):
+        sym = ticker if ticker.endswith(".CA") else f"{ticker}.CA"
+        for status_value in ("CLOSED", "EXITED"):
             try:
-                resp = requests.patch(patch_url, json=payload, headers=headers, timeout=10)
+                resp = requests.patch(
+                    f"{url}/rest/v1/{USER_PORTFOLIO_TABLE}?symbol=eq.{sym}&status=eq.TRACKING",
+                    json={"status": status_value},
+                    headers=headers, timeout=10,
+                )
                 if resp.status_code in (200, 204):
-                    if payload.get("status") == "EXITED":
-                        logger.warning("[CLOSED] legacy DB check-constraint - marked EXITED (run supabase_migration_remaining_qty.sql)")
-                    logger.info(f"[CLOSED] user_portfolio ticker={ticker} -> {payload.get('status')}")
+                    logger.info("[CLOSED] user_portfolio %s -> %s", sym, status_value)
                     break
             except Exception as e:
-                logger.warning(f"[CLOSED] user_portfolio exception: {e}")
+                logger.warning("[CLOSED] user_portfolio exception: %s", e)
                 break
     except Exception as e:
-        logger.warning(f"[CLOSED] user_portfolio exception: {e}")
+        logger.warning("[CLOSED] user_portfolio exception: %s", e)
     return updated
 
 
-def _is_sl_closed(ticker: str) -> bool:
-    """Check if trade_signals for this ticker already has status=CLOSED (SL already processed)."""
+def _is_sl_closed(ticker: str, signal_id: Optional[int] = None) -> bool:
+    """True when the signal row is already CLOSED (SL already processed).
+    Prefers the primary key when available; falls back to ticker."""
     cfg = _cfg()
     if requests is None or cfg is None:
         return False
-    url, key = cfg
-    headers = _headers(prefer="return=minimal")
+    url, _ = cfg
+    q = f"id=eq.{signal_id}" if signal_id is not None else f"ticker=eq.{ticker}"
     try:
-        check_url = f"{url}/rest/v1/{TRADE_SIGNALS_TABLE}?ticker=eq.{ticker}&status=eq.CLOSED&order=created_at.desc&limit=1&select=id"
-        resp = requests.get(check_url, headers=headers, timeout=10)
+        resp = requests.get(
+            f"{url}/rest/v1/{TRADE_SIGNALS_TABLE}?{q}&status=eq.CLOSED&limit=1&select=id",
+            headers=_headers(prefer="return=minimal"),
+            timeout=10,
+        )
         if resp.status_code == 200:
             rows = resp.json()
-            if isinstance(rows, list) and rows:
-                return True
+            return isinstance(rows, list) and bool(rows)
     except Exception as e:
-        logger.debug(f"Check closed status failed: {e}")
+        logger.debug("[SL-CLOSED] check failed: %s", e)
     return False
 
 
@@ -293,8 +550,10 @@ def fetch_active_signals_enriched(limit: int = 50) -> List[Dict[str, Any]]:
             for idx, tv in enumerate(targets, start=1):
                 if current is not None and current >= tv * 0.98:
                     targets_hit.append(idx)
-            # Determine if SL hit
-            sl_hit = stop_f is not None and current is not None and current <= stop_f * 1.02
+            # SL hit: price at/below the stop (0.2% epsilon for feed rounding).
+            # The old *1.02 tolerance treated a price 2% ABOVE the SL as a hit -
+            # the phantom trigger behind the repeated CLHO alerts (17.70 vs SL 17.56).
+            sl_hit = stop_f is not None and current is not None and current <= stop_f * 1.002
             # Trade id
             trade_id = sig.get("trade_id") or sig.get("id")
             status = sig.get("status") or "TRACKING"
@@ -365,46 +624,26 @@ def format_sl_exit_card(ticker: str, current_price: float, stop_loss: float, ent
     return "\n".join(lines)
 
 
-def publish_target_alert(ticker: str, target_level: int, target_price: float, current_price: float, entry_price: Optional[float] = None, dry_run: bool = False) -> Tuple[bool, bool]:
-    """Broadcast target-hit alert to public channel + push DM to subscribers.
+def publish_target_alert(ticker: str, target_level: int, target_price: float, current_price: float, entry_price: Optional[float] = None, dry_run: bool = False, trade_id: Optional[int] = None) -> Tuple[bool, bool]:
+    """DM-only target-hit dispatch with claim-first idempotency.
 
-    Returns (public_ok, dm_ok).
-    Idempotency: skips if sent_alerts already has this (ticker, target_level).
+    Policy change: trade-management cards NO LONGER broadcast to public
+    channels - open-trade monitoring is private per user.
+    Returns (dispatched, dm_ok); first element is True whenever the event was
+    handled (DM-only by design), False when suppressed/duplicate.
     """
-    card = format_target_hit_card(ticker, target_level, target_price, current_price, entry_price)
-
-    # Idempotency guard
-    already = not _record_target_hit(ticker, target_level, target_price, current_price)
-    if already:
+    signal_id = trade_id if trade_id is not None else _resolve_signal_id(ticker)
+    key = _event_key(f"T{target_level}", ticker, signal_id)
+    if _was_notified(key):
         logger.info(f"[IDEMPOTENT] Target {target_level} hit for {ticker} already sent - skipping")
         return (False, False)
-
-    public_ok = False
-    dm_ok = False
-
     if not dry_run:
-        # Broadcast to public channel (TELEGRAM_CHANNEL_NEWS or TELEGRAM_CHANNEL_SCALPING)
-        channel = os.environ.get("TELEGRAM_CHANNEL_NEWS") or os.environ.get("TELEGRAM_CHANNEL_SCALPING") or ""
-        if channel and notifier.enabled:
-            public_ok = notifier.send_to_chat(channel, card)
-        elif notifier.enabled:
-            public_ok = notifier.broadcast_signal(card)
-        else:
-            logger.info(f"[MOCK BROADCAST] Target {target_level} hit card for {ticker}")
-            print(f"[MOCK BROADCAST - PUBLIC]\n{card[:500]}")
-            public_ok = True
-    else:
-        logger.info(f"[DRY-RUN] Would broadcast target {target_level} hit for {ticker}")
-        print(f"[DRY-RUN - PUBLIC CARD]\n{card[:800]}")
-        public_ok = True
+        if not _record_event(key, "TARGET_HIT", ticker, signal_id,
+                             {"target_price": target_price, "current_price": current_price}):
+            logger.warning(f"[TARGET] claim failed for {key} - suppressed this cycle")
+            return (False, False)
 
-    # Push DM to subscribers with actionable steps
-    trade_id = None
-    raw_signals = _get_active_signals_from_supabase()
-    for s in raw_signals:
-        if (s.get("ticker") or s.get("symbol")) == ticker:
-            trade_id = s.get("trade_id") or s.get("id")
-            break
+    card = format_target_hit_card(ticker, target_level, target_price, current_price, entry_price)
 
     # Determine actionable suggestion based on target level
     if target_level == 1:
@@ -416,48 +655,17 @@ def publish_target_alert(ticker: str, target_level: int, target_price: float, cu
     else:
         action_suggestion = "💡 <b>الإجراء المقترح:</b> مراجعة الصفقة وتحديث وقف الخسارة."
 
-    if not dry_run:
-        try:
-            subscribers = list_subscribers(trade_id) if trade_id else []
-            if not subscribers and ticker:
-                subscribers = list_subscribers_by_symbol(ticker)
-            if subscribers:
-                dm_text = (
-                    f"{card}\n"
-                    f"------------------------------------\n"
-                    f"{action_suggestion}\n"
-                    f"📩 تم إرسال تنبيه الهدف لك في الخاص."
-                )
-                token = (os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
-                if token and requests:
-                    ok_count = 0
-                    for uid in subscribers:
-                        try:
-                            resp = requests.post(
-                                f"https://api.telegram.org/bot{token}/sendMessage",
-                                json={"chat_id": uid, "text": dm_text, "parse_mode": "HTML"},
-                                timeout=10,
-                            )
-                            if resp.status_code == 200:
-                                ok_count += 1
-                        except Exception:
-                            continue
-                    dm_ok = ok_count > 0
-                    logger.info(f"[DM] Target alert with action sent to {ok_count}/{len(subscribers)} subscribers for {ticker} T{target_level}")
-                else:
-                    logger.info(f"[MOCK DM] Would send target alert with action to {len(subscribers)} users for {ticker}")
-                    dm_ok = True
-            else:
-                logger.info(f"[DM] No subscribers for {ticker} (trade_id={trade_id})")
-                dm_ok = True  # no one to notify = success
-        except Exception as e:
-            logger.warning(f"[DM] Exception: {e}")
-            dm_ok = True  # degrade gracefully
-    else:
-        logger.info(f"[DRY-RUN] Would push DM with action to subscribers for {ticker} T{target_level}")
-        dm_ok = True
-
-    return (public_ok, dm_ok)
+    dm_ok, delivered, total = _dm_subscribers(
+        ticker, signal_id, card,
+        footer=f"{action_suggestion}\n📩 تم إرسال تنبيه الهدف لك في الخاص.",
+        dry_run=dry_run,
+    )
+    if not dry_run and total > 0 and delivered == 0:
+        _unclaim_event(key)
+        _notify_admin("Target DM delivery failed",
+                      f"{key}: 0/{total} delivered - claim released for retry.",
+                      throttle_key=f"target-dm:{ticker}")
+    return (True, dm_ok)
 
 
 def format_trailing_sl_update(ticker: str, new_sl: float, current_price: float, entry_price: Optional[float] = None) -> str:
@@ -475,149 +683,101 @@ def format_trailing_sl_update(ticker: str, new_sl: float, current_price: float, 
         f"📊 [EGX TradingView](https://www.tradingview.com/markets/egypt/)"
     )
 
-def publish_trailing_sl_alert(ticker: str, new_sl: float, current_price: float, entry_price: Optional[float] = None, dry_run: bool = False) -> Tuple[bool, bool]:
-    """Broadcast trailing SL update to subscribers with actionable DM."""
-    card = format_trailing_sl_update(ticker, new_sl, current_price, entry_price)
-    # Reuse target alert logic but with trailing specific
-    public_ok = False
-    dm_ok = False
-    if not dry_run:
-        channel = os.environ.get("TELEGRAM_CHANNEL_NEWS") or os.environ.get("TELEGRAM_CHANNEL_SCALPING") or ""
-        if channel and notifier.enabled:
-            public_ok = notifier.send_to_chat(channel, card)
-        elif notifier.enabled:
-            public_ok = notifier.broadcast_signal(card)
-        else:
-            logger.info(f"[MOCK BROADCAST] Trailing SL update for {ticker}")
-            print(f"[MOCK BROADCAST - PUBLIC]\n{card[:500]}")
-            public_ok = True
-    else:
-        logger.info(f"[DRY-RUN] Would broadcast trailing SL update for {ticker}")
-        print(f"[DRY-RUN - PUBLIC CARD]\n{card[:800]}")
-        public_ok = True
+def publish_trailing_sl_alert(ticker: str, new_sl: float, current_price: float, entry_price: Optional[float] = None, dry_run: bool = False, trade_id: Optional[int] = None, stored_sl: Optional[float] = None) -> Tuple[bool, bool]:
+    """Persist-then-announce trailing SL update (DM-only).
 
-    # Push DM with trailing suggestion
-    raw_signals = _get_active_signals_from_supabase()
-    trade_id = None
-    for s in raw_signals:
-        if (s.get("ticker") or s.get("symbol")) == ticker:
-            trade_id = s.get("trade_id") or s.get("id")
-            break
-    if not dry_run:
-        try:
-            subscribers = list_subscribers(trade_id) if trade_id else []
-            if not subscribers and ticker:
-                subscribers = list_subscribers_by_symbol(ticker)
-            if subscribers:
-                dm_text = f"{card}\n------------------------------------\n💡 <b>الإجراء:</b> الوقف المتحرك يحمي أرباحك تلقائياً."
-                token = (os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
-                if token and requests:
-                    ok_count = 0
-                    for uid in subscribers:
-                        try:
-                            resp = requests.post(
-                                f"https://api.telegram.org/bot{token}/sendMessage",
-                                json={"chat_id": uid, "text": dm_text, "parse_mode": "HTML"},
-                                timeout=10,
-                            )
-                            if resp.status_code == 200:
-                                ok_count += 1
-                        except Exception:
-                            continue
-                    dm_ok = ok_count > 0
-                    logger.info(f"[DM] Trailing SL sent to {ok_count}/{len(subscribers)} for {ticker}")
-                else:
-                    dm_ok = True
-            else:
-                dm_ok = True
-        except Exception as e:
-            logger.warning(f"[DM] Exception: {e}")
-            dm_ok = True
-    else:
-        dm_ok = True
-    return (public_ok, dm_ok)
-
-def publish_sl_alert(ticker: str, current_price: float, stop_loss: float, entry_price: Optional[float] = None, dry_run: bool = False) -> Tuple[bool, bool]:
-    """Broadcast SL exit alert to public channel + mark trade closed + push DM.
-
-    Idempotency: skips if trade_signals.status is already CLOSED for this ticker.
+    Loop fix: the old version computed new_sl but NEVER persisted it to
+    trade_signals.current_stop_loss, so the same move re-fired every cycle
+    (SUGR 56.35 / SKPC 17.89 loop). Now:
+      1. claim TRAIL:{ticker}:{signal_id}:{new_sl}
+      2. PATCH current_stop_loss (and stop_loss) - MUST succeed
+      3. only then DM subscribers; persist failure = suppress + admin alert
     """
-    if _is_sl_closed(ticker):
-        logger.info(f"[IDEMPOTENT] SL already closed for {ticker} - skipping")
+    signal_id = trade_id if trade_id is not None else _resolve_signal_id(ticker)
+    key = _event_key("TRAIL", ticker, signal_id, f":{new_sl}")
+    if _was_notified(key):
         return (False, False)
 
-    card = format_sl_exit_card(ticker, current_price, stop_loss, entry_price)
-
-    public_ok = False
-    dm_ok = False
-
     if not dry_run:
-        # Update DB status to CLOSED
-        trade_id = None
-        raw_signals = _get_active_signals_from_supabase()
-        for s in raw_signals:
-            if (s.get("ticker") or s.get("symbol")) == ticker:
-                trade_id = s.get("trade_id") or s.get("id")
-                break
-        _mark_trade_closed(ticker, trade_id, "EXIT_STOP_LOSS")
-
-        # Broadcast to public channel
-        channel = os.environ.get("TELEGRAM_CHANNEL_NEWS") or os.environ.get("TELEGRAM_CHANNEL_SCALPING") or ""
-        if channel and notifier.enabled:
-            public_ok = notifier.send_to_chat(channel, card)
-        elif notifier.enabled:
-            public_ok = notifier.broadcast_signal(card)
-        else:
-            logger.info(f"[MOCK BROADCAST] SL exit card for {ticker}")
-            print(f"[MOCK BROADCAST - PUBLIC]\n{card[:500]}")
-            public_ok = True
-    else:
-        logger.info(f"[DRY-RUN] Would broadcast SL exit for {ticker}")
-        print(f"[DRY-RUN - PUBLIC CARD]\n{card[:800]}")
-        public_ok = True
-
-    # Push DM to subscribers
-    if not dry_run:
-        try:
-            subscribers = list_subscribers(trade_id) if trade_id else []
-            if not subscribers and ticker:
-                subscribers = list_subscribers_by_symbol(ticker)
-            if subscribers:
-                dm_text = (
-                    f"{card}\n"
-                    f"------------------------------------\n"
-                    f"🔴 تم إرسال تنبيه وقف الخسارة لك في الخاص."
+        persisted = False
+        cfg = _cfg()
+        if requests is not None and cfg is not None and signal_id is not None:
+            url, _ = cfg
+            try:
+                resp = requests.patch(
+                    f"{url}/rest/v1/{TRADE_SIGNALS_TABLE}?id=eq.{signal_id}",
+                    json={"current_stop_loss": new_sl, "stop_loss": new_sl},
+                    headers=_headers(prefer="return=minimal"),
+                    timeout=10,
                 )
-                token = (os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
-                if token and requests:
-                    ok_count = 0
-                    for uid in subscribers:
-                        try:
-                            resp = requests.post(
-                                f"https://api.telegram.org/bot{token}/sendMessage",
-                                json={"chat_id": uid, "text": dm_text, "parse_mode": "HTML"},
-                                timeout=10,
-                            )
-                            if resp.status_code == 200:
-                                ok_count += 1
-                        except Exception:
-                            continue
-                    dm_ok = ok_count > 0
-                    logger.info(f"[DM] SL alert sent to {ok_count}/{len(subscribers)} subscribers for {ticker}")
-                else:
-                    logger.info(f"[MOCK DM] Would send SL alert to {len(subscribers)} users for {ticker}")
-                    dm_ok = True
-            else:
-                logger.info(f"[DM] No subscribers for {ticker}")
-                dm_ok = True
-        except Exception as e:
-            logger.warning(f"[DM] Exception: {e}")
-            dm_ok = True
-    else:
-        logger.info(f"[DRY-RUN] Would push DM to subscribers for {ticker}")
-        dm_ok = True
+                persisted = resp.status_code in (200, 204)
+                if not persisted:
+                    logger.error("[TRAIL] persist %s failed HTTP %s: %s", ticker, resp.status_code, resp.text[:200])
+            except Exception as e:
+                logger.error("[TRAIL] persist %s exception: %s", ticker, e)
+        if not persisted:
+            _notify_admin(
+                "Trailing SL persist failed",
+                f"{ticker}: new_sl={new_sl} NOT persisted to trade_signals - trailing alert suppressed to avoid a repeat loop.",
+                throttle_key=f"trail-persist:{ticker}",
+            )
+            return (False, False)
+        _record_event(key, "TRAILING_SL", ticker, signal_id, {"new_sl": new_sl, "previous_stop": stored_sl})
 
-    return (public_ok, dm_ok)
+    card = format_trailing_sl_update(ticker, new_sl, current_price, entry_price)
+    dm_ok, delivered, total = _dm_subscribers(
+        ticker, signal_id, card,
+        footer="💡 <b>الإجراء:</b> الوقف المتحرك يحمي أرباحك تلقائياً.",
+        dry_run=dry_run,
+    )
+    if not dry_run and total > 0 and delivered == 0:
+        _unclaim_event(key)
+        _notify_admin("Trailing DM delivery failed",
+                      f"{ticker}: 0/{total} delivered - claim released for retry.",
+                      throttle_key=f"trail-dm:{ticker}")
+    return (True, dm_ok)
+
+def publish_sl_alert(ticker: str, current_price: float, stop_loss: float, entry_price: Optional[float] = None, dry_run: bool = False, trade_id: Optional[int] = None) -> Tuple[bool, bool]:
+    """Close-first SL dispatch (DM-only).
+
+    Loop-fix chain:
+      1. claim SL:{ticker}:{signal_id} (never re-announce)
+      2. close the trade FIRST via _mark_trade_closed (by PK id)
+      3. close write FAILED -> suppress alert + throttled admin alert
+         (an un-closed trade would otherwise re-alert every 15 minutes)
+      4. success -> DM subscribers only; delivery failure releases the claim
+    """
+    signal_id = trade_id if trade_id is not None else _resolve_signal_id(ticker)
+    key = _event_key("SL", ticker, signal_id)
+    if _was_notified(key) or _is_sl_closed(ticker, signal_id):
+        if not dry_run:
+            # Backfill the claim so legacy-closed trades skip via both guards.
+            _record_event(key, "SL_HIT", ticker, signal_id, {"note": "already closed"})
+        logger.info(f"[IDEMPOTENT] SL for {ticker} already closed/notified - skipping")
+        return (False, False)
+
+    if not dry_run:
+        if not _mark_trade_closed(ticker, signal_id, "EXIT_STOP_LOSS"):
+            _notify_admin(
+                "SL close failed",
+                f"{ticker}: trade_signals close PATCH failed - SL alert suppressed to avoid the 15-minute loop.",
+                throttle_key=f"sl-close:{ticker}",
+            )
+            return (False, False)
+        _record_event(key, "SL_HIT", ticker, signal_id, {"price": current_price})
+
+    card = format_sl_exit_card(ticker, current_price, stop_loss, entry_price)
+    dm_ok, delivered, total = _dm_subscribers(
+        ticker, signal_id, card,
+        footer="📩 تم إرسال تنبيه وقف الخسارة لك في الخاص.",
+        dry_run=dry_run,
+    )
+    if not dry_run and total > 0 and delivered == 0:
+        _unclaim_event(key)
+        _notify_admin("SL DM delivery failed",
+                      f"{ticker}: 0/{total} delivered - claim released for retry.",
+                      throttle_key=f"sl-dm:{ticker}")
+    return (True, dm_ok)
 
 
 def list_subscribers_by_symbol(symbol: str) -> List[str]:
@@ -642,32 +802,33 @@ def list_subscribers_by_symbol(symbol: str) -> List[str]:
 
 
 def check_target_hits(enriched: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Identify signals where current price has reached a new target level.
+    """Identify signals where current price has reached a NEW target level.
 
-    Returns list of dicts with keys: ticker, target_level, target_price, current_price, entry_price.
-    Only returns NEW hits (not already recorded in sent_alerts).
+    Returns list of dicts with keys: ticker, target_level, target_price,
+    current_price, entry_price, trade_id.
+    Only returns NEW hits - the claim key T{level}:{ticker}:{signal_id} is
+    per-trade (not per-day like the old sent_alerts check).
     """
     hits: List[Dict[str, Any]] = []
     for sig in enriched:
         if sig.get("sl_hit"):
             continue  # SL hit takes priority
+        ticker = sig["ticker"]
+        signal_id = sig.get("trade_id")
         for level in sig.get("targets_hit", []):
-            # Check idempotency: has this level already been recorded?
-            ticker = sig["ticker"]
             target_price = sig["targets"][level - 1] if level <= len(sig["targets"]) else None
             if target_price is None:
                 continue
-            # Check sent_alerts
-            already_recorded = _check_sent_alert(ticker, level, target_price)
-            if not already_recorded:
-                hits.append({
-                    "ticker": ticker,
-                    "target_level": level,
-                    "target_price": target_price,
-                    "current_price": sig["current_price"],
-                    "entry_price": sig["entry_price"],
-                    "trade_id": sig.get("trade_id"),
-                })
+            if _was_notified(_event_key(f"T{level}", ticker, signal_id)):
+                continue
+            hits.append({
+                "ticker": ticker,
+                "target_level": level,
+                "target_price": target_price,
+                "current_price": sig["current_price"],
+                "entry_price": sig["entry_price"],
+                "trade_id": signal_id,
+            })
     return hits
 
 
@@ -698,14 +859,14 @@ def _check_sent_alert(ticker: str, target_level: int, target_price: float) -> bo
 def check_stop_loss_hits(enriched: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Identify signals where current price has breached stop-loss.
 
-    Returns list of dicts with keys: ticker, current_price, stop_loss, entry_price, trade_id.
-    Filters out already-closed trades.
+    Returns list of dicts with keys: ticker, current_price, stop_loss,
+    entry_price, trade_id. Filters out already-closed trades (by PK id).
     """
     hits: List[Dict[str, Any]] = []
     for sig in enriched:
         if not sig.get("sl_hit"):
             continue
-        if _is_sl_closed(sig["ticker"]):
+        if _is_sl_closed(sig["ticker"], sig.get("trade_id")):
             continue
         hits.append({
             "ticker": sig["ticker"],
@@ -718,10 +879,12 @@ def check_stop_loss_hits(enriched: List[Dict[str, Any]]) -> List[Dict[str, Any]]
 
 
 def check_trailing_stop_updates(enriched: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Detect trailing stop opportunities: when price is up >5% and trailing SL should be moved.
+    """Detect trailing-stop moves: raise SL to breakeven (+5%) or trail to T1 (+10%).
 
-    Returns list of dicts with keys: ticker, current_price, new_sl, entry_price, trade_id.
-    Suggests moving SL to breakeven or trailing.
+    The comparison base is the PERSISTED current_stop_loss (not the original
+    plan SL), so a move is proposed only when the stop genuinely still needs
+    raising. The publisher persists the new value BEFORE announcing - this is
+    what ended the identical-value-every-15-minutes trailing loop.
     """
     updates: List[Dict[str, Any]] = []
     for sig in enriched:
@@ -729,42 +892,35 @@ def check_trailing_stop_updates(enriched: List[Dict[str, Any]]) -> List[Dict[str
             ticker = sig.get("ticker")
             entry = sig.get("entry_price")
             current = sig.get("current_price")
-            stop = sig.get("stop_loss")
-            if not ticker or entry is None or current is None or stop is None:
+            raw = sig.get("raw") or {}
+            # Persisted stop wins; fall back to the plan stop for legacy rows
+            stored_sl = raw.get("current_stop_loss") or sig.get("stop_loss")
+            if not ticker or entry is None or current is None or stored_sl is None:
                 continue
-            if current <= stop:
-                continue  # SL hit will be handled separately
+            if current <= stored_sl:
+                continue  # SL hit handled separately
             pnl_pct = (current - entry) / entry * 100 if entry else 0
-            # If up >5% and current SL still below entry, suggest moving to breakeven
-            if pnl_pct >= 5.0 and stop < entry:
+            new_sl = None
+            # If up >5% and the stored SL is still below entry, move to breakeven
+            if pnl_pct >= 5.0 and stored_sl < entry:
                 new_sl = round(entry * 1.005, 2)  # Breakeven + 0.5%
-                # Check if new SL is higher than old (trailing up)
-                if new_sl > stop:
-                    updates.append({
-                        "ticker": ticker,
-                        "current_price": current,
-                        "new_sl": new_sl,
-                        "entry_price": entry,
-                        "trade_id": sig.get("trade_id"),
-                        "pnl_pct": pnl_pct,
-                    })
-            # If up >10% and already breakeven, trail to T1 level
+            # If up >10% (and already at/above breakeven), trail to just under T1
             elif pnl_pct >= 10.0:
                 targets = sig.get("targets", [])
-                if targets and len(targets) >= 1:
+                if targets:
                     t1 = targets[0]
-                    # Trail to T1 if current above T1 and SL below T1
-                    if current >= t1 and stop < t1:
+                    if current >= t1 and stored_sl < t1:
                         new_sl = round(t1 * 0.99, 2)
-                        if new_sl > stop:
-                            updates.append({
-                                "ticker": ticker,
-                                "current_price": current,
-                                "new_sl": new_sl,
-                                "entry_price": entry,
-                                "trade_id": sig.get("trade_id"),
-                                "pnl_pct": pnl_pct,
-                            })
+            if new_sl is not None and new_sl > stored_sl:
+                updates.append({
+                    "ticker": ticker,
+                    "current_price": current,
+                    "new_sl": new_sl,
+                    "stored_sl": stored_sl,
+                    "entry_price": entry,
+                    "trade_id": sig.get("trade_id"),
+                    "pnl_pct": pnl_pct,
+                })
         except Exception:
             continue
     return updates
@@ -774,12 +930,16 @@ def run_monitor_cycle(dry_run: bool = False) -> Dict[str, Any]:
     """Execute one full monitoring cycle.
 
     1. Fetch active signals enriched with live prices.
-    2. Detect target hits -> broadcast + DM, record idempotency.
-    3. Detect SL hits -> broadcast + DM + mark closed.
-    4. Return summary dict.
+    2. Detect target hits -> claim event, DM-only dispatch.
+    3. Detect SL hits -> claim event, close trade FIRST (suppress + admin
+       alert when the close write fails), DM-only dispatch.
+    4. Detect trailing moves -> persist stop FIRST (suppress + admin alert
+       when the persist fails), DM-only dispatch.
+    5. Return summary dict.
 
     Returns:
-        dict with keys: signals_scanned, target_hits, sl_hits, target_results, sl_results, errors
+        dict with keys: signals_scanned, target_hits, sl_hits, target_results,
+        sl_results, trailing_results, errors
     """
     logger.info("===== Trade Monitor Cycle START =====")
     result: Dict[str, Any] = {
@@ -807,21 +967,23 @@ def run_monitor_cycle(dry_run: bool = False) -> Dict[str, Any]:
         result["target_hits"] = len(target_hits)
         for hit in target_hits:
             try:
-                public_ok, dm_ok = publish_target_alert(
+                dispatched, dm_ok = publish_target_alert(
                     ticker=hit["ticker"],
                     target_level=hit["target_level"],
                     target_price=hit["target_price"],
                     current_price=hit["current_price"],
                     entry_price=hit["entry_price"],
                     dry_run=dry_run,
+                    trade_id=hit.get("trade_id"),
                 )
                 result["target_results"].append({
                     "ticker": hit["ticker"],
                     "target_level": hit["target_level"],
-                    "public_ok": public_ok,
+                    "channel": "dm_only",
+                    "dispatched": dispatched,
                     "dm_ok": dm_ok,
                 })
-                logger.info(f"Target {hit['target_level']} hit for {hit['ticker']}: public={public_ok} dm={dm_ok}")
+                logger.info(f"Target {hit['target_level']} hit for {hit['ticker']}: dispatched={dispatched} dm={dm_ok}")
             except Exception as e:
                 logger.error(f"Target alert failed for {hit['ticker']}: {e}")
                 result["errors"].append(f"target_{hit['ticker']}: {e}")
@@ -835,19 +997,21 @@ def run_monitor_cycle(dry_run: bool = False) -> Dict[str, Any]:
         result["sl_hits"] = len(sl_hits)
         for hit in sl_hits:
             try:
-                public_ok, dm_ok = publish_sl_alert(
+                dispatched, dm_ok = publish_sl_alert(
                     ticker=hit["ticker"],
                     current_price=hit["current_price"],
                     stop_loss=hit["stop_loss"],
                     entry_price=hit["entry_price"],
                     dry_run=dry_run,
+                    trade_id=hit.get("trade_id"),
                 )
                 result["sl_results"].append({
                     "ticker": hit["ticker"],
-                    "public_ok": public_ok,
+                    "channel": "dm_only",
+                    "dispatched": dispatched,
                     "dm_ok": dm_ok,
                 })
-                logger.info(f"SL hit for {hit['ticker']}: public={public_ok} dm={dm_ok}")
+                logger.info(f"SL hit for {hit['ticker']}: dispatched={dispatched} dm={dm_ok}")
             except Exception as e:
                 logger.error(f"SL alert failed for {hit['ticker']}: {e}")
                 result["errors"].append(f"sl_{hit['ticker']}: {e}")
@@ -855,27 +1019,30 @@ def run_monitor_cycle(dry_run: bool = False) -> Dict[str, Any]:
         logger.error(f"SL hit detection failed: {e}")
         result["errors"].append(f"detect_sl: {e}")
 
-    # Trailing Stop & Target Hit Auto-Alerts: dispatch DM with actionable steps
+    # Trailing Stop: persist-then-announce, DM-only
     try:
         trailing_updates = check_trailing_stop_updates(enriched)
         result["trailing_updates"] = len(trailing_updates)
         result["trailing_results"] = []
         for upd in trailing_updates:
             try:
-                public_ok, dm_ok = publish_trailing_sl_alert(
+                dispatched, dm_ok = publish_trailing_sl_alert(
                     ticker=upd["ticker"],
                     new_sl=upd["new_sl"],
                     current_price=upd["current_price"],
                     entry_price=upd["entry_price"],
                     dry_run=dry_run,
+                    trade_id=upd.get("trade_id"),
+                    stored_sl=upd.get("stored_sl"),
                 )
                 result["trailing_results"].append({
                     "ticker": upd["ticker"],
                     "new_sl": upd["new_sl"],
-                    "public_ok": public_ok,
+                    "channel": "dm_only",
+                    "dispatched": dispatched,
                     "dm_ok": dm_ok,
                 })
-                logger.info(f"Trailing SL update for {upd['ticker']}: new_sl={upd['new_sl']} public={public_ok} dm={dm_ok}")
+                logger.info(f"Trailing SL update for {upd['ticker']}: new_sl={upd['new_sl']} dispatched={dispatched} dm={dm_ok}")
             except Exception as e:
                 logger.error(f"Trailing alert failed for {upd['ticker']}: {e}")
                 result["errors"].append(f"trailing_{upd['ticker']}: {e}")
@@ -900,12 +1067,12 @@ def format_cycle_summary(result: Dict[str, Any]) -> str:
         lines.append("")
         lines.append("🎯 **Target Hits:**")
         for r in result["target_results"]:
-            lines.append(f"• {r['ticker']} Target {r['target_level']}: public={r['public_ok']} dm={r['dm_ok']}")
+            lines.append(f"• {r['ticker']} Target {r['target_level']}: dispatched={r['dispatched']} dm={r['dm_ok']} (dm_only)")
     if result.get("sl_results"):
         lines.append("")
         lines.append("🛑 **SL Hits:**")
         for r in result["sl_results"]:
-            lines.append(f"• {r['ticker']}: public={r['public_ok']} dm={r['dm_ok']}")
+            lines.append(f"• {r['ticker']}: dispatched={r['dispatched']} dm={r['dm_ok']} (dm_only)")
     if result.get("errors"):
         lines.append("")
         lines.append("⚠️ **Errors:**")
