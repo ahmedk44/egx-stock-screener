@@ -95,6 +95,22 @@ JOBS = [
         },
     },
     {
+        "key": "monitor",
+        "title": "EGX Trade Monitor 06:00-12:30 UTC */5",
+        "path": "/api/monitor",
+        "cron": "*/5 6-12 * * 0-4",
+        "desc": "09:00-15:30 Cairo / 10:00-16:30 Oman — every 5m trade monitor (target/SL/trailing DM alerts; endpoint window-guards 12:30+ pings itself)",
+        "cronjob_schedule": {
+            "timezone": "UTC",
+            "hours": [6, 7, 8, 9, 10, 11, 12],
+            "minutes": [0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55],
+            "wdays": [0, 1, 2, 3, 4],
+            "mdays": [-1],
+            "months": [-1],
+            "expiresAt": 0,
+        },
+    },
+    {
         "key": "post_market",
         "title": "EGX Post-Market 12:30 UTC",
         "path": "/api/post_market",

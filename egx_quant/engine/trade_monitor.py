@@ -302,17 +302,19 @@ def _dm_subscribers(ticker: str, signal_id: Optional[int], card: str,
     Returns (ok, delivered, total_subscribers). Zero subscribers is success
     (nothing to do); total>0 with delivered==0 is a failure.
     """
+    # UNION of both registries (by trade_id AND by symbol) so no tracking user
+    # is ever missed when the two disagree (e.g. legacy joins with trade_id=0).
     subscribers: List[str] = []
     try:
         if signal_id is not None:
-            subscribers = list_subscribers(signal_id)
+            subscribers.extend(list_subscribers(signal_id))
     except Exception as e:
         logger.warning("[DM] list_subscribers failed: %s", e)
-    if not subscribers:
-        try:
-            subscribers = list_subscribers_by_symbol(ticker)
-        except Exception as e:
-            logger.warning("[DM] list_subscribers_by_symbol failed: %s", e)
+    try:
+        subscribers.extend(list_subscribers_by_symbol(ticker))
+    except Exception as e:
+        logger.warning("[DM] list_subscribers_by_symbol failed: %s", e)
+    subscribers = sorted({str(u) for u in subscribers if u})
     if not subscribers:
         logger.info("[DM] no tracking users for %s (signal_id=%s) - nothing sent", ticker, signal_id)
         return (True, 0, 0)
@@ -323,6 +325,9 @@ def _dm_subscribers(ticker: str, signal_id: Optional[int], card: str,
             print(f"[DRY-RUN DM -> {uid[:8]}]\n{text[:400]}")
         return (True, len(subscribers), len(subscribers))
     token = (os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
+    if requests is None or not token:
+        logger.error("[DM] token/requests missing - %d subscriber(s) NOT notified for %s", len(subscribers), ticker)
+        return (False, 0, len(subscribers))
     delivered = 0
     for idx, uid in enumerate(subscribers):
         if idx:

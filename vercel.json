@@ -24,6 +24,13 @@
       "config": {
         "maxDuration": 60
       }
+    },
+    {
+      "src": "api/monitor.py",
+      "use": "@vercel/python",
+      "config": {
+        "maxDuration": 60
+      }
     }
   ],
   "routes": [
@@ -42,6 +49,10 @@
     {
       "src": "/api/scanner",
       "dest": "api/scanner.py"
+    },
+    {
+      "src": "/api/monitor",
+      "dest": "api/monitor.py"
     }
   ],
   "crons": [
