@@ -93,6 +93,18 @@ class handler(BaseHTTPRequestHandler):
         is_stale = False
         delay_minutes = 0.0
         output = ""
+        # Safe-probe mode: ?dry_run=1 generates the card WITHOUT publishing
+        # and WITHOUT writing the idempotency guard (health checks must be
+        # side-effect free - a probe must never send a bulletin).
+        dry_run = False
+        try:
+            from urllib.parse import urlparse as _up, parse_qs as _pqs
+            _vals = _pqs(_up(self.path).query).get("dry_run", [])
+            dry_run = any(str(v or "").strip().lower() in ("1", "true", "yes") for v in _vals)
+            if dry_run:
+                print("[CRON][POST_MARKET] dry-run probe - generating card only (no publish, no guard write)")
+        except Exception:
+            pass
         try:
             # Import here to avoid cold-start import errors before auth check
             from egx_quant.news.post_market_summary import main as pm_main, check_execution_window
@@ -106,9 +118,9 @@ class handler(BaseHTTPRequestHandler):
 
             # Run main (fetch -> AI -> publish to Telegram)
             # Use broadcast=True (default) — will handle idempotency and late banner internally
-            result_code = pm_main(dry_run=False, broadcast=True)
-            output = f"main returned {result_code}"
-            print(f"[CRON][POST_MARKET] pipeline completed code={result_code} stale={is_stale} delay={delay_minutes:.0f}m")
+            result_code = pm_main(dry_run=True, broadcast=False) if dry_run else pm_main(dry_run=False, broadcast=True)
+            output = f"main returned {result_code} (dry_run={dry_run})"
+            print(f"[CRON][POST_MARKET] pipeline completed code={result_code} stale={is_stale} delay={delay_minutes:.0f}m dry_run={dry_run}")
         except Exception as exc:
             print(f"[CRON][POST_MARKET][ERROR] pipeline crashed: {exc}")
             import traceback

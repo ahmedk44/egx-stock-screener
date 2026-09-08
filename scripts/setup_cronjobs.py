@@ -147,15 +147,22 @@ def resolve_cron_secret(arg_secret: Optional[str]) -> str:
     return (os.environ.get("CRON_SECRET") or "").strip()
 
 
-def build_url(base: str, path: str, secret: str, use_query: bool = True) -> str:
+def build_url(base: str, path: str, secret: str, use_query: bool = True, dry_run: bool = False) -> str:
+    """Build endpoint URL. dry_run=True appends ?dry_run=1 for SIDE-EFFECT-FREE
+    verification probes (a plain authenticated GET would EXECUTE the pipeline:
+    bulletins publish, scanner may broadcast). Cron-job creation MUST leave
+    dry_run=False (default) so scheduled fires execute for real."""
     base = base.rstrip("/")
     url = f"{base}{path}"
+    # Use query-string auth (most compatible with cron-job.org free tier)
+    from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+    parsed = urlparse(url)
+    qs = parse_qs(parsed.query)
     if use_query and secret:
-        # Use query-string auth (most compatible with cron-job.org free tier)
-        from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
-        parsed = urlparse(url)
-        qs = parse_qs(parsed.query)
         qs["secret"] = [secret]
+    if dry_run:
+        qs["dry_run"] = ["1"]
+    if qs:
         new_qs = urlencode(qs, doseq=True)
         url = urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_qs, parsed.fragment))
     return url
@@ -168,13 +175,14 @@ def verify_endpoint(base: str, path: str, secret: str) -> Tuple[bool, str]:
     full = f"{base.rstrip('/')}{path}"
     headers = {}
     params = {}
-    # Try query-string first (most reliable)
+    # Try query-string first (most reliable). ALWAYS with dry_run=1: verification
+    # must never execute the pipeline (see build_url docstring).
     test_secret = secret or "test-no-secret"
     # If secret is set, test both good and bad auth
     # First test: with correct secret via query
     try:
-        # Correct auth via query
-        url_ok = build_url(base, path, secret, use_query=True) if secret else full
+        # Correct auth via query (+dry_run so the probe is side-effect free)
+        url_ok = build_url(base, path, secret, use_query=True, dry_run=True) if secret else f"{full}?dry_run=1"
         resp = requests.get(url_ok, headers={"Authorization": f"Bearer {secret}"} if secret else {}, timeout=15)
         body = resp.text[:500] if resp.text else ""
         # Endpoint should return 200 even for stale check (it always returns 200 with {ok, delay})

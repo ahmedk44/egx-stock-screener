@@ -169,9 +169,14 @@ def check_endpoints():
         try:
             # NOTE: the secret MUST be percent-encoded (+ -> %2B). A raw '+'
             # decodes as space server-side and false-401s (lesson learned).
+            # Probes ALWAYS carry dry_run=1: an authenticated GET without it
+            # would EXECUTE the pipeline (bulletins publish, scanner may
+            # broadcast). Health checks must be side-effect free.
             from urllib.parse import urlencode
-            qs = urlencode({"secret": secret}) if secret else ""
-            url = f"{BASE_URL}{path}?{qs}" if qs else f"{BASE_URL}{path}"
+            params = {"dry_run": 1}
+            if secret:
+                params["secret"] = secret
+            url = f"{BASE_URL}{path}?{urlencode(params)}"
             r = requests.get(url, timeout=40)
             auth = ""
             try:

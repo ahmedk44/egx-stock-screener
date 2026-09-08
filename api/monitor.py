@@ -118,6 +118,16 @@ class handler(BaseHTTPRequestHandler):
             in_window = True
 
         dry_run = (os.environ.get("MONITOR_DRY_RUN") or "").strip() in ("1", "true", "True")
+        # Safe-probe mode: ?dry_run=1 forces dry-run (no Supabase writes / Telegram
+        # sends) regardless of env - health checks must be side-effect free.
+        try:
+            from urllib.parse import urlparse as _up, parse_qs as _pqs
+            _vals = _pqs(_up(self.path).query).get("dry_run", [])
+            if any(str(v or "").strip().lower() in ("1", "true", "yes") for v in _vals):
+                dry_run = True
+                print("[CRON][MONITOR] dry-run probe via ?dry_run=1")
+        except Exception:
+            pass
 
         if in_window:
             try:

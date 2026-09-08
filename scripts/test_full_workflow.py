@@ -98,9 +98,20 @@ def test_http_endpoints() -> bool:
         detail = ""
         for use_query in [True, False]:
             try:
-                url = f"{BASE_URL}{path}?secret={CRON_SECRET}" if (use_query and CRON_SECRET) else f"{BASE_URL}{path}"
-                hdrs = {"Authorization": f"Bearer {CRON_SECRET}"} if (not use_query and CRON_SECRET) else {}
-                log(f"[Probe] GET {url} (use_query={use_query})")
+                # Probes ALWAYS carry dry_run=1 (side-effect free): a live probe
+                # would otherwise EXECUTE the pipeline (bulletins publish!).
+                # Secret is percent-encoded (+ -> %2B) to avoid false 401s.
+                from urllib.parse import urlencode as _uenc
+                if use_query and CRON_SECRET:
+                    url = f"{BASE_URL}{path}?{_uenc({'secret': CRON_SECRET, 'dry_run': 1})}"
+                    hdrs = {}
+                elif CRON_SECRET:
+                    url = f"{BASE_URL}{path}?dry_run=1"
+                    hdrs = {"Authorization": f"Bearer {CRON_SECRET}"}
+                else:
+                    url = f"{BASE_URL}{path}?dry_run=1"
+                    hdrs = {}
+                log(f"[Probe] GET {path}?dry_run=1 (use_query={use_query})")
                 resp = requests.get(url, headers=hdrs, timeout=30)
                 tried.append(f"{use_query}:{resp.status_code}")
                 if resp.status_code == 200:

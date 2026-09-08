@@ -65,6 +65,18 @@ class handler(BaseHTTPRequestHandler):
             return
         result_code = -1
         output = ""
+        # Safe-probe mode: ?dry_run=1 generates the card WITHOUT publishing
+        # and WITHOUT writing the idempotency guard (health checks must be
+        # side-effect free - a probe must never send a bulletin).
+        dry_run = False
+        try:
+            from urllib.parse import urlparse as _up, parse_qs as _pqs
+            _vals = _pqs(_up(self.path).query).get("dry_run", [])
+            dry_run = any(str(v or "").strip().lower() in ("1", "true", "yes") for v in _vals)
+            if dry_run:
+                print("[CRON][PRE_MARKET] dry-run probe - generating card only (no publish, no guard write)")
+        except Exception:
+            pass
         try:
             from egx_quant.news.pre_market_briefing import main as pm_main
             # Quick window audit (08:30 Cairo / 09:30 Oman = 05:30 UTC)
@@ -85,9 +97,9 @@ class handler(BaseHTTPRequestHandler):
             except Exception as e:
                 print(f"[CRON][AUDIT] window check failed: {e}")
 
-            result_code = pm_main(dry_run=False, broadcast=True)
-            output = f"main returned {result_code}"
-            print(f"[CRON][PRE_MARKET] pipeline completed code={result_code}")
+            result_code = pm_main(dry_run=True, broadcast=False) if dry_run else pm_main(dry_run=False, broadcast=True)
+            output = f"main returned {result_code} (dry_run={dry_run})"
+            print(f"[CRON][PRE_MARKET] pipeline completed code={result_code} dry_run={dry_run}")
         except Exception as exc:
             print(f"[CRON][PRE_MARKET][ERROR] pipeline crashed: {exc}")
             import traceback; traceback.print_exc()
