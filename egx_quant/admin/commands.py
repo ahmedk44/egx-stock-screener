@@ -195,14 +195,35 @@ def format_portfolio_card(
     positions: List[Dict[str, Any]],
     user_id: str,
     user_tg_id: str,
+    summary: Optional[Dict[str, Any]] = None,
 ) -> str:
-    """Render the /portfolio summary card."""
+    """Render the /portfolio summary card.
+
+    summary (from _summarize_positions): working_capital / invested / available /
+    exposure_pct / unrealized / priced - rendered as a portfolio-level header
+    above the per-position lines. Omitted gracefully when capital is unknown.
+    """
     sep = "------------------------------------"
     lines = [
         f"💼 <b>محفظتك النشطة | Active Portfolio</b>",
         f"🕐 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC",
         sep,
     ]
+    if summary and summary.get("working_capital"):
+        try:
+            wc = float(summary["working_capital"])
+            inv = float(summary.get("invested") or 0.0)
+            av = summary.get("available")
+            exp = summary.get("exposure_pct")
+            unr = float(summary.get("unrealized") or 0.0)
+            sign_u = "+" if unr >= 0 else ""
+            lines.append(f"💰 <b>رأس المال العامل:</b> {wc:,.2f} EGP")
+            exp_txt = f" ({exp:.1f}%)" if exp is not None else ""
+            lines.append(f"🔒 <b>المستثمر:</b> {inv:,.2f} EGP{exp_txt} | 💵 <b>الكاش المتاح:</b> {float(av):,.2f} EGP" if av is not None else f"🔒 <b>المستثمر:</b> {inv:,.2f} EGP{exp_txt}")
+            lines.append(f"📊 <b>غير محقق إجمالي:</b> {sign_u}{unr:,.2f} EGP")
+            lines.append(sep)
+        except Exception:
+            pass
     if not positions:
         lines.append("🔍 لا توجد صفقات متابعة حالياً.")
         lines.append("استخدم زر الانضمام من أي إشارة عامة للبدء.")
@@ -771,6 +792,27 @@ def _handle_join_command(ticker_raw: str, custom_price: Optional[float], user_id
             except Exception as _exc:
                 current_alloc = 100.0
             new_alloc = float(custom_alloc) if custom_alloc is not None else current_alloc
+            # Smart liquidity check (update path): extra allocation must fit available cash.
+            _upd_cash_line = ""
+            try:
+                _w, _ie, _lo = _portfolio_cash_state(supa_url, supa_key, user_id_str, exclude_symbol=wh.normalize_ticker(ticker_raw))
+            except Exception as _cash_exc:
+                print(f"[JOIN][CASH][WARN] {_cash_exc}")
+                _w, _ie, _lo = None, 0.0, 0.0
+            if _w is not None:
+                _req = float(_w) * float(new_alloc) / 100.0
+                _ok_cash, _avail, _after = _cash_check(_w, _ie, _lo, _req)
+                if not _ok_cash:
+                    return False, (
+                        f"❌ <b>السيولة لا تكفي لرفع التخصيص.</b>\n"
+                        f"------------------------------------\n"
+                        f"💰 رأس المال العامل: {float(_w):,.2f} EGP\n"
+                        f"🔒 مستثمر (خارج هذه الصفقة): {float(_ie):,.2f} EGP\n"
+                        f"💵 المتاح: {float(_avail):,.2f} EGP | المطلوب: {_req:,.2f} EGP\n"
+                        f"------------------------------------\n"
+                        f"💡 خفّض نسبة التخصيص أو زوّد السيولة بـ <code>/add_capital [المبلغ]</code>."
+                    )
+                _upd_cash_line = f"\n💵 الكاش المتاح بعد التحديث: {_after:,.2f} EGP"
             updates: Dict[str, Any] = {"entry_price": float(price)}
             if custom_alloc is not None:
                 updates["allocation_pct"] = float(new_alloc)
@@ -785,6 +827,7 @@ def _handle_join_command(ticker_raw: str, custom_price: Optional[float], user_id
                 print(f"[JOIN][UPDATE] user={user_id_str} {ticker_raw} -> {updates} (remaining_qty_pct PRESERVED)")
                 return True, (
                     f"✅ تم تحديث بيانات الدخول للصفقة {bare}: سعر الدخول {float(price):.2f} EGP | نسبة التخصيص: {new_alloc:.0f}%"
+                    f"{_upd_cash_line}"
                 )
             print(f"[JOIN][UPDATE][WARN] patch rejected {resp.status_code}: {(resp.text or '')[:200]}")
             return False, f"⚠️ فشل تحديث بيانات الصفقة ({resp.status_code})."
@@ -801,6 +844,31 @@ def _handle_join_command(ticker_raw: str, custom_price: Optional[float], user_id
             return False, f"⚠️ تعذر تحديد سعر الدخول لـ {bare}. حاول استخدام سعر مخصص: <code>/join {bare} [سعر]</code>"
         allocation_pct = float(custom_alloc) if custom_alloc is not None else 100.0
         capital_at_join = _fetch_capital_at_join()
+        # Smart liquidity check (fresh join): full position cost must fit available cash.
+        # No registered capital -> allow the join but nudge to /set_capital (also
+        # unlocks cash-denominated PnL in DMs and /portfolio).
+        cash_line = ""
+        try:
+            _w, _ie, _ = _portfolio_cash_state(supa_url, supa_key, user_id_str)
+        except Exception as _cash_exc:
+            print(f"[JOIN][CASH][WARN] {_cash_exc}")
+            _w, _ie = None, 0.0
+        if _w is None:
+            cash_line = "\n💡 حدد رأس مالك بـ <code>/set_capital [المبلغ]</code> لتفعيل فحص السيولة والأرباح النقدية."
+        else:
+            _req = float(_w) * float(allocation_pct) / 100.0
+            _ok_cash, _avail, _after = _cash_check(_w, _ie, 0.0, _req)
+            if not _ok_cash:
+                return False, (
+                    f"❌ <b>السيولة لا تكفي لهذه الصفقة.</b>\n"
+                    f"------------------------------------\n"
+                    f"💰 رأس المال العامل: {float(_w):,.2f} EGP\n"
+                    f"🔒 مستثمر حالياً: {float(_ie):,.2f} EGP\n"
+                    f"💵 المتاح: {float(_avail):,.2f} EGP | المطلوب: {_req:,.2f} EGP (تخصيص {float(allocation_pct):.0f}%)\n"
+                    f"------------------------------------\n"
+                    f"💡 خفّض التخصيص (مثال: <code>/join {bare} {float(entry_price):.2f} 25</code>) أو زوّد السيولة بـ <code>/add_capital [المبلغ]</code>."
+                )
+            cash_line = f"\n💵 الكاش المتاح بعد العملية: {_after:,.2f} EGP"
         # Build snapshot with the resolved entry_price
         snapshot = {
             "strategy": str(signal.get("strategy") or ""),
@@ -835,7 +903,8 @@ def _handle_join_command(ticker_raw: str, custom_price: Optional[float], user_id
         return True, (
             f"✅ تم تسجيل {bare} في محفظتك بنجاح\n"
             f"💵 سعر الدخول: {price_label} EGP{' (مخصص)' if is_custom else ' (من الإشارة)'}\n"
-            f"📊 نسبة التخصيص: {allocation_pct:.0f}% | المتبقي: 100%\n"
+            f"📊 نسبة التخصيص: {allocation_pct:.0f}% | المتبقي: 100%"
+            f"{cash_line}\n"
             f"📊 راجع المحادثة الخاصة لبطاقة الصفقة الكاملة."
         )
     except Exception as e:
@@ -1514,20 +1583,285 @@ def _handle_weekly_stats(user_id: str, bot_token: str) -> Tuple[bool, str]:
         print(f"[JOIN_ERROR] {traceback.format_exc()}")
         return False, f"⚠️ فشل تقرير الأسبوع: {str(e)[:150]}"
 
-def handle_slash_command(text: str, from_user: Dict[str, Any], bot_token: str) -> Tuple[bool, str]:
-    """Route slash commands: /start, /portfolio, /close, /update, محفظتي.
+# ============================================================================
+# DM ISOLATION + FLEXIBLE PARSING + CASH/SUMMARY/MARKUP HELPERS
+# (Phase: interactive portfolio manager - kept backward compatible)
+# ============================================================================
 
-    Returns (success, response_text). Handles Telegram @botname suffix.
-    Never fails silently - errors are returned as user-visible messages.
+# Portfolio-management commands execute ONLY in private chats. /start + /help
+# stay public so new users can onboard from anywhere.
+DM_ONLY_COMMANDS = frozenset({
+    "/join", "/exit", "/portfolio", "/محفظتي", "/close", "/update",
+    "/set_capital", "/add_capital", "/stats", "/weekly",
+    "/احصائيات", "/تقرير", "/menu",
+})
+
+DM_ONLY_REFUSAL = (
+    "🔒 <b>أوامر المحفظة تعمل في الخاص فقط.</b>\n"
+    "------------------------------------\n"
+    "خصوصيتك أولاً: بيانات محفظتك لا تُعرض ولا تُنفذ في القنوات أو المجموعات.\n"
+    "📩 راسل البوت مباشرة هنا: @EGX.signals ثم أعد إرسال الأمر.\n"
+    "ℹ️ لم يتم تنفيذ أي شيء ولم تُعرض أي بيانات."
+)
+
+
+def _dm_guard(command: str, chat_type: Optional[str] = None) -> Optional[Tuple[bool, str]]:
+    """Central DM-only gate. Returns (False, refusal) when a portfolio command
+    arrives outside a private chat, else None (allowed). /start + /help always pass."""
+    if not chat_type:
+        return None  # unknown origin (legacy callers) - preserve old behavior
+    if str(chat_type).lower() == "private":
+        return None
+    cmd = str(command or "").strip().lower()
+    if cmd in DM_ONLY_COMMANDS:
+        print(f"[DM-GUARD] blocked {cmd} from chat_type={chat_type} (no data leaked)")
+        logger.info("[DM-GUARD] blocked %s from %s", cmd, chat_type)
+        return (False, DM_ONLY_REFUSAL)
+    return None
+
+
+# Flexible parsing (private chats only - applied by the webhook BEFORE dispatch):
+# slash-optional + case-insensitive first token + Arabic aliases.
+COMMAND_ALIASES = {
+    "portfolio": "/portfolio", "محفظتي": "/portfolio", "محفظتى": "/portfolio",
+    "محفظة": "/portfolio", "محفظه": "/portfolio",
+    "join": "/join", "انضم": "/join", "انضمام": "/join", "دخول": "/join",
+    "exit": "/exit", "خروج": "/exit", "بيع": "/exit",
+    "close": "/close", "إغلاق": "/close", "اغلاق": "/close", "اقفال": "/close",
+    "update": "/update", "تحديث": "/update", "تعديل": "/update",
+    "set_capital": "/set_capital", "set-capital": "/set_capital",
+    "add_capital": "/add_capital", "add-capital": "/add_capital",
+    "تعزيز": "/add_capital", "اضافة": "/add_capital", "إضافة": "/add_capital",
+    "stats": "/stats", "weekly": "/weekly", "احصائيات": "/stats", "تقرير": "/weekly",
+    "menu": "/menu", "القائمة": "/menu", "القائمه": "/menu", "لوحة": "/menu",
+    "start": "/start", "بدء": "/start", "help": "/help", "مساعدة": "/help",
+}
+
+
+def normalize_command_text(text: str) -> str:
+    """Map slash-less / mixed-case / Arabic command words to canonical /command.
+
+    Only the FIRST token is normalized (tickers keep their case for later
+    upper-casing by each handler). Pure function - safe to unit test.
+    """
+    t = (text or "").strip()
+    if not t or t.startswith("/"):
+        return t
+    parts = t.split()
+    key = parts[0].lower()
+    if key in COMMAND_ALIASES:
+        base = COMMAND_ALIASES[key]
+        rest = " ".join(parts[1:])
+        return base + (" " + rest if rest else "")
+    return t
+
+
+def _cash_check(working: float, invested_excl: float, locked_old: float,
+                required_new: float) -> Tuple[bool, float, float]:
+    """Pure liquidity math (testable): can the user afford required_new?
+
+    working       = user_profile.capital (working baseline)
+    invested_excl = locked cash in OTHER tracking positions
+    locked_old    = this row's currently locked cash (0 on fresh join)
+    required_new  = working * new_alloc_pct (EGP cost of the join/update)
+    Returns (ok, available_now, available_after).
+    """
+    try:
+        available = float(working) - float(invested_excl)
+        funds = available + float(locked_old)
+        if float(required_new) <= funds + 1e-9:
+            return True, available, funds - float(required_new)
+        return False, available, funds
+    except Exception:
+        return True, 0.0, 0.0  # fail-open on math errors (never block on a bug)
+
+
+def _portfolio_cash_state(supa_url: str, supa_key: str, user_id: str,
+                          exclude_symbol: Optional[str] = None) -> Tuple[Optional[float], float, float]:
+    """Working capital + locked-cash snapshot for one user (never raises).
+
+    Returns (working_capital_or_None, invested_excl, locked_excluded_row).
+    invested model (migration-free): per TRACKING row
+      (capital_at_join or working) * alloc% * remaining%.
+    """
+    working: Optional[float] = None
+    invested_excl = 0.0
+    locked_old = 0.0
+    try:
+        headers = _headers(prefer="return=minimal")
+        try:
+            up = requests.get(
+                f"{supa_url}/rest/v1/user_profile?user_id=eq.{user_id}&select=capital&limit=1",
+                headers=headers, timeout=10,
+            )
+            if up.status_code == 200:
+                rows = up.json()
+                if isinstance(rows, list) and rows and rows[0].get("capital") is not None:
+                    working = float(rows[0]["capital"])
+        except Exception as cap_exc:
+            print(f"[CASH][WARN] capital fetch failed: {cap_exc}")
+        if working is None:
+            return None, 0.0, 0.0
+        try:
+            pr = requests.get(
+                f"{supa_url}/rest/v1/{USER_PORTFOLIO_TABLE}?user_id=eq.{user_id}&status=eq.TRACKING"
+                f"&select=symbol,allocation_pct,remaining_qty_pct,capital_at_join,entry_price,joined_at_price",
+                headers=headers, timeout=10,
+            )
+            if pr.status_code == 200 and isinstance(pr.json(), list):
+                excl = (exclude_symbol or "").upper()
+                for r in pr.json():
+                    try:
+                        base = float(r.get("capital_at_join")) if r.get("capital_at_join") is not None else working
+                        alloc = float(r.get("allocation_pct") if r.get("allocation_pct") is not None else 100.0)
+                        rem = float(r.get("remaining_qty_pct") if r.get("remaining_qty_pct") is not None else 100.0)
+                        locked = base * (alloc / 100.0) * (rem / 100.0)
+                    except Exception:
+                        continue
+                    if excl and str(r.get("symbol") or "").upper() == excl:
+                        locked_old = locked
+                    else:
+                        invested_excl += locked
+        except Exception as pos_exc:
+            print(f"[CASH][WARN] positions fetch failed: {pos_exc}")
+    except Exception as e:
+        print(f"[CASH][ERROR] cash state failed: {e}")
+    return working, invested_excl, locked_old
+
+
+def _summarize_positions(positions: List[Dict[str, Any]],
+                         working_capital: Optional[float]) -> Dict[str, Any]:
+    """Portfolio-level totals from enriched position dicts (pure, testable).
+
+    invested   = SUM allocated_egp * remaining%   (cash currently locked)
+    unrealized = SUM locked * pnl%                (priced positions only)
+    available  = working - invested | exposure%   (when capital known)
+    """
+    invested = 0.0
+    unrealized = 0.0
+    priced = 0
+    for p in positions or []:
+        try:
+            alloc = float(p.get("allocated_egp") or 0.0)
+            rem = float(p.get("remaining_qty_pct") if p.get("remaining_qty_pct") is not None else 100.0)
+            locked = alloc * (rem / 100.0)
+            invested += locked
+            entry = float(p.get("entry_price") or 0.0)
+            cur = p.get("current_price")
+            if entry and cur:
+                unrealized += locked * ((float(cur) - entry) / entry)
+                priced += 1
+        except Exception:
+            continue
+    summary: Dict[str, Any] = {
+        "positions": len(positions or []),
+        "priced": priced,
+        "invested": round(invested, 2),
+        "unrealized": round(unrealized, 2),
+        "working_capital": working_capital,
+        "available": None,
+        "exposure_pct": None,
+    }
+    try:
+        if working_capital:
+            summary["available"] = round(float(working_capital) - invested, 2)
+            summary["exposure_pct"] = round(invested / float(working_capital) * 100.0, 1) if float(working_capital) else 0.0
+    except Exception:
+        pass
+    return summary
+
+
+def build_portfolio_markup(positions: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Per-position quick-action keyboard for the /portfolio card.
+
+    Row per position: [📊 حالة TICKER] -> portfolio_status:{TICKER}
+                      [🛑 خروج]        -> exit_sym:{TICKER}:{trade_id} (preset menu)
+    Final row: dashboard shortcuts. All callback_data < 64 bytes (Telegram cap).
+    """
+    kb: Dict[str, Any] = {"inline_keyboard": []}
+    for p in (positions or [])[:10]:
+        bare = str(p.get("ticker") or "").replace(".CA", "").strip().upper()
+        if not bare:
+            continue
+        try:
+            tid = int(p.get("trade_id") or 0)
+        except Exception:
+            tid = 0
+        kb["inline_keyboard"].append([
+            {"text": f"📊 {bare}", "callback_data": f"portfolio_status:{bare}"},
+            {"text": "🛑 خروج", "callback_data": f"exit_sym:{bare}:{tid}"},
+        ])
+    kb["inline_keyboard"].append([
+        {"text": "➕ انضمام جديد", "callback_data": "dash:join"},
+        {"text": "🔄 تحديث العرض", "callback_data": "dash:portfolio"},
+    ])
+    return kb
+
+
+def build_dashboard_markup() -> Dict[str, Any]:
+    """Main dashboard menu keyboard (/menu) - every button maps to dash:* router."""
+    return {"inline_keyboard": [
+        [{"text": "💼 محفظتي", "callback_data": "dash:portfolio"},
+         {"text": "➕ انضمام لصفقة", "callback_data": "dash:join"}],
+        [{"text": "📤 خروج من صفقة", "callback_data": "dash:exit"},
+         {"text": "🔴 إغلاق صفقة", "callback_data": "dash:close"}],
+        [{"text": "📊 تقرير الأسبوع", "callback_data": "dash:stats"},
+         {"text": "❓ مساعدة", "callback_data": "dash:help"}],
+    ]}
+
+
+def dashboard_card() -> str:
+    """Main dashboard menu text (/menu)."""
+    sep = "------------------------------------"
+    return "\n".join([
+        "🎛️ <b>لوحة التحكم | Main Dashboard</b>",
+        sep,
+        "💼 <b>محفظتي</b> - المراكز المفتوحة + الكاش + الأرباح غير المحققة",
+        "➕ <b>انضمام لصفقة</b> - اختر من الإشارات النشطة",
+        "📤 <b>خروج من صفقة</b> - كلي أو جزئي بسعر السوق",
+        "🔴 <b>إغلاق صفقة</b> - إغلاق فوري بضغطة واحدة",
+        "📊 <b>تقرير الأسبوع</b> - الأرباح المحققة",
+        sep,
+        "💡 استخدم الأزرار أدناه - كل شيء يعمل داخل الخاص فقط.",
+    ])
+
+
+def handle_slash_command(text: str, from_user: Dict[str, Any], bot_token: str, chat_type: Optional[str] = None, chat_id: Optional[str] = None) -> Tuple[bool, str]:
+    """Route slash commands (backward-compatible 3-arg signature).
+
+    chat_type/chat_id are optional: legacy callers (verify scripts) omit them
+    and keep the old behavior. The webhook passes the real chat type to enforce
+    DM-only isolation. Markup (if any) is dropped - use handle_slash_command_ex
+    when the caller can deliver inline keyboards.
+    """
+    ok, response_text, _markup = _dispatch_command(text, from_user, bot_token, chat_type, chat_id)
+    return ok, response_text
+
+
+def handle_slash_command_ex(text: str, from_user: Dict[str, Any], bot_token: str, chat_type: Optional[str] = None, chat_id: Optional[str] = None) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
+    """Extended dispatcher returning (ok, text, reply_markup|None).
+
+    The webhook uses this to attach inline keyboards (portfolio quick actions,
+    dashboard menu). Markup is delivered ONLY to private chats - group/chat
+    refusals never carry buttons.
+    """
+    return _dispatch_command(text, from_user, bot_token, chat_type, chat_id)
+
+
+def _dispatch_command(text: str, from_user: Dict[str, Any], bot_token: str, chat_type: Optional[str] = None, chat_id: Optional[str] = None) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
+    """Core router returning (ok, text, reply_markup|None).
+
+    The DM-only gate runs FIRST - before any Supabase touch - so group/channel
+    invocations are refused with zero data leakage.
     """
     text = (text or "").strip()
     if not text:
-        return False, ""
-    # Support Arabic محفظتي without slash
+        return False, "", None
+    # Support Arabic محفظتي without slash (legacy; webhook also pre-normalizes)
     if text.strip() in ("محفظتي", "محفظتى"):
         text = "/portfolio"
     if not text.startswith("/"):
-        return False, ""
+        return False, "", None
     # Strip @botname suffix like /portfolio@EGXSignalsBot or /start@EGXSignalsBot
     try:
         first = text.split()[0]
@@ -1540,13 +1874,25 @@ def handle_slash_command(text: str, from_user: Dict[str, Any], bot_token: str) -
     user_id = str(from_user.get("id", ""))
     user_name = from_user.get("first_name", "") or ""
 
+    # DM-ONLY gate: portfolio commands refuse outside private chats BEFORE any DB touch.
+    blocked = _dm_guard(command, chat_type)
+    if blocked is not None:
+        ok_b, txt_b = blocked
+        return ok_b, txt_b, None
+
     # /start - always allowed, no Supabase needed
     if command == "/start":
-        return _handle_start(user_id)
+        ok_s, txt_s = _handle_start(user_id)
+        return ok_s, txt_s, None
 
     # /help alias
     if command in ("/help", "/مساعدة"):
-        return _handle_start(user_id)
+        ok_h, txt_h = _handle_start(user_id)
+        return ok_h, txt_h, None
+
+    # /menu - interactive dashboard (DM only, guarded above)
+    if command == "/menu":
+        return True, dashboard_card(), build_dashboard_markup()
 
     # /portfolio or محفظتي - user command with explicit try-except logging
     if command in ("/portfolio", "/محفظتي", "محفظتي"):
@@ -1554,8 +1900,9 @@ def handle_slash_command(text: str, from_user: Dict[str, Any], bot_token: str) -
         try:
             print(f"[PORTFOLIO] Dispatch /portfolio user={user_id} ticker_arg={ticker_arg}")
             logger.info("[PORTFOLIO] Dispatch user=%s ticker_arg=%s", user_id, ticker_arg)
-            success, card = handle_portfolio(user_id, bot_token, ticker_arg)
-            return success, card
+            success, card, positions, _summary = _portfolio_bundle(user_id, bot_token, ticker_arg)
+            markup = build_portfolio_markup(positions) if (success and not ticker_arg) else None
+            return success, card, markup
         except Exception as e:
             import traceback
             traceback.print_exc()
@@ -1566,13 +1913,14 @@ def handle_slash_command(text: str, from_user: Dict[str, Any], bot_token: str) -
                 f"⚠️ حدث خطأ أثناء جلب المحفظة.\n"
                 f"السبب: {str(e)[:200]}\n"
                 f"تحقق من إعدادات SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY أو تواصل مع المسؤول."
-            )
+            ), None
 
     # /join <TICKER> [PRICE] [QTY%] - join or update an already-tracked position
     if command == "/join":
         if len(parts) < 2:
             # INTERACTIVE: parameter-less /join -> active signals picker (Telegram Menu button safe)
-            return _handle_join_menu(user_id, bot_token)
+            ok_jm, txt_jm = _handle_join_menu(user_id, bot_token)
+            return ok_jm, txt_jm, None
         ticker_raw = parts[1].strip().upper()
         if not ticker_raw.endswith(".CA"):
             ticker_raw = f"{ticker_raw}.CA"
@@ -1581,87 +1929,95 @@ def handle_slash_command(text: str, from_user: Dict[str, Any], bot_token: str) -
             try:
                 custom_price = float(parts[2])
                 if custom_price <= 0:
-                    return False, f"⚠️ السعر يجب أن يكون رقماً موجباً (تم إدخال: <code>{parts[2]}</code>)."
+                    return False, f"⚠️ السعر يجب أن يكون رقماً موجباً (تم إدخال: <code>{parts[2]}</code>).", None
             except (ValueError, TypeError):
-                return False, f"⚠️ سعر غير صالح: '<code>{parts[2]}</code>' - يجب إدخال رقم موجب."
+                return False, f"⚠️ سعر غير صالح: '<code>{parts[2]}</code>' - يجب إدخال رقم موجب.", None
         custom_alloc = None
         if len(parts) >= 4:
             try:
                 custom_alloc = float(parts[3].replace("%", ""))
             except (ValueError, TypeError):
-                return False, f"⚠️ نسبة التخصيص غير صالحة: '<code>{parts[3]}</code>' - يجب إدخال رقم بين 1 و 100."
+                return False, f"⚠️ نسبة التخصيص غير صالحة: '<code>{parts[3]}</code>' - يجب إدخال رقم بين 1 و 100.", None
             if custom_alloc <= 0 or custom_alloc > 100:
-                return False, f"⚠️ نسبة التخصيص يجب أن تكون بين 1 و 100 (تم إدخال: <code>{parts[3]}</code>)."
-        return _handle_join_command(ticker_raw, custom_price, user_id, bot_token, custom_alloc=custom_alloc)
+                return False, f"⚠️ نسبة التخصيص يجب أن تكون بين 1 و 100 (تم إدخال: <code>{parts[3]}</code>).", None
+        ok_j, txt_j = _handle_join_command(ticker_raw, custom_price, user_id, bot_token, custom_alloc=custom_alloc)
+        return ok_j, txt_j, None
 
     # /exit - user exit with partial/full support (not admin-only)
     if command == "/exit":
         # /exit <TICKER> [PRICE] [QTY%] - e.g., /exit COMI 95 50, /exit COMI.CA 100
-        return _handle_exit_command(text, from_user, bot_token)
+        ok_e, txt_e = _handle_exit_command(text, from_user, bot_token)
+        return ok_e, txt_e, None
 
     # /stats and /weekly - weekly PnL from closed_positions
     if command in ("/stats", "/weekly", "/احصائيات", "/تقرير"):
         try:
             print(f"[WEEKLY] Dispatch /weekly user={user_id}")
             success, card = _handle_weekly_stats(user_id, bot_token)
-            return success, card
+            return success, card, None
         except Exception as e:
             import traceback
             print(f"[JOIN_ERROR] {traceback.format_exc()}")
-            return False, f"⚠️ فشل تقرير الأسبوع: {str(e)[:150]}"
+            return False, f"⚠️ فشل تقرير الأسبوع: {str(e)[:150]}", None
 
-    # /set_capital - ANY user sets their own portfolio capital (non-admin, no admin gate)
+    # /set_capital - ANY user sets their own portfolio capital baseline (non-admin, no admin gate)
     if command == "/set_capital":
         try:
             print(f"[SET_CAPITAL] Dispatch user={user_id}")
-            return _handle_set_capital_command(text, from_user, bot_token)
+            ok_sc, txt_sc = _handle_set_capital_command(text, from_user, bot_token)
+            return ok_sc, txt_sc, None
         except Exception as e:
             import traceback
             print(f"[JOIN_ERROR] {traceback.format_exc()}")
-            return False, f"⚠️ فشل تحديث رأس المال: {str(e)[:150]}"
+            return False, f"⚠️ فشل تحديث رأس المال: {str(e)[:150]}", None
 
     # /add_capital - ANY user tops up cash (capital + total_deposits; initial untouched)
     if command == "/add_capital":
         try:
             print(f"[ADD_CAPITAL] Dispatch user={user_id}")
-            return _handle_add_capital_command(text, from_user, bot_token)
+            ok_ac, txt_ac = _handle_add_capital_command(text, from_user, bot_token)
+            return ok_ac, txt_ac, None
         except Exception as e:
             import traceback
             print(f"[JOIN_ERROR] {traceback.format_exc()}")
-            return False, f"⚠️ فشل إضافة التعزيز: {str(e)[:150]}"
+            return False, f"⚠️ فشل إضافة التعزيز: {str(e)[:150]}", None
 
     # /close - ANY user force-closes their OWN tracked position (user_portfolio row).
     if command == "/close":
         if len(parts) < 2:
             # INTERACTIVE: parameter-less /close -> one-click close menu for own positions
-            return _handle_close_menu(user_id, bot_token)
+            ok_cm, txt_cm = _handle_close_menu(user_id, bot_token)
+            return ok_cm, txt_cm, None
         ticker = parts[1].upper()
         reason = " ".join(parts[2:]) if len(parts) > 2 else "إغلاق يدوي"
-        return _handle_close_own_position(ticker, reason, user_id, bot_token)
+        ok_co, txt_co = _handle_close_own_position(ticker, reason, user_id, bot_token)
+        return ok_co, txt_co, None
 
     if command == "/update":
         if len(parts) < 3:
-            return False, "📝 الاستخدام: /update <TICKER> [sl=VALUE] [target1=VALUE] [target2=VALUE]\nمثال: /update COMI.CA sl=95 target1=110"
+            return False, "📝 الاستخدام: /update <TICKER> [sl=VALUE] [target1=VALUE] [target2=VALUE]\nمثال: /update COMI.CA sl=95 target1=110", None
         ticker = parts[1].upper()
         params = {}
         for p in parts[2:]:
             if "=" in p:
                 k, v = p.split("=", 1)
                 params[k.lower()] = v
-        return _handle_update_own_position(ticker, params, user_id, bot_token)
+        ok_u, txt_u = _handle_update_own_position(ticker, params, user_id, bot_token)
+        return ok_u, txt_u, None
 
     # Admin-only commands (everything below)
     if not is_admin(user_id):
         print(f"[ADMIN] Denied {command} for non-admin user={user_id} admin_ids={_load_admin_ids()}")
-        return False, "⛔ هذا الأمر مخصص للمسؤولين فقط."
+        return False, "⛔ هذا الأمر مخصص للمسؤولين فقط.", None
 
-    return False, "⚠️ أمر غير معروف. استخدم /start، /portfolio، /close، أو /update."
+    return False, "⚠️ أمر غير معروف. استخدم /start، /portfolio، /close، أو /update.", None
 
 
-def handle_portfolio(user_id: str, bot_token: str, ticker_arg: Optional[str] = None) -> Tuple[bool, str]:
-    """Handle /portfolio command. If ticker_arg given, set custom entry price.
+def _portfolio_bundle(user_id: str, bot_token: str, ticker_arg: Optional[str] = None) -> Tuple[bool, str, List[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """Core portfolio fetch+format returning (ok, card, positions, summary).
 
-    Explicit try-except with logging for missing Supabase env / connection errors.
+    handle_portfolio() wraps this for backward compatibility (drops extras);
+    the dispatcher uses the full bundle to attach quick-action keyboards.
     Never fails silently - errors are returned as user-visible messages.
     """
     try:
@@ -1669,18 +2025,19 @@ def handle_portfolio(user_id: str, bot_token: str, ticker_arg: Optional[str] = N
     except Exception as cfg_exc:
         logger.error("[PORTFOLIO][ENV AUDIT] get_supabase_config failed: %s", cfg_exc, exc_info=True)
         print(f"[PORTFOLIO][ENV AUDIT] get_supabase_config failed: {cfg_exc}")
-        return False, f"⚠️ إعدادات قاعدة البيانات غير متوفرة: {str(cfg_exc)[:150]}"
+        return False, f"⚠️ إعدادات قاعدة البيانات غير متوفرة: {str(cfg_exc)[:150]}", [], None
     if not supabase_url or not supabase_key:
         print(f"[PORTFOLIO][ENV AUDIT] SUPABASE_URL present={bool(supabase_url)} SUPABASE_SERVICE_ROLE_KEY present={bool(supabase_key)} - cannot fetch portfolio")
         logger.warning("[PORTFOLIO][ENV AUDIT] SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY missing - portfolio fetch skipped for user=%s", str(user_id)[:8])
         return False, (
             "⚠️ إعدادات قاعدة البيانات غير متوفرة.\n"
             "تأكد من ضبط <code>SUPABASE_URL</code> و <code>SUPABASE_SERVICE_ROLE_KEY</code> في إعدادات Vercel."
-        )
+        ), [], None
 
     # If ticker_arg provided, set/update custom entry price
     if ticker_arg and ticker_arg.upper() != user_id:
-        return _set_custom_entry(user_id, ticker_arg, bot_token, supabase_url, supabase_key)
+        ok_ce, txt_ce = _set_custom_entry(user_id, ticker_arg, bot_token, supabase_url, supabase_key)
+        return ok_ce, txt_ce, [], None
 
     # Fetch all user's portfolio rows joined with trade_signals
     positions: List[Dict[str, Any]] = []
@@ -1732,6 +2089,7 @@ def handle_portfolio(user_id: str, bot_token: str, ticker_arg: Optional[str] = N
                     allocated_egp = round(cap_join_f * (alloc_val / 100.0), 2) if cap_join_f else None
                     pos = {
                         "ticker": ticker,
+                        "trade_id": row.get("trade_id") or 0,
                         "entry_price": float(entry) if entry else 0.0,
                         "current_price": current,
                         "status": row.get("status", "TRACKING"),
@@ -1751,16 +2109,23 @@ def handle_portfolio(user_id: str, bot_token: str, ticker_arg: Optional[str] = N
         return False, (
             f"⚠️ فشل جلب المحفظة: {str(e)[:200]}\n"
             f"تحقق من إعدادات SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY."
-        )
+        ), [], None
 
     try:
-        card = format_portfolio_card(positions, user_id, user_id)
+        summary = _summarize_positions(positions, profile_capital)
+        card = format_portfolio_card(positions, user_id, user_id, summary=summary)
     except Exception as ce:
         import traceback
         traceback.print_exc()
         logger.error("[PORTFOLIO] format_portfolio_card crashed: %s", ce, exc_info=True)
-        return False, f"⚠️ فشل تنسيق بيانات المحفظة: {str(ce)[:200]}"
-    return True, card
+        return False, f"⚠️ فشل تنسيق بيانات المحفظة: {str(ce)[:200]}", [], None
+    return True, card, positions, summary
+
+
+def handle_portfolio(user_id: str, bot_token: str, ticker_arg: Optional[str] = None) -> Tuple[bool, str]:
+    """Handle /portfolio command (backward-compatible 2-tuple wrapper)."""
+    ok, card, _positions, _summary = _portfolio_bundle(user_id, bot_token, ticker_arg)
+    return ok, card
 
 
 def _set_custom_entry(user_id: str, ticker_arg: str, bot_token: str, supabase_url: str, supabase_key: str) -> Tuple[bool, str]:

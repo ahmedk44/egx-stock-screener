@@ -2770,6 +2770,50 @@ try:
                         print(f"[SUPPRESSED] {_exc}")
                     return {"statusCode": 200, "body": "OK"}
 
+                # === Dashboard menu branch: dash:{portfolio|join|exit|close|stats|help} ===
+                # Every dashboard button reuses the text-command pipeline and DMs the
+                # result to the pressing user (query.from) - never to the channel.
+                if isinstance(data, str) and data.startswith("dash:"):
+                    try:
+                        dash_action = data.split(":", 1)[1].strip().lower() if ":" in data else ""
+                        dash_map = {
+                            "portfolio": "/portfolio", "join": "/join", "exit": "/exit",
+                            "close": "/close", "stats": "/stats", "help": "/help",
+                        }
+                        dash_cmd = dash_map.get(dash_action)
+                        dash_user = (query.get("from") or {}) if isinstance(query, dict) else {}
+                        dash_uid = str(dash_user.get("id", "")).strip()
+                        if dash_cmd and dash_uid and bot_token and requests:
+                            try:
+                                from egx_quant.admin.commands import handle_slash_command_ex as _dash_hsc  # type: ignore
+                                _ok, _txt, _mk = _dash_hsc(dash_cmd, dash_user, bot_token, "private", dash_uid)
+                            except Exception as _dash_exc:
+                                print(f"[DASH][ERROR] {_dash_exc}")
+                                _ok, _txt, _mk = False, "⚠️ حدث خطأ - حاول مرة أخرى.", None
+                            if _txt:
+                                try:
+                                    _payload = {"chat_id": dash_uid, "text": _txt, "parse_mode": "HTML"}
+                                    if _mk:
+                                        _payload["reply_markup"] = _mk
+                                    requests.post(TELEGRAM_SEND_URL.format(token=bot_token), json=_payload, timeout=10)
+                                except Exception as _send_exc:
+                                    print(f"[DASH][WARN] send failed: {_send_exc}")
+                            print(f"[DASH] action={dash_action} user={dash_uid} ok={_ok}")
+                        else:
+                            try:
+                                _answer_callback(str(callback_id), bot_token, "⚠️ إجراء غير معروف", show_alert=False)
+                            except Exception:
+                                pass
+                    except Exception as exc:
+                        print(f"[WEBHOOK][DASH][ERROR] {exc}")
+                    try:
+                        if hasattr(request, "status_code"):
+                            request.status_code = 200
+                            return "OK"
+                    except Exception as _exc:
+                        print(f"[SUPPRESSED] {_exc}")
+                    return {"statusCode": 200, "body": "OK"}
+
                 # === Legacy 3-button path DISABLED ===
                 # All public broadcasts now strictly use build_channel_short_card + single join_trade button.
                 # Any act_/dis_/cls_ payload is deprecated and will NOT touch Supabase.
@@ -2869,6 +2913,24 @@ try:
                 chat_id = str(chat_obj.get("id", "")).strip() if isinstance(chat_obj, dict) else ""
                 from_user = message.get("from", {}) if isinstance(message, dict) else {}
                 user_id = str(from_user.get("id", "")).strip() if isinstance(from_user, dict) else ""
+                # Chat-type isolation: portfolio commands run ONLY in private chats.
+                chat_type = "private"
+                try:
+                    chat_type = str(chat_obj.get("type") or "private").strip().lower() or "private"
+                except Exception:
+                    chat_type = "private"
+                # Flexible parsing (private chats ONLY): slash-optional + case-insensitive
+                # first token + Arabic aliases -> canonical /command. Bare numbers and
+                # tickers fall through untouched (pending-amount flow / ignore).
+                if isinstance(message, dict) and text_raw and not text_raw.startswith("/") and chat_type == "private":
+                    try:
+                        from egx_quant.admin.commands import normalize_command_text  # type: ignore
+                        _norm = normalize_command_text(text_raw)
+                        if _norm.startswith("/"):
+                            print(f"[SLASH][FLEX] normalized {text_raw[:40]!r} -> {_norm[:40]!r}")
+                            text_raw = _norm
+                    except Exception as _flex_exc:
+                        print(f"[SLASH][FLEX][WARN] {_flex_exc}")
                 # Re-resolve bot_token outside callback block (may not have been set)
                 try:
                     bot_token_msg = (os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
@@ -2899,13 +2961,14 @@ try:
                     response_text = ""
                     success = False
                     handler_error = ""
+                    reply_markup = None
                     try:
-                        from egx_quant.admin.commands import handle_slash_command  # type: ignore
-                        print(f"[SLASH] Dispatching command: {cmd_text[:80]!r} from user={user_id}")
-                        logger.info("[SLASH] Dispatching %r from user=%s", cmd_text[:80], user_id)
+                        from egx_quant.admin.commands import handle_slash_command_ex  # type: ignore
+                        print(f"[SLASH] Dispatching command: {cmd_text[:80]!r} from user={user_id} chat_type={chat_type}")
+                        logger.info("[SLASH] Dispatch %r from user=%s chat_type=%s", cmd_text[:80], user_id, chat_type)
                         # Wrap handle_portfolio explicitly with try-except for Supabase errors
                         try:
-                            success, response_text = handle_slash_command(cmd_text, from_user, bot_token_msg)
+                            success, response_text, reply_markup = handle_slash_command_ex(cmd_text, from_user, bot_token_msg, chat_type, chat_id)
                         except Exception as hp_exc:
                             import traceback
                             traceback.print_exc()
@@ -2933,9 +2996,12 @@ try:
                     # Always send a response if we have text and can reply, even on error
                     if response_text and bot_token_msg and requests and chat_id:
                         try:
+                            payload = {"chat_id": chat_id, "text": response_text, "parse_mode": "HTML"}
+                            if reply_markup:
+                                payload["reply_markup"] = reply_markup
                             resp = requests.post(
                                 TELEGRAM_SEND_URL.format(token=bot_token_msg),
-                                json={"chat_id": chat_id, "text": response_text, "parse_mode": "HTML"},
+                                json=payload,
                                 timeout=10,
                             )
                             print(f"[SLASH] Command {cmd_text.split()[0] if cmd_text else 'unknown'} response sent to {chat_id} -> {resp.status_code}")
@@ -2961,8 +3027,9 @@ try:
                             print(f"[SLASH][WARN] No response_text for {cmd_text[:40]!r} success={success} error={handler_error[:100]}")
                         if not chat_id:
                             print("[SLASH][WARN] No chat_id to reply")
-                elif isinstance(message, dict) and text_raw:
+                elif isinstance(message, dict) and text_raw and chat_type == "private":
                     # Pending capital-amount step (from parameter-less /set_capital or /add_capital)
+                    # PRIVATE CHATS ONLY - never consume group/channel text as amounts.
                     amount_handled = False
                     try:
                         if supabase_url_msg and supabase_key_msg and user_id and requests and bot_token_msg and not text_raw.startswith("/"):

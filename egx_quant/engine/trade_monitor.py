@@ -10,6 +10,10 @@ Routing policy (per system agreement):
   - Open-trade management alerts (targets / SL / trailing) are PRIVATE per
     user - they NEVER go to public broadcast channels. Public channels carry
     only NEW signal teasers from the scanner.
+  - Every DM is PERSONALIZED per subscriber from their own user_portfolio row
+    (their entry price, remaining qty %, and capital when registered) - no two
+    users get the same numbers. Users without stored data fall back to the
+    official signal entry (stated explicitly in their message).
 
 Idempotency (claim-first, per EVENT - fixes the 15-minute alert loop):
   - public.notified_events.event_key is a UNIQUE claim store:
@@ -292,44 +296,38 @@ def _notify_admin(subject: str, detail: str, throttle_key: Optional[str] = None)
 
 
 def _dm_subscribers(ticker: str, signal_id: Optional[int], card: str,
-                    footer: str = "", dry_run: bool = False) -> Tuple[bool, int, int]:
-    """DM-only dispatch of a trade-management card to tracking users.
+                    footer: str = "", dry_run: bool = False, render=None) -> Tuple[bool, int, int]:
+    """DM-only dispatch, ONE PERSONALIZED message per tracking user.
 
-    Policy: open-trade management alerts NEVER go to public channels - the
-    public feed carries only new-signal teasers from the scanner.
+    render(row) -> text builds each subscriber's own message from their
+    user_portfolio numbers (entry / remaining / capital). When render is None
+    the same global card+footer goes to everyone (fallback).
     Rate-limited: sleeps RATE_LIMIT_DELAY_SECONDS between sends and backs off
     on Telegram 429 (retry_after) to respect the ~30 msg/sec bot cap.
     Returns (ok, delivered, total_subscribers). Zero subscribers is success
     (nothing to do); total>0 with delivered==0 is a failure.
     """
-    # UNION of both registries (by trade_id AND by symbol) so no tracking user
-    # is ever missed when the two disagree (e.g. legacy joins with trade_id=0).
-    subscribers: List[str] = []
-    try:
-        if signal_id is not None:
-            subscribers.extend(list_subscribers(signal_id))
-    except Exception as e:
-        logger.warning("[DM] list_subscribers failed: %s", e)
-    try:
-        subscribers.extend(list_subscribers_by_symbol(ticker))
-    except Exception as e:
-        logger.warning("[DM] list_subscribers_by_symbol failed: %s", e)
-    subscribers = sorted({str(u) for u in subscribers if u})
-    if not subscribers:
+    rows = _fetch_tracking_rows(ticker, signal_id)
+    if not rows:
         logger.info("[DM] no tracking users for %s (signal_id=%s) - nothing sent", ticker, signal_id)
         return (True, 0, 0)
-    text = f"{card}\n{footer}" if footer else card
     if dry_run:
-        logger.info("[DRY-RUN DM] would send to %d subscriber(s) for %s", len(subscribers), ticker)
-        for uid in subscribers:
-            print(f"[DRY-RUN DM -> {uid[:8]}]\n{text[:400]}")
-        return (True, len(subscribers), len(subscribers))
+        logger.info("[DRY-RUN DM] would send PERSONALIZED messages to %d subscriber(s) for %s", len(rows), ticker)
+        for row in rows:
+            uid = str(row.get("user_id") or "?")
+            text = render(row) if render else (f"{card}\n{footer}" if footer else card)
+            print(f"[DRY-RUN DM -> {uid[:8]}]\n{text[:600]}")
+        return (True, len(rows), len(rows))
     token = (os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
     if requests is None or not token:
-        logger.error("[DM] token/requests missing - %d subscriber(s) NOT notified for %s", len(subscribers), ticker)
-        return (False, 0, len(subscribers))
+        logger.error("[DM] token/requests missing - %d subscriber(s) NOT notified for %s", len(rows), ticker)
+        return (False, 0, len(rows))
     delivered = 0
-    for idx, uid in enumerate(subscribers):
+    for idx, row in enumerate(rows):
+        uid = str(row.get("user_id") or "")
+        if not uid:
+            continue
+        text = render(row) if render else (f"{card}\n{footer}" if footer else card)
         if idx:
             time.sleep(RATE_LIMIT_DELAY_SECONDS)
         try:
@@ -364,8 +362,8 @@ def _dm_subscribers(ticker: str, signal_id: Optional[int], card: str,
             logger.warning("[DM] send to %s failed HTTP %s: %s", uid[:8], resp.status_code, resp.text[:120])
         except Exception as e:
             logger.warning("[DM] exception sending to %s: %s", uid[:8], e)
-    logger.info("[DM] %s: delivered %d/%d", ticker, delivered, len(subscribers))
-    return (delivered > 0, delivered, len(subscribers))
+    logger.info("[DM] %s: delivered %d/%d", ticker, delivered, len(rows))
+    return (delivered > 0, delivered, len(rows))
 
 
 def _resolve_signal_id(ticker: str) -> Optional[int]:
@@ -389,6 +387,135 @@ def _resolve_signal_id(ticker: str) -> Optional[int]:
         except Exception as e:
             logger.warning("[RESOLVE] %s failed: %s", ticker, e)
     return None
+
+
+def _fnum(x) -> Optional[float]:
+    """Safe float coercion (None/NaN/garbage -> None)."""
+    try:
+        v = float(x)
+        return None if v != v else v
+    except (TypeError, ValueError):
+        return None
+
+
+def _fetch_tracking_rows(ticker: str, signal_id: Optional[int]) -> List[Dict[str, Any]]:
+    """Full TRACKING user_portfolio rows for one trade - each user's own numbers.
+
+    Union of the trade_id match and the symbol match, deduped by user_id.
+    Each row carries: entry_price / joined_at_price / remaining_qty_pct /
+    allocation_pct / capital_at_join / snapshot.
+    """
+    cfg = _cfg()
+    if requests is None or cfg is None:
+        return []
+    url, _ = cfg
+    headers = _headers(prefer="return=minimal")
+    cols = ("user_id,entry_price,joined_at_price,remaining_qty_pct,"
+            "allocation_pct,capital_at_join,snapshot,trade_id,symbol")
+    queries = []
+    if signal_id is not None:
+        queries.append(f"trade_id=eq.{signal_id}")
+    sym = ticker if ticker.endswith(".CA") else f"{ticker}.CA"
+    queries.append(f"symbol=eq.{sym}")
+    rows: List[Dict[str, Any]] = []
+    for q in queries:
+        try:
+            resp = requests.get(
+                f"{url}/rest/v1/{USER_PORTFOLIO_TABLE}?{q}&status=eq.TRACKING&select={cols}",
+                headers=headers, timeout=10,
+            )
+            if resp.status_code == 200 and isinstance(resp.json(), list):
+                rows.extend(resp.json())
+        except Exception as e:
+            logger.warning("[DM] tracking-rows fetch failed: %s", e)
+    seen, out = set(), []
+    for r in rows:
+        uid = str(r.get("user_id") or "")
+        if uid and uid not in seen:
+            seen.add(uid)
+            out.append(r)
+    return out
+
+
+def _user_context(row: Optional[Dict[str, Any]], global_entry: Optional[float]) -> Dict[str, Any]:
+    """Resolve one subscriber's own numbers (graceful fallbacks everywhere).
+
+    Entry chain: their entry_price -> joined_at_price -> official signal entry.
+    Position size only when capital data was registered at join time.
+    """
+    row = row or {}
+    entry = _fnum(row.get("entry_price")) or _fnum(row.get("joined_at_price")) or _fnum(global_entry)
+    remaining = _fnum(row.get("remaining_qty_pct"))
+    if remaining is None:
+        remaining = 100.0
+    capital = _fnum(row.get("capital_at_join"))
+    alloc = _fnum(row.get("allocation_pct"))
+    invested = qty = None
+    if capital is not None and alloc is not None and entry:
+        invested = capital * alloc / 100.0
+        qty = invested / entry if entry else None
+    return {
+        "user_id": str(row.get("user_id") or ""),
+        "entry": entry,
+        "remaining": remaining,
+        "invested": invested,
+        "qty": qty,
+        "has_capital": invested is not None and qty is not None,
+    }
+
+
+def _target_suggestion(u: Dict[str, Any], level: int) -> str:
+    """Action line tuned to the user's remaining position (not a generic blast)."""
+    rem = u["remaining"]
+    base = "💡 <b>المقترح لك:</b> "
+    if level == 1:
+        if rem >= 99:
+            return base + "بيع 50% من مركزك الآن عند T1 وارفع وقفك لنقطة دخولك."
+        return base + f"بعت جزءاً من قبل (المتبقي {rem:.0f}%) - أمّن الباقي برفع الوقف لنقطة دخولك."
+    if level == 2:
+        return base + f"بيع جزءاً إضافياً عند T2 من مركزك المتبقي ({rem:.0f}%) وحافظ على وقف متحرك تحت T1."
+    if level >= 3:
+        return base + f"الهدف النهائي تحقق - اجنِ أرباح مركزك المتبقي ({rem:.0f}%) أو أغلقه بالكامل."
+    return base + "راجع صفقتك وحدّث وقف الخسارة."
+
+
+def _personal_block(u: Dict[str, Any], *, current: float, event: str,
+                    new_sl: Optional[float] = None, suggestion: str = "") -> str:
+    """Per-user numbers block appended under the market-fact card.
+
+    event: TARGET | SL | TRAIL. Users without a stored entry fall back to the
+    official signal entry - stated explicitly, never silently mixed.
+    Money values appear only when capital was registered at join time.
+    """
+    lines = ["------------------------------------", "👤 <b>حسابك الخاص:</b>"]
+    entry = u.get("entry")
+    if entry:
+        pnl = (current - entry) / entry * 100 if entry else 0.0
+        lines.append(f"• <b>سعر دخولك:</b> {entry:.2f} EGP")
+        if event == "TARGET":
+            lines.append(f"• <b>ربحك الحالي:</b> {pnl:+.2f}%")
+            if u["has_capital"]:
+                gain = (current - entry) * (u["qty"] or 0.0) * (u["remaining"] / 100.0)
+                lines.append(f"• <b>ربح مركزك المتبقي ({u['remaining']:.0f}%):</b> {gain:+,.0f} EGP")
+            else:
+                lines.append(f"• <b>مركزك المتبقي:</b> {u['remaining']:.0f}%")
+        elif event == "SL":
+            lines.append(f"• <b>خسارتك عند التنفيذ:</b> {pnl:+.2f}%")
+            if u["has_capital"]:
+                loss = (current - entry) * (u["qty"] or 0.0) * (u["remaining"] / 100.0)
+                lines.append(f"• <b>قيمتها على مركزك المتبقي ({u['remaining']:.0f}%):</b> {loss:+,.0f} EGP")
+            lines.append(f"• <b>تم إغلاق مركزك المتبقي ({u['remaining']:.0f}%) عند:</b> {current:.2f} EGP")
+        elif event == "TRAIL" and new_sl is not None:
+            floor = (new_sl - entry) / entry * 100 if entry else 0.0
+            lines.append(f"• <b>أرضية حمايتك الجديدة:</b> {floor:+.2f}% فوق دخولك")
+            if u["has_capital"]:
+                prot = (new_sl - entry) * (u["qty"] or 0.0) * (u["remaining"] / 100.0)
+                lines.append(f"• <b>الربح المحمي على مركزك ({u['remaining']:.0f}%):</b> {prot:+,.0f} EGP")
+    else:
+        lines.append("• لا يوجد سعر دخول مسجّل لك - الأرقام المعروضة بسعر الإشارة الرسمي.")
+    if suggestion:
+        lines.append(suggestion)
+    return "\n".join(lines)
 
 
 def _mark_trade_closed(ticker: str, signal_id: Optional[int], reason: str) -> bool:
@@ -650,20 +777,16 @@ def publish_target_alert(ticker: str, target_level: int, target_price: float, cu
 
     card = format_target_hit_card(ticker, target_level, target_price, current_price, entry_price)
 
-    # Determine actionable suggestion based on target level
-    if target_level == 1:
-        action_suggestion = "💡 <b>الإجراء المقترح:</b> بيع 50% من الكمية عند T1 وحرك وقف الخسارة إلى نقطة الدخول (Breakeven) لتأمين الأرباح."
-    elif target_level == 2:
-        action_suggestion = "💡 <b>الإجراء المقترح:</b> بيع 25% إضافية عند T2 وحافظ على وقف متحرك تحت T1."
-    elif target_level >= 3:
-        action_suggestion = "💡 <b>الإجراء المقترح:</b> جني الأرباح المتبقية أو الإغلاق الكامل - الهدف النهائي تحقق."
-    else:
-        action_suggestion = "💡 <b>الإجراء المقترح:</b> مراجعة الصفقة وتحديث وقف الخسارة."
+    def render(row):
+        """Per-user message: card recomputed on THEIR entry + their numbers block."""
+        u = _user_context(row, entry_price)
+        body = format_target_hit_card(ticker, target_level, target_price, current_price, u["entry"])
+        block = _personal_block(u, current=current_price, event="TARGET",
+                                suggestion=_target_suggestion(u, target_level))
+        return f"{body}\n{block}\n📩 تم إرسال تنبيه الهدف لك في الخاص."
 
     dm_ok, delivered, total = _dm_subscribers(
-        ticker, signal_id, card,
-        footer=f"{action_suggestion}\n📩 تم إرسال تنبيه الهدف لك في الخاص.",
-        dry_run=dry_run,
+        ticker, signal_id, card, dry_run=dry_run, render=render,
     )
     if not dry_run and total > 0 and delivered == 0:
         _unclaim_event(key)
@@ -730,10 +853,16 @@ def publish_trailing_sl_alert(ticker: str, new_sl: float, current_price: float, 
         _record_event(key, "TRAILING_SL", ticker, signal_id, {"new_sl": new_sl, "previous_stop": stored_sl})
 
     card = format_trailing_sl_update(ticker, new_sl, current_price, entry_price)
+
+    def render(row):
+        u = _user_context(row, entry_price)
+        body = format_trailing_sl_update(ticker, new_sl, current_price, u["entry"])
+        block = _personal_block(u, current=current_price, event="TRAIL", new_sl=new_sl,
+                                suggestion="💡 <b>الإجراء:</b> الوقف المتحرك يحمي أرباحك تلقائياً - لا حاجة للتدخل.")
+        return f"{body}\n{block}"
+
     dm_ok, delivered, total = _dm_subscribers(
-        ticker, signal_id, card,
-        footer="💡 <b>الإجراء:</b> الوقف المتحرك يحمي أرباحك تلقائياً.",
-        dry_run=dry_run,
+        ticker, signal_id, card, dry_run=dry_run, render=render,
     )
     if not dry_run and total > 0 and delivered == 0:
         _unclaim_event(key)
@@ -772,10 +901,16 @@ def publish_sl_alert(ticker: str, current_price: float, stop_loss: float, entry_
         _record_event(key, "SL_HIT", ticker, signal_id, {"price": current_price})
 
     card = format_sl_exit_card(ticker, current_price, stop_loss, entry_price)
+
+    def render(row):
+        u = _user_context(row, entry_price)
+        body = format_sl_exit_card(ticker, current_price, stop_loss, u["entry"])
+        block = _personal_block(u, current=current_price, event="SL",
+                                suggestion="🔴 تم إغلاق مركزك لحماية رأس مالك.")
+        return f"{body}\n{block}\n📩 تم إرسال تنبيه وقف الخسارة لك في الخاص."
+
     dm_ok, delivered, total = _dm_subscribers(
-        ticker, signal_id, card,
-        footer="📩 تم إرسال تنبيه وقف الخسارة لك في الخاص.",
-        dry_run=dry_run,
+        ticker, signal_id, card, dry_run=dry_run, render=render,
     )
     if not dry_run and total > 0 and delivered == 0:
         _unclaim_event(key)
