@@ -48,14 +48,14 @@ _STOCKS: List[StockMeta] = [
     StockMeta("TMGH.CA", "طلعت مصطفى - تطوير عقاري", "Talaat Moustafa Group", "Real Estate", ShariahStatus.NEEDS_REVIEW),
     StockMeta("EMFD.CA", "عمار مصر", "Emaar Misr Development", "Real Estate", ShariahStatus.COMPLIANT),
     StockMeta("PHDC.CA", "بالم هيلز للتطوير العقاري", "Palm Hills Developments", "Real Estate", ShariahStatus.NEEDS_REVIEW),
-    StockMeta("MFPC.CA", "مدينة مصر للتطوير العقاري", "Madinet Masr Housing", "Real Estate", ShariahStatus.NEEDS_REVIEW),
+    StockMeta("MFPC.CA", "مصر للأسمدة - موبكو", "MOPCO (Misr Fertilizers)", "Fertilizers", ShariahStatus.NEEDS_REVIEW),
     StockMeta("ORHD.CA", "أوراسكوم للتطوير والعمران", "Orascom Development Egypt", "Real Estate", ShariahStatus.NEEDS_REVIEW),
     StockMeta("SWDY.CA", "السويدي إلكتريك", "Elsewedy Electric", "Industrials", ShariahStatus.COMPLIANT),
     StockMeta("ORAS.CA", "أوراسكوم للإنشاء والتطوير", "Orascom Construction", "Construction", ShariahStatus.COMPLIANT),
     StockMeta("ABUK.CA", "أبو قير للأسمدة", "Abu Qir Fertilizers", "Fertilizers", ShariahStatus.COMPLIANT),
     StockMeta("SKPC.CA", "سيد كير للبتروكيماويات", "Sidi Kerir Petrochemicals", "Petrochemicals", ShariahStatus.NEEDS_REVIEW),
     StockMeta("AMOC.CA", "الإسكندرية للزيوت المعدنية", "Alexandria Mineral Oils", "Oil & Gas", ShariahStatus.NON_COMPLIANT),
-    StockMeta("EFID.CA", "عز - صناعة الحديد والصلب", "Ezz Steel Industries", "Steel", ShariahStatus.NON_COMPLIANT),
+    StockMeta("EFID.CA", "إيديتا للصناعات الغذائية", "Edita Food Industries", "Food & Beverage", ShariahStatus.COMPLIANT),
     StockMeta("ESRS.CA", "عز لصناعة الصلب", "Ezz Steel", "Steel", ShariahStatus.NON_COMPLIANT),
     StockMeta("ETEL.CA", "المصرية للاتصالات", "Telecom Egypt", "Telecom", ShariahStatus.NEEDS_REVIEW),
     StockMeta("FWRY.CA", "فوري للخدمات المصرفية والتكنولوجيا", "Fawry Banking Technology", "Technology", ShariahStatus.COMPLIANT),
@@ -74,6 +74,16 @@ _STOCKS: List[StockMeta] = [
     StockMeta("ORWE.CA", "الشرقية للسجاد", "Oriental Weavers", "Industrials", ShariahStatus.COMPLIANT),
     StockMeta("FAIT.CA", "بنك فيصل الإسلامي", "Faisal Islamic Bank", "Banking", ShariahStatus.COMPLIANT),
     StockMeta("EFIH.CA", "إي فاينانس للاستثمارات المالية والرقمنة", "e-finance", "Technology", ShariahStatus.COMPLIANT),
+    # --- Expanded 2026-09-09: full EGX30 coverage + liquid EGX70 leaders.
+    # Shariah flags follow the team's own EGX33 list (main.EGX33_SHARIAH_TICKERS);
+    # HRHO/QNBA/ALCN/BINV/EKHO/LCSW are NEEDS_REVIEW (not vetted yet).
+    StockMeta("HRHO.CA", "إي إف جي القابضة", "EFG Holding", "Financial Services", ShariahStatus.NEEDS_REVIEW),
+    StockMeta("QNBA.CA", "بنك قطر الوطني الأهلي", "QNB Alahli", "Banking", ShariahStatus.NEEDS_REVIEW),
+    StockMeta("ALCN.CA", "الإسكندرية لتداول الحاويات", "Alexandria Containers", "Industrials", ShariahStatus.NEEDS_REVIEW),
+    StockMeta("OLFI.CA", "عبور لاند للصناعات الغذائية", "Obour Land Foods", "Food & Beverage", ShariahStatus.COMPLIANT),
+    StockMeta("BINV.CA", "بي إنفستمنتس القابضة", "B Investments Holding", "Financial Services", ShariahStatus.NEEDS_REVIEW),
+    StockMeta("EKHO.CA", "القابضة المصرية الكويتية", "Egyptian Kuwaiti Holding", "Conglomerate", ShariahStatus.NEEDS_REVIEW),
+    StockMeta("LCSW.CA", "ليسيكو مصر", "Lecico Egypt", "Industrials", ShariahStatus.NEEDS_REVIEW),
 ]
 
 _REGISTRY: Dict[str, StockMeta] = {meta.symbol: meta for meta in _STOCKS}

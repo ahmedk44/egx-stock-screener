@@ -199,11 +199,14 @@ class TelegramNotifier:
         except:
             return "تحليل فني"
 
-    def format_channel_short_card(self, plan: RiskPlan, trade_id: int) -> List[str]:
+    def format_channel_short_card(self, plan: RiskPlan, trade_id: int, trade_track: Optional[str] = None) -> List[str]:
         """Professional public channel template with dynamic targets (2-4+).
 
         Header: 🚀 إشارة جديدة | {ticker} ({company_name})
         Includes Shariah & Strategy, TQI/Grade, Technical Trigger, Execution Levels (dynamic targets), CTA.
+        trade_track (optional): explicit track key ("scalping"/"swing"/"investment") -
+        overrides inference so the card badge always matches the scanner's
+        dynamic classification. Omitted = legacy inference behavior.
         """
         bare = clean_ticker(plan.symbol)
         # Company name if registry available
@@ -220,19 +223,32 @@ class TelegramNotifier:
             flag = SHARIAH_FLAG_SHORT.get(self._shariah.get_status(plan.symbol), "⚠️ يحتاج مراجعة")
         except:
             flag = "⚠️ يحتاج مراجعة"
-        # Strategy / track label - infer from plan if possible
+        # Strategy / track label - explicit override wins, else infer from plan
         track_label = "📈 تداول سوينغ (Swing)"
-        for attr in ("strategy_type", "strategy", "trade_track"):
-            val = getattr(plan, attr, None)
-            if val:
-                lower = str(val).lower()
-                if "scalp" in lower:
-                    track_label = "⚡ مضاربة لحظية (Scalp)"
-                elif "swing" in lower:
-                    track_label = "📈 تداول سوينغ (Swing)"
-                elif "invest" in lower:
-                    track_label = "🏛️ استثمار طويل (Invest)"
-                break
+        _explicit = str(trade_track or "").strip().lower()
+        if _explicit:
+            if "scalp" in _explicit:
+                track_label = "⚡ مضاربة لحظية (Scalp)"
+            elif "invest" in _explicit:
+                track_label = "🏛️ استثمار طويل (Invest)"
+            elif "swing" in _explicit:
+                track_label = "📈 تداول سوينغ (Swing)"
+            # unrecognized explicit value -> keep default (never break the card)
+            _explicit_used = True
+        else:
+            _explicit_used = False
+        if not _explicit_used:
+            for attr in ("strategy_type", "strategy", "trade_track"):
+                val = getattr(plan, attr, None)
+                if val:
+                    lower = str(val).lower()
+                    if "scalp" in lower:
+                        track_label = "⚡ مضاربة لحظية (Scalp)"
+                    elif "swing" in lower:
+                        track_label = "📈 تداول سوينغ (Swing)"
+                    elif "invest" in lower:
+                        track_label = "🏛️ استثمار طويل (Invest)"
+                    break
         tqi = getattr(plan, "tqi_score", 5.0)
         try:
             tqi_f = float(tqi)
@@ -301,8 +317,8 @@ class TelegramNotifier:
         """Alias for format_channel_short_card - professional template."""
         return self.format_channel_short_card(plan, trade_id)
 
-    def format_channel_broadcast(self, plan: RiskPlan, trade_id: int) -> str:
-        return "\n".join(self.format_channel_short_card(plan, trade_id))
+    def format_channel_broadcast(self, plan: RiskPlan, trade_id: int, trade_track: Optional[str] = None) -> str:
+        return "\n".join(self.format_channel_short_card(plan, trade_id, trade_track=trade_track))
 
     def send_text(self, text: str, parse_mode: str = "HTML") -> bool:
         """Direct/private sends. NEVER touches the public channel - the channel

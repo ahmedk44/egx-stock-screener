@@ -6,7 +6,8 @@ Triggered by:
   - GitHub Actions runner.yml schedule (fallback, */15 7-11 * * 0-4)
 
 Pipeline (official project modules only — no hardcoded logic):
-  a. Ticker ingestion    : StocksRegistry.all_symbols() (31 registered EGX stocks)
+  a. Ticker ingestion    : StocksRegistry.all_symbols() (38 registered EGX stocks:
+                            full EGX30 + liquid EGX70 leaders)
   b. Shariah transparency: ALL tickers processed (non-compliant / needs-review are
                            NOT dropped); the real status (✅ متوافق / ⚠️ يحتاج مراجعة /
                            ❌ غير متوافق) is featured on the official Telegram card
@@ -292,6 +293,123 @@ def _rr_ratio(plan: "Any") -> Optional[float]:
     return None
 
 
+# Dynamic track classification thresholds (aligned with STRATEGY_PLAN in
+# main.py: scalp SL<=3.5%/T1<=4%, invest TQI>=8 & T3>=12%, else balanced swing).
+TRACK_SCALP_MAX_SL = 0.035
+TRACK_SCALP_MAX_T1 = 0.04
+TRACK_INVEST_MIN_TQI = 8.0
+TRACK_INVEST_MIN_T3 = 0.12
+
+# Per-track channel env chains (first set var wins). Missing track channel
+# falls back to the scalping channel - a signal is never dropped for routing.
+TRACK_CHANNEL_ENVS: Dict[str, tuple] = {
+    "scalping": ("TELEGRAM_CHANNEL_SCALPING", "SCALPING_CHANNEL_ID", "CHANNEL_SCALPING", "TELEGRAM_CHANNEL_ID"),
+    "swing": ("TELEGRAM_CHANNEL_SWING", "CHANNEL_SWING"),
+    "investment": ("TELEGRAM_CHANNEL_INVESTMENT", "CHANNEL_INVESTMENT"),
+}
+
+
+def classify_track(entry: Any, stop: Any, t1: Any, t3: Any, tqi: Any) -> str:
+    """Dynamic track from the REALIZED signal fingerprint (pure, testable).
+
+    invest:     TQI >= 8.0 with wide third target (>= +12%) - exceptional quality.
+    scalping:   tight stop (<= 3.5%) with close first target (<= 4%) - fast setup.
+    swing:      default balanced profile (Donchian confluence standard).
+    invest is checked first (quality dominates speed). Unknown/garbage -> swing.
+    """
+    try:
+        e = float(entry)
+        sl_d = (e - float(stop)) / e if e else 1.0
+        t1_d = (float(t1) - e) / e if e and t1 else 1.0
+        t3_d = (float(t3) - e) / e if e and t3 else 0.0
+        tq = float(tqi)
+    except Exception:
+        return "swing"
+    if tq >= TRACK_INVEST_MIN_TQI and t3_d >= TRACK_INVEST_MIN_T3:
+        return "investment"
+    if sl_d <= TRACK_SCALP_MAX_SL and t1_d <= TRACK_SCALP_MAX_T1:
+        return "scalping"
+    return "swing"
+
+
+def _channel_for_track(track: str, fallback: str) -> str:
+    """Resolve the Telegram channel for a track (fallback = scalping channel)."""
+    for env in TRACK_CHANNEL_ENVS.get(str(track or "").strip().lower(), ()):
+        try:
+            val = (os.environ.get(env) or "").strip().strip('"').strip("'")
+        except Exception:
+            val = ""
+        if val:
+            return val
+    print(f"[CRON][SCANNER][WARN] no channel configured for track={track} - falling back (signal never dropped)")
+    return fallback
+
+
+def _liquidity_prescreen(tickers: List[str]) -> Dict[str, Dict[str, Any]]:
+    """Fast availability pre-check: ONE light 5d/1d download for the universe.
+
+    Marks tickers with no usable frame (delisted/unknown/empty/bad price) as
+    ok=False so the heavy 6mo pass skips them instantly (Vercel budget guard).
+    This is AVAILABILITY only - selectivity stays with the strategy engine.
+    Fail-OPEN: any download failure marks everything ok=True (the prescreen
+    must never kill the scan).
+    Returns {ticker: {"ok": bool, "reason": str}}.
+    """
+    result: Dict[str, Dict[str, Any]] = {t: {"ok": True, "reason": "prescreen-bypassed"} for t in tickers}
+    try:
+        import yfinance as yf  # type: ignore
+        import pandas as pd  # type: ignore
+        import math as _math
+    except Exception as exc:
+        print(f"[CRON][SCANNER][WARN] prescreen deps unavailable ({exc}) - all tickers pass")
+        return result
+    try:
+        data = yf.download(
+            tickers=list(tickers),
+            period="5d",
+            interval="1d",
+            group_by="ticker",
+            threads=True,
+            progress=False,
+            auto_adjust=True,
+        )
+    except Exception as exc:
+        print(f"[CRON][SCANNER][WARN] prescreen download failed ({exc}) - all tickers pass")
+        return result
+    try:
+        multi = isinstance(data.columns, pd.MultiIndex)
+        level0 = set(data.columns.get_level_values(0)) if multi else set()
+        for t in tickers:
+            try:
+                if multi and t not in level0:
+                    result[t] = {"ok": False, "reason": "no-frame"}
+                    continue
+                df = data[t] if multi else data
+                if df is None or df.empty:
+                    result[t] = {"ok": False, "reason": "empty"}
+                    continue
+                df = df.dropna(subset=["Close"])
+                if df.empty:
+                    result[t] = {"ok": False, "reason": "no-close"}
+                    continue
+                last_close = float(df["Close"].iloc[-1])
+                if not _math.isfinite(last_close) or last_close <= 0:
+                    result[t] = {"ok": False, "reason": "bad-price"}
+                    continue
+                result[t] = {"ok": True, "reason": "ok"}
+            except Exception:
+                result[t] = {"ok": False, "reason": "parse-error"}
+    except Exception as exc:
+        print(f"[CRON][SCANNER][WARN] prescreen parse failed ({exc}) - all tickers pass")
+        return {t: {"ok": True, "reason": "prescreen-bypassed"} for t in tickers}
+    dropped = sorted(t for t, v in result.items() if not v["ok"])
+    if dropped:
+        print(f"[CRON][SCANNER] prescreen: {len(tickers) - len(dropped)}/{len(tickers)} liquid, skipped: {', '.join(dropped)}")
+    else:
+        print(f"[CRON][SCANNER] prescreen: all {len(tickers)} tickers liquid")
+    return result
+
+
 def _run_strategy_batch(
     batch: List[str],
     data: "Any",
@@ -333,6 +451,7 @@ def _run_strategy_batch(
         try:
             df = _ticker_frame(data, ticker, multi, level0)
             if df is None or len(df) < MIN_BARS:
+                print(f"[CRON][SCANNER][NO-DATA] {ticker} no usable frame (empty or <{MIN_BARS} bars) - skipped")
                 continue
             # Same-day validation: the latest bar MUST belong to the CURRENT
             # Cairo session date. Yesterday's bar / pre-open placeholder = stale.
@@ -429,7 +548,7 @@ def _publish_signal(
     dry_run: bool,
     allow_delayed: bool = False,
 ) -> Dict[str, Any]:
-    """Dispatch one approved plan: market gate -> Live Price Guard -> reprice -> card -> dispatch.
+    """Dispatch one approved plan: market gate -> Live Price Guard -> reprice -> track -> card -> dispatch.
 
     Order:
       0. MARKET HOURS GATE: if is_market_open() is False the live dispatch is
@@ -441,12 +560,14 @@ def _publish_signal(
          as stale (EXPIRED_ENTRY).
       3. Dynamic reprice: entry is re-anchored to the LIVE price and SL/TP1/TP2/TP3
          are recalculated from it (official RiskManager + fib_targets).
-      4. Official Signal Card Formatter (features the real Shariah status) and
-         Telegram broadcast + Supabase upsert.
+      4. Dynamic track classification from the realized fingerprint
+         (invest: TQI>=8 & wide T3; scalping: tight SL & close T1; else swing).
+      5. Official Signal Card Formatter (real Shariah status + explicit track
+         badge) and per-track channel broadcast + Supabase upsert.
     """
     from egx_quant.core.risk_engine import atr as atr_fn
     from egx_quant.core.strategy_engine import fib_targets, impulse_swings
-    from egx_quant.utils.telegram_notifier import build_join_markup, clean_ticker
+    from egx_quant.utils.telegram_notifier import build_join_markup, clean_ticker, TelegramNotifier
 
     plan = rec["plan"]
     ticker = str(plan.symbol)
@@ -526,8 +647,13 @@ def _publish_signal(
         f"tp1={plan.target_1} tp2={plan.target_2} tp3={plan.target_3} rr_tp1={_rr_ratio(plan)}"
     )
 
-    # 4) Official Signal Card Formatter — real Shariah status featured on the card
-    card = notifier.format_channel_broadcast(plan, 0)
+    # 4) Dynamic track classification from the REALIZED fingerprint (TQI + SL/TP profile)
+    track = classify_track(plan.entry_price, plan.stop_loss, plan.target_1, plan.target_3, plan.tqi_score)
+    rec["track"] = track
+    print(f"[CRON][SCANNER] TRACK {ticker}: {track} (tqi={plan.tqi_score} rr_tp1={_rr_ratio(plan)})")
+
+    # 5) Official Signal Card Formatter — real Shariah status + explicit track badge
+    card = notifier.format_channel_broadcast(plan, 0, trade_track=track)
     if rec.get("delayed_quote"):
         card += (
             f"\n⚠️ دخول محسوب على سعر متأخر (آخر تحديث {rec.get('quote_asof') or 'غير معروف'}) - "
@@ -545,7 +671,7 @@ def _publish_signal(
         from egx_quant.utils import supabase_sync
         payload = {
             "ticker": ticker,
-            "strategy_type": "scanner_watch",
+            "strategy_type": track,
             "entry_price": plan.entry_price,
             "stop_loss": plan.stop_loss,
             "current_stop_loss": plan.stop_loss,
@@ -563,9 +689,13 @@ def _publish_signal(
         outcome["supabase"] = f"error: {str(exc)[:120]}"
         print(f"[CRON][SCANNER][ERROR] Supabase publish {ticker} crashed: {exc}")
     try:
-        ok = notifier.broadcast_signal(card, markup)
-        outcome["telegram"] = "broadcast" if ok else "failed/mock"
-        print(f"[CRON][SCANNER] Telegram broadcast {ticker}: {'OK' if ok else 'FAILED/mock'}")
+        scalp_fallback = _get_scalping_channel_id()
+        target_channel = _channel_for_track(track, scalp_fallback)
+        sender = notifier if target_channel == scalp_fallback else TelegramNotifier(channel_id=target_channel)
+        ok = sender.broadcast_signal(card, markup)
+        outcome["telegram"] = f"broadcast:{track}" if ok else "failed/mock"
+        outcome["channel"] = target_channel
+        print(f"[CRON][SCANNER] Telegram broadcast {ticker} -> {track} channel: {'OK' if ok else 'FAILED/mock'}")
     except Exception as exc:
         outcome["telegram"] = f"error: {str(exc)[:120]}"
         print(f"[CRON][SCANNER][ERROR] Telegram broadcast {ticker} crashed: {exc}")
@@ -634,7 +764,20 @@ def run_scan_pipeline(dry_run: bool = False) -> Dict[str, Any]:
         f"{status_counts.get('NON_COMPLIANT', 0)} non-compliant) - status featured on card"
     )
 
-    batches = [universe[i:i + BATCH_SIZE] for i in range(0, len(universe), BATCH_SIZE)]
+    # Liquidity pre-check: skip dead tickers before the heavy 6mo pass (budget guard).
+    liquid_map = _liquidity_prescreen(universe)
+    skipped = sorted(t for t in universe if not liquid_map.get(t, {}).get("ok", True))
+    for t in skipped:
+        print(f"[CRON][SCANNER][ILLIQUID-SKIP] {t} ({liquid_map.get(t, {}).get('reason')}) - heavy pass skipped")
+    trade_universe = [t for t in universe if t not in set(skipped)]
+    result["prescreen_skipped"] = skipped
+    result["trade_universe_size"] = len(trade_universe)
+    if not trade_universe:
+        print("[CRON][SCANNER][WARN] prescreen dropped everything - failing open to full universe")
+        trade_universe = list(universe)
+        result["prescreen_skipped"] = []
+        result["trade_universe_size"] = len(trade_universe)
+    batches = [trade_universe[i:i + BATCH_SIZE] for i in range(0, len(trade_universe), BATCH_SIZE)]
     all_records: List[Dict[str, Any]] = []
     all_near_misses: List[Dict[str, Any]] = []
     scan_stats: Dict[str, Any] = {}  # stale-frame census for the feed-freeze monitor
@@ -731,6 +874,7 @@ def run_scan_pipeline(dry_run: bool = False) -> Dict[str, Any]:
             "ticker": rec["ticker"],
             "strategy_tag": rec["signal"].strategy_tag,
             "signal": "confluence_buy",
+            "track": rec.get("track", "swing"),
             "entry_price": plan.entry_price,
             "entry_source": rec.get("entry_source", "daily_close"),
             "live_price": rec.get("live_price"),
