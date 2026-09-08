@@ -6,8 +6,9 @@ Triggered by:
   - GitHub Actions runner.yml schedule (fallback, */15 7-11 * * 0-4)
 
 Pipeline (official project modules only — no hardcoded logic):
-  a. Ticker ingestion    : StocksRegistry.all_symbols() (38 registered EGX stocks:
-                            full EGX30 + liquid EGX70 leaders)
+  a. Ticker ingestion    : StocksRegistry.all_symbols() (54 registered EGX stocks:
+                            full EGX30 + liquid EGX70 leaders, extendable at
+                            runtime via EXTRA_TICKERS env)
   b. Shariah transparency: ALL tickers processed (non-compliant / needs-review are
                            NOT dropped); the real status (✅ متوافق / ⚠️ يحتاج مراجعة /
                            ❌ غير متوافق) is featured on the official Telegram card
@@ -53,8 +54,13 @@ from typing import Any, Dict, List, Optional, Tuple
 from egx_quant.core.shariah_filter import ShariahFilter
 from egx_quant.utils.egx_calendar import is_market_open, now_cairo, session_label
 
-# Batch size tuned so each yf.download returns in ~2-4s and progress is logged
-BATCH_SIZE = 9
+# Batch size: 12 tickers per yf.download keeps each batch in ~2-4s while a
+# 54+ universe fits in 5 batches (inside the Vercel 60s budget - see deadline).
+BATCH_SIZE = 12
+# Hard wall-clock deadline (seconds) for the scan phase: stop starting new
+# batches past this point so the function ALWAYS returns inside maxDuration.
+# The standalone /api/monitor covers trade tracking independently.
+SCAN_DEADLINE_SECONDS = 50.0
 # Rough wall-clock budget guard (seconds) for optional heavy extras (monitor)
 TIME_BUDGET_SECONDS = 45.0
 # StrategyEngine needs >= 60 daily bars; 6mo (~125 sessions) is the safe fetch window
@@ -63,15 +69,34 @@ KLINE_INTERVAL = "1d"
 
 
 def _universe() -> List[str]:
-    """ALL registered EGX stocks (single source of truth). Never raises."""
+    """Registry stocks + EXTRA_TICKERS env extension (single source of truth). Never raises.
+
+    Operators can append tickers without a deploy:
+      EXTRA_TICKERS="FOO.CA, BAR"  (normalized, deduped, validated live by the
+      liquidity prescreen - dead symbols are auto-skipped + logged).
+    """
     try:
         from egx_quant.config.stocks_registry import StocksRegistry
-        symbols = StocksRegistry.all_symbols()
-        if symbols:
-            return symbols
+        symbols = list(StocksRegistry.all_symbols() or [])
     except Exception as exc:
         print(f"[CRON][SCANNER][WARN] StocksRegistry unavailable ({exc}) - using fallback watchlist")
-    return ["COMI.CA", "FWRY.CA", "TMGH.CA", "SWDY.CA", "ABUK.CA", "ETEL.CA", "HRHO.CA", "EAST.CA"]
+        symbols = ["COMI.CA", "FWRY.CA", "TMGH.CA", "SWDY.CA", "ABUK.CA", "ETEL.CA", "HRHO.CA", "EAST.CA"]
+    try:
+        extra: List[str] = []
+        for part in (os.environ.get("EXTRA_TICKERS") or "").replace(";", ",").split(","):
+            t = part.strip().upper()
+            if not t:
+                continue
+            if not t.endswith(".CA"):
+                t = f"{t}.CA"
+            if t not in symbols and t not in extra:
+                extra.append(t)
+        if extra:
+            print(f"[CRON][SCANNER] EXTRA_TICKERS adding {len(extra)}: {', '.join(extra)}")
+            symbols = symbols + extra
+    except Exception as exc:
+        print(f"[CRON][SCANNER][WARN] EXTRA_TICKERS parse failed ({exc}) - ignored")
+    return symbols
 
 
 def _is_authorized(handler: BaseHTTPRequestHandler) -> tuple[bool, str]:
@@ -789,8 +814,14 @@ def run_scan_pipeline(dry_run: bool = False) -> Dict[str, Any]:
     result["max_bar_lag"] = max_lag
     if max_lag > 0:
         print(f"[CRON][SCANNER] delayed-data mode ON: evaluating bars up to {max_lag} session(s) old (badged)")
+    result["deadline_cut"] = False
     for idx, batch in enumerate(batches, start=1):
         t0 = datetime.now(timezone.utc)
+        if idx > 1 and (t0 - started).total_seconds() > SCAN_DEADLINE_SECONDS:
+            print(f"[CRON][SCANNER][DEADLINE] {(t0 - started).total_seconds():.0f}s > {SCAN_DEADLINE_SECONDS:.0f}s - "
+                  f"stopping after {idx - 1}/{len(batches)} batches (remainder resumes next cycle)")
+            result["deadline_cut"] = True
+            break
         try:
             print(f"[CRON][SCANNER] batch {idx}/{len(batches)}: downloading {len(batch)} tickers ({KLINE_PERIOD}/{KLINE_INTERVAL} daily bars)")
             data = yf.download(

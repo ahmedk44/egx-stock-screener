@@ -84,6 +84,28 @@ _STOCKS: List[StockMeta] = [
     StockMeta("BINV.CA", "بي إنفستمنتس القابضة", "B Investments Holding", "Financial Services", ShariahStatus.NEEDS_REVIEW),
     StockMeta("EKHO.CA", "القابضة المصرية الكويتية", "Egyptian Kuwaiti Holding", "Conglomerate", ShariahStatus.NEEDS_REVIEW),
     StockMeta("LCSW.CA", "ليسيكو مصر", "Lecico Egypt", "Industrials", ShariahStatus.NEEDS_REVIEW),
+    # --- Expanded 2026-09-09: full EGX30 + liquid EGX70 coverage (54 total).
+    # Tier A (main.py team universe, traded daily): bare-ticker names (no
+    # fabricated company data), NEEDS_REVIEW, neutral "General" sector.
+    StockMeta("ATQA.CA", "ATQA", "ATQA", "General", ShariahStatus.NEEDS_REVIEW),
+    StockMeta("EALR.CA", "EALR", "EALR", "General", ShariahStatus.NEEDS_REVIEW),
+    StockMeta("ELWA.CA", "ELWA", "ELWA", "General", ShariahStatus.NEEDS_REVIEW),
+    StockMeta("ETRS.CA", "ETRS", "ETRS", "General", ShariahStatus.NEEDS_REVIEW),
+    StockMeta("GBCO.CA", "GBCO", "GBCO", "General", ShariahStatus.NEEDS_REVIEW),
+    # Tier B (liquid EGX70 leaders, best-effort symbols): validated live by the
+    # liquidity prescreen each cycle; dead symbols are auto-skipped + logged.
+    # Send verified names/sectors to upgrade any entry from bare ticker.
+    StockMeta("MASR.CA", "MASR", "MASR", "Real Estate", ShariahStatus.NEEDS_REVIEW),
+    StockMeta("CIEB.CA", "CIEB", "CIEB", "Banking", ShariahStatus.NEEDS_REVIEW),
+    StockMeta("HDBK.CA", "HDBK", "HDBK", "Banking", ShariahStatus.NEEDS_REVIEW),
+    StockMeta("TAQA.CA", "TAQA", "TAQA", "Oil & Gas", ShariahStatus.NEEDS_REVIEW),
+    StockMeta("AJWA.CA", "AJWA", "AJWA", "Food & Beverage", ShariahStatus.NEEDS_REVIEW),
+    StockMeta("ACGC.CA", "ACGC", "ACGC", "Industrials", ShariahStatus.NEEDS_REVIEW),
+    StockMeta("DICE.CA", "DICE", "DICE", "Industrials", ShariahStatus.NEEDS_REVIEW),
+    StockMeta("OCDI.CA", "OCDI", "OCDI", "Real Estate", ShariahStatus.NEEDS_REVIEW),
+    StockMeta("AMER.CA", "AMER", "AMER", "Real Estate", ShariahStatus.NEEDS_REVIEW),
+    StockMeta("ACTF.CA", "ACTF", "ACTF", "Financial Services", ShariahStatus.NEEDS_REVIEW),
+    StockMeta("CCAP.CA", "CCAP", "CCAP", "Conglomerate", ShariahStatus.NEEDS_REVIEW),
 ]
 
 _REGISTRY: Dict[str, StockMeta] = {meta.symbol: meta for meta in _STOCKS}
