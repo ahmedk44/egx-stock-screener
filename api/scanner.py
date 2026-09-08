@@ -198,7 +198,7 @@ def _scanner_max_lag() -> int:
         return 2
 
 
-def _fetch_live_quote(symbol: str, allow_delayed: bool = False) -> Tuple[Optional[float], str, Optional[str]]:
+def _fetch_live_quote(symbol: str, allow_delayed: bool = False, allow_tv: bool = False, tv_hint: Optional[Dict[str, Any]] = None, allow_oanor: bool = False, oanor_hint: Optional[Dict[str, Any]] = None) -> Tuple[Optional[float], str, Optional[str]]:
     """Live execution price: fast_info.last_price primary, 1m ticker fallback.
 
     Session validation: the supporting bar MUST belong to the CURRENT Cairo
@@ -209,6 +209,10 @@ def _fetch_live_quote(symbol: str, allow_delayed: bool = False) -> Tuple[Optiona
     latest daily close REGARDLESS of date, returned as
     (price, "delayed_daily", bar_date) so the card carries an explicit
     delayed-data badge. Never fabricates: the price IS a real traded close.
+
+    TV snapshot fallback (allow_tv): TradingView scanner quote, accepted ONLY
+    in-session (its response carries no timestamp). Sanity vs entry happens in
+    _publish_signal. tv_hint (pre-fetched dict) avoids per-ticker POSTs.
     """
     try:
         import yfinance as yf  # type: ignore
@@ -243,6 +247,45 @@ def _fetch_live_quote(symbol: str, allow_delayed: bool = False) -> Tuple[Optiona
                         return round(px, 2), "intraday_1m", str(today)
         except Exception:
             pass
+        # oanor live quote (documented multi-ticker API + P/E, session-gated).
+        # Preferred over TV: richer fields + quota observability. TV stays as
+        # the free backup below; delayed-daily (known-old) comes last.
+        if allow_oanor:
+            hint = oanor_hint if isinstance(oanor_hint, dict) else None
+            if hint is None:
+                try:
+                    from egx_quant.utils.oanor_client import fetch_oanor_quotes
+                    hint = fetch_oanor_quotes([symbol]).get(symbol.upper())
+                except Exception:
+                    hint = None
+            if hint:
+                try:
+                    px = float(hint.get("price"))
+                    if is_market_open() and math.isfinite(px) and px > 0:
+                        print(f"[CRON][SCANNER][OANOR-QUOTE] {symbol} {px:.2f} (pe {hint.get('pe_ratio')})")
+                        return round(px, 2), "oanor", "live"
+                except Exception:
+                    pass
+            print(f"[CRON][SCANNER][OANOR-QUOTE] {symbol} unavailable - continuing to next source")
+        # TV snapshot fallback (session-only: TV responses carry no timestamp,
+        # so out-of-session quotes are indistinguishable from frozen ones).
+        if allow_tv:
+            hint = tv_hint if isinstance(tv_hint, dict) else None
+            if hint is None:
+                try:
+                    from egx_quant.utils.tv_fallback import fetch_tv_quotes
+                    hint = fetch_tv_quotes([symbol]).get(symbol.upper())
+                except Exception:
+                    hint = None
+            if hint:
+                try:
+                    px = float(hint.get("price"))
+                    if is_market_open() and math.isfinite(px) and px > 0:
+                        print(f"[CRON][SCANNER][TV-QUOTE] {symbol} {px:.2f} (change {hint.get('change_pct')})")
+                        return round(px, 2), "tv", "live"
+                except Exception:
+                    pass
+            print(f"[CRON][SCANNER][TV-QUOTE] {symbol} unavailable - continuing to next source")
         # Delayed fallback: latest daily close with explicit as-of date
         if allow_delayed:
             try:
@@ -324,6 +367,10 @@ TRACK_SCALP_MAX_SL = 0.035
 TRACK_SCALP_MAX_T1 = 0.04
 TRACK_INVEST_MIN_TQI = 8.0
 TRACK_INVEST_MIN_T3 = 0.12
+# Absurd P/E ceiling for the invest track (EGX large-cap context): a TQI>=8
+# wide-target setup with higher P/E is demoted to swing (anti-hype guard).
+# None (unknown) never blocks - only a KNOWN absurd value demotes.
+TRACK_INVEST_MAX_PE = 15.0
 
 # Per-track channel env chains (first set var wins). Missing track channel
 # falls back to the scalping channel - a signal is never dropped for routing.
@@ -334,13 +381,14 @@ TRACK_CHANNEL_ENVS: Dict[str, tuple] = {
 }
 
 
-def classify_track(entry: Any, stop: Any, t1: Any, t3: Any, tqi: Any) -> str:
+def classify_track(entry: Any, stop: Any, t1: Any, t3: Any, tqi: Any, pe: Any = None) -> str:
     """Dynamic track from the REALIZED signal fingerprint (pure, testable).
 
-    invest:     TQI >= 8.0 with wide third target (>= +12%) - exceptional quality.
+    invest:     TQI >= 8.0 with wide third target (>= +12%) and sane P/E
+                (None = unknown, never blocks; > 15 demotes to swing).
     scalping:   tight stop (<= 3.5%) with close first target (<= 4%) - fast setup.
     swing:      default balanced profile (Donchian confluence standard).
-    invest is checked first (quality dominates speed). Unknown/garbage -> swing.
+    invest is checked first (quality dominates speed).
     """
     try:
         e = float(entry)
@@ -350,6 +398,18 @@ def classify_track(entry: Any, stop: Any, t1: Any, t3: Any, tqi: Any) -> str:
         tq = float(tqi)
     except Exception:
         return "swing"
+    try:
+        pe_v = float(pe) if pe is not None else None
+    except Exception:
+        pe_v = None
+    if tq >= TRACK_INVEST_MIN_TQI and t3_d >= TRACK_INVEST_MIN_T3:
+        if pe_v is not None and pe_v > TRACK_INVEST_MAX_PE:
+            print(f"[CRON][SCANNER] TRACK demote: invest blocked by absurd P/E {pe_v} -> swing")
+            return "swing"
+        return "investment"
+    if sl_d <= TRACK_SCALP_MAX_SL and t1_d <= TRACK_SCALP_MAX_T1:
+        return "scalping"
+    return "swing"
     if tq >= TRACK_INVEST_MIN_TQI and t3_d >= TRACK_INVEST_MIN_T3:
         return "investment"
     if sl_d <= TRACK_SCALP_MAX_SL and t1_d <= TRACK_SCALP_MAX_T1:
@@ -572,6 +632,10 @@ def _publish_signal(
     risk: "Any",
     dry_run: bool,
     allow_delayed: bool = False,
+    allow_tv: bool = False,
+    tv_map: Optional[Dict[str, Any]] = None,
+    allow_oanor: bool = False,
+    oanor_map: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Dispatch one approved plan: market gate -> Live Price Guard -> reprice -> track -> card -> dispatch.
 
@@ -579,16 +643,17 @@ def _publish_signal(
       0. MARKET HOURS GATE: if is_market_open() is False the live dispatch is
          IMMEDIATELY ABORTED — no Telegram/Supabase signal emission after close.
       1. Dedup: skip when an ACTIVE/TRACKING signal already exists for the ticker.
-      2. Live Price Guard: fetch a real-time quote (fast_info.last_price / 1m
-         fallback, same-session validated). If the live price already moved beyond
-         TP1 or dropped >1% below the calculated entry, the signal is DISCARDED
-         as stale (EXPIRED_ENTRY).
+      2. Live Price Guard: strict Yahoo quote (fast_info / 1m, same-session),
+         then oanor snapshot, then TV snapshot (both session-gated + sanity
+         banded), then delayed-daily (badged). EXPIRED_ENTRY discards stale
+         entries; phantom prints are rejected.
       3. Dynamic reprice: entry is re-anchored to the LIVE price and SL/TP1/TP2/TP3
          are recalculated from it (official RiskManager + fib_targets).
       4. Dynamic track classification from the realized fingerprint
-         (invest: TQI>=8 & wide T3; scalping: tight SL & close T1; else swing).
+         (invest: TQI>=8 & wide T3 & sane P/E; scalping: tight SL & close T1;
+         else swing).
       5. Official Signal Card Formatter (real Shariah status + explicit track
-         badge) and per-track channel broadcast + Supabase upsert.
+         badge + price-source badge) and per-track channel broadcast + Supabase upsert.
     """
     from egx_quant.core.risk_engine import atr as atr_fn
     from egx_quant.core.strategy_engine import fib_targets, impulse_swings
@@ -618,7 +683,12 @@ def _publish_signal(
     # 2) Live Price Guard — entry must match the CURRENT live price, not a lagging bar.
     # Delayed mode (allow_delayed): accept the latest daily close with an
     # explicit as-of date; the card carries a delayed-data badge.
-    live_price, quote_source, quote_asof = _fetch_live_quote(ticker, allow_delayed=allow_delayed)
+    live_price, quote_source, quote_asof = _fetch_live_quote(
+        ticker, allow_delayed=allow_delayed, allow_tv=allow_tv,
+        tv_hint=(tv_map or {}).get(ticker) if tv_map else None,
+        allow_oanor=allow_oanor,
+        oanor_hint=(oanor_map or {}).get(ticker) if oanor_map else None,
+    )
     if live_price is None or live_price <= 0:
         outcome["guard"] = f"skipped-no-live-quote ({quote_source})"
         print(f"[CRON][SCANNER] {ticker} no valid live quote ({quote_source}) - publish skipped (cannot validate entry)")
@@ -637,6 +707,17 @@ def _publish_signal(
         outcome["guard"] = f"EXPIRED_ENTRY (live {live_price} dropped >1% below calculated entry {calc_entry:.2f})"
         print(f"[CRON][SCANNER] {ticker} DISCARDED: {outcome['guard']}")
         return outcome
+    # Phantom-print guard for non-Yahoo sources (oanor / tv / delayed_daily):
+    # reject quotes deviating wildly from the calculated entry.
+    if quote_source in ("oanor", "tv", "delayed_daily"):
+        try:
+            from egx_quant.utils.tv_fallback import tv_quote_sane
+            if not tv_quote_sane(live_price, calc_entry):
+                outcome["guard"] = f"phantom-reject ({quote_source} {live_price} vs entry {calc_entry:.2f})"
+                print(f"[CRON][SCANNER] {ticker} DISCARDED: {outcome['guard']}")
+                return outcome
+        except Exception:
+            pass
 
     # 3) Dynamic reprice — SL/TP1-3 recalculated from the CURRENT LIVE price
     df = rec.get("df")
@@ -672,10 +753,19 @@ def _publish_signal(
         f"tp1={plan.target_1} tp2={plan.target_2} tp3={plan.target_3} rr_tp1={_rr_ratio(plan)}"
     )
 
-    # 4) Dynamic track classification from the REALIZED fingerprint (TQI + SL/TP profile)
-    track = classify_track(plan.entry_price, plan.stop_loss, plan.target_1, plan.target_3, plan.tqi_score)
+    # 4) Dynamic track classification from the REALIZED fingerprint (TQI + SL/TP
+    # profile + P/E when oanor provided it). Absurd P/E demotes invest->swing.
+    pe_ratio = None
+    try:
+        _pq = (oanor_map or {}).get(ticker) or {}
+        _pev = _pq.get("pe_ratio")
+        pe_ratio = float(_pev) if _pev is not None else None
+    except Exception:
+        pe_ratio = None
+    rec["pe_ratio"] = pe_ratio
+    track = classify_track(plan.entry_price, plan.stop_loss, plan.target_1, plan.target_3, plan.tqi_score, pe=pe_ratio)
     rec["track"] = track
-    print(f"[CRON][SCANNER] TRACK {ticker}: {track} (tqi={plan.tqi_score} rr_tp1={_rr_ratio(plan)})")
+    print(f"[CRON][SCANNER] TRACK {ticker}: {track} (tqi={plan.tqi_score} rr_tp1={_rr_ratio(plan)} pe={pe_ratio})")
 
     # 5) Official Signal Card Formatter — real Shariah status + explicit track badge
     card = notifier.format_channel_broadcast(plan, 0, trade_track=track)
@@ -684,6 +774,10 @@ def _publish_signal(
             f"\n⚠️ دخول محسوب على سعر متأخر (آخر تحديث {rec.get('quote_asof') or 'غير معروف'}) - "
             f"راجع السعر الحالي قبل التنفيذ."
         )
+    if quote_source == "tv":
+        card += "\n⚠️ تم التحقق من السعر عبر TradingView (لحظي) - راجع السعر الحالي قبل التنفيذ."
+    if quote_source == "oanor":
+        card += "\n⚠️ تم التحقق من السعر عبر oanor (لحظي) - راجع السعر الحالي قبل التنفيذ."
     markup = build_join_markup(0, clean_ticker(plan.symbol))
     if dry_run:
         print(f"[CRON][SCANNER][DRY-RUN][TELEGRAM PAYLOAD] {ticker}")
@@ -895,11 +989,30 @@ def run_scan_pipeline(dry_run: bool = False) -> Dict[str, Any]:
         print(f"[CRON][SCANNER][ERROR] TelegramNotifier unavailable: {exc}")
         notifier = None
 
+    # oanor pre-fetch (ONE batched call for all candidates; skipped when empty).
+    # TV hints resolve per ticker inside _fetch_live_quote (few candidates).
+    oanor_map: Dict[str, Any] = {}
+    allow_oanor = False
+    try:
+        from egx_quant.utils.oanor_client import oanor_enabled, fetch_oanor_quotes
+        allow_oanor = bool(oanor_enabled())
+    except Exception:
+        pass
+    if allow_oanor and all_records:
+        try:
+            oanor_map = fetch_oanor_quotes([rec["ticker"] for rec in all_records])
+            if oanor_map:
+                print(f"[CRON][SCANNER] oanor pre-fetch resolved {len(oanor_map)} quote(s)")
+        except Exception as e_oa:
+            print(f"[CRON][SCANNER][WARN] oanor pre-fetch failed: {e_oa}")
+            oanor_map = {}
+    result["allow_oanor"] = allow_oanor
+
     for rec in all_records:
         if notifier is None:
             outcome: Dict[str, Any] = {"ticker": rec["ticker"], "guard": "skipped-no-notifier", "supabase": "skipped", "telegram": "skipped"}
         else:
-            outcome = _publish_signal(rec, shariah, notifier, risk, dry_run, allow_delayed=allow_delayed)
+            outcome = _publish_signal(rec, shariah, notifier, risk, dry_run, allow_delayed=allow_delayed, allow_oanor=allow_oanor, oanor_map=oanor_map)
         plan = rec["plan"]
         result["signals"].append({
             "ticker": rec["ticker"],
@@ -912,6 +1025,7 @@ def run_scan_pipeline(dry_run: bool = False) -> Dict[str, Any]:
             "quote_source": rec.get("quote_source"),
             "delayed": bool(rec.get("delayed_quote", False)),
             "price_asof": rec.get("quote_asof"),
+            "pe_ratio": rec.get("pe_ratio"),
             "stop_loss": plan.stop_loss,
             "target_1": plan.target_1,
             "target_2": plan.target_2,

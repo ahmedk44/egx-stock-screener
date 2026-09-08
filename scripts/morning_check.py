@@ -208,6 +208,35 @@ def check_telegram():
         note("CAUTION", f"getMe failed: {e}")
 
 
+def check_oanor():
+    print("--- 6) oanor EGX API (quote fallback) ---")
+    key = (os.environ.get("OANOR_API_KEY") or "").strip()
+    if not key:
+        note("CAUTION", "OANOR_API_KEY not set - Yahoo->TV chain only (set key to enable oanor fallback)")
+        return
+    if requests is None:
+        note("CAUTION", "requests missing - cannot probe oanor")
+        return
+    try:
+        r = requests.get("https://api.oanor.com/egx-api/v1/quote",
+                         headers={"x-oanor-key": key}, params={"codes": "COMI"},
+                         timeout=20)
+        if r.status_code == 200:
+            try:
+                px = ((r.json().get("data", {}) or {}).get("quotes", []) or [{}])[0].get("price")
+            except Exception:
+                px = "?"
+            note("OK", f"oanor key live (COMI={px} EGP, quota left={r.headers.get('x-quota-remaining', '?')})")
+        elif r.status_code == 402:
+            note("BLOCKER", "oanor 402: key not subscribed to EGX API (subscribe on oanor.com)")
+        elif r.status_code == 429:
+            note("CAUTION", "oanor 429: quota exhausted - TV fallback covers quotes")
+        else:
+            note("CAUTION", f"oanor HTTP {r.status_code} - TV fallback covers quotes")
+    except Exception as e:
+        note("CAUTION", f"oanor probe failed: {e}")
+
+
 def main():
     print("=" * 64)
     print("EGX pre-session readiness check (read-only)")
@@ -217,6 +246,7 @@ def main():
     check_crons()
     check_endpoints()
     check_telegram()
+    check_oanor()
     print("=" * 64)
     blockers = [m for lv, m in FINDINGS if lv == "BLOCKER"]
     cautions = [m for lv, m in FINDINGS if lv == "CAUTION"]

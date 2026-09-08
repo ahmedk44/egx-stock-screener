@@ -110,6 +110,10 @@ def _cfg() -> Optional[Tuple[str, str]]:
 # Reuse common price helper
 from egx_quant.news.common import fetch_current_price_yfinance  # type: ignore
 
+# Session gate + sanity math for fallback quotes (all standalone, no cycles)
+from egx_quant.utils.egx_calendar import is_market_open  # type: ignore
+from egx_quant.utils.tv_fallback import tv_quote_sane  # type: ignore (generic ±band math)
+
 # Reuse telegram notifier
 from egx_quant.utils.telegram_notifier import TelegramNotifier, clean_ticker  # type: ignore
 
@@ -638,6 +642,38 @@ def _get_active_signals_from_supabase() -> List[Dict[str, Any]]:
     return []
 
 
+def _refresh_derived(row: Dict[str, Any]) -> None:
+    """Recompute pnl/targets_hit/sl_hit from row's current_price (in place).
+
+    Single source of truth for trigger math (target >= level*0.98, SL breach
+    at <= stop*1.002). Used both by the initial enrich pass and after a
+    fallback price resolves.
+    """
+    try:
+        e = row.get("entry_price")
+        cur = row.get("current_price")
+        stop = row.get("stop_loss")
+        targets = row.get("targets") or []
+        pnl = None
+        if e and cur and e != 0:
+            try:
+                pnl = (cur - e) / e * 100
+            except Exception:
+                pnl = 0
+        row["pnl_pct"] = pnl
+        hits: List[int] = []
+        for idx, tv in enumerate(targets, start=1):
+            try:
+                if cur is not None and cur >= tv * 0.98:
+                    hits.append(idx)
+            except Exception:
+                continue
+        row["targets_hit"] = hits
+        row["sl_hit"] = bool(stop is not None and cur is not None and cur <= stop * 1.002)
+    except Exception as ex:
+        logger.warning(f"Derived refresh failed: {ex}")
+
+
 def fetch_active_signals_enriched(limit: int = 50) -> List[Dict[str, Any]]:
     """Fetch active trades and enrich with live prices + PnL."""
     raw = _get_active_signals_from_supabase()
@@ -666,11 +702,10 @@ def fetch_active_signals_enriched(limit: int = 50) -> List[Dict[str, Any]]:
                         targets.append(float(sig.get(k)))
                     except Exception:
                         continue
-            # Fetch live price
+            # Fetch live price (Yahoo primary; oanor/TV fallbacks resolved below, batched)
             current = fetch_current_price_yfinance(ticker)
-            if current is None and entry_f is not None:
-                current = entry_f  # neutral fallback
-            # PnL
+            price_source = "yahoo" if current is not None else None
+            # PnL / hits computed now for Yahoo prices; recomputed if a fallback resolves
             pnl_pct = None
             if entry_f and current and entry_f != 0:
                 try:
@@ -697,6 +732,7 @@ def fetch_active_signals_enriched(limit: int = 50) -> List[Dict[str, Any]]:
                 "stop_loss": stop_f,
                 "targets": targets,
                 "current_price": current,
+                "price_source": price_source,
                 "pnl_pct": pnl_pct,
                 "targets_hit": targets_hit,
                 "sl_hit": sl_hit,
@@ -707,6 +743,49 @@ def fetch_active_signals_enriched(limit: int = 50) -> List[Dict[str, Any]]:
         except Exception as e:
             logger.warning(f"Enrich failed for {sig.get('ticker')}: {e}")
             continue
+
+    # Batched fallback chain for Yahoo-missed tickers: oanor -> TV.
+    # Both gated on session hours (responses carry limited/no timestamps) and a
+    # sanity band vs each trade's own entry; final neutral fallback = entry.
+    needy = [i for i, r in enumerate(enriched) if r.get("current_price") is None]
+    if needy:
+        needy_tickers = [enriched[i]["ticker"] for i in needy]
+        oanor_map: Dict[str, Any] = {}
+        tv_map: Dict[str, Any] = {}
+        try:
+            from egx_quant.utils.oanor_client import fetch_oanor_quotes
+            oanor_map = fetch_oanor_quotes(needy_tickers)
+        except Exception as e:
+            logger.warning(f"[PRICE] oanor fallback failed: {e}")
+        still = [t for t in needy_tickers if t not in oanor_map]
+        if still:
+            try:
+                from egx_quant.utils.tv_fallback import fetch_tv_quotes
+                tv_map = fetch_tv_quotes(still)
+            except Exception as e:
+                logger.warning(f"[PRICE] tv fallback failed: {e}")
+        try:
+            in_session = bool(is_market_open())
+        except Exception:
+            in_session = False
+        for i in needy:
+            row = enriched[i]
+            resolved = False
+            for src, mp in (("oanor", oanor_map), ("tv", tv_map)):
+                try:
+                    px = (mp.get(row["ticker"]) or {}).get("price")
+                    if px is not None and in_session and tv_quote_sane(px, row.get("entry_price")):
+                        row["current_price"] = float(px)
+                        row["price_source"] = src
+                        _refresh_derived(row)
+                        logger.info(f"[PRICE] {row['ticker']} resolved via {src} @ {px:.2f}")
+                        resolved = True
+                        break
+                except Exception:
+                    continue
+            if not resolved and row.get("entry_price") is not None:
+                row["current_price"] = row["entry_price"]  # neutral fallback
+                _refresh_derived(row)
     return enriched
 
 
