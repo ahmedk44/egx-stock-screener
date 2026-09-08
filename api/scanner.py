@@ -6,7 +6,7 @@ Triggered by:
   - GitHub Actions runner.yml schedule (fallback, */15 7-11 * * 0-4)
 
 Pipeline (official project modules only — no hardcoded logic):
-  a. Ticker ingestion    : StocksRegistry.all_symbols() (26 registered EGX stocks)
+  a. Ticker ingestion    : StocksRegistry.all_symbols() (31 registered EGX stocks)
   b. Shariah transparency: ALL tickers processed (non-compliant / needs-review are
                            NOT dropped); the real status (✅ متوافق / ⚠️ يحتاج مراجعة /
                            ❌ غير متوافق) is featured on the official Telegram card
@@ -137,18 +137,59 @@ def _bar_session_date(ts: "Any") -> Optional["Any"]:
         return None
 
 
-def _fetch_live_quote(symbol: str) -> Tuple[Optional[float], str]:
+def _sessions_lag(bar_date: "Any", today: "Any") -> int:
+    """Trading-session lag (Sun-Thu) between a bar date and today.
+
+    Weekends (Fri/Sat) are not sessions and never count. Unknown dates -> 999
+    (fail-closed). Sep-6 bar on Sep-8 session = lag 2 (Mon 7 + Tue 8).
+    """
+    try:
+        if bar_date is None or today is None:
+            return 999
+        if bar_date >= today:
+            return 0
+        from datetime import timedelta
+        lag, day = 0, bar_date + timedelta(days=1)
+        while day <= today:
+            if day.weekday() in (6, 0, 1, 2, 3):  # Sun-Thu EGX sessions
+                lag += 1
+            day += timedelta(days=1)
+        return lag
+    except Exception:
+        return 999
+
+
+def _scanner_max_lag() -> int:
+    """Max tolerated bar lag for EVALUATION (SCANNER_MAX_BAR_LAG, default 2).
+
+    0 = strict same-session only (old behavior). Publishing additionally
+    requires a live quote (or an explicitly badged delayed quote).
+    """
+    try:
+        v = int((os.environ.get("SCANNER_MAX_BAR_LAG") or "2").strip())
+        return max(0, min(5, v))
+    except Exception:
+        return 2
+
+
+def _fetch_live_quote(symbol: str, allow_delayed: bool = False) -> Tuple[Optional[float], str, Optional[str]]:
     """Live execution price: fast_info.last_price primary, 1m ticker fallback.
 
     Session validation: the supporting bar MUST belong to the CURRENT Cairo
     session date. Stale bars from yesterday or pre-open placeholders return
-    (None, reason) so the candidate is dropped immediately.
+    (None, reason, None) so the candidate is dropped immediately.
+
+    Delayed mode (allow_delayed): when the strict path fails, fall back to the
+    latest daily close REGARDLESS of date, returned as
+    (price, "delayed_daily", bar_date) so the card carries an explicit
+    delayed-data badge. Never fabricates: the price IS a real traded close.
     """
     try:
         import yfinance as yf  # type: ignore
     except Exception as exc:
-        return None, f"yfinance-unavailable: {exc}"
+        return None, f"yfinance-unavailable: {exc}", None
     today = now_cairo().date()
+    daily = None
     try:
         t = yf.Ticker(symbol)
         # Primary: fast_info.last_price, validated against the latest daily bar date
@@ -160,8 +201,9 @@ def _fetch_live_quote(symbol: str) -> Tuple[Optional[float], str]:
             try:
                 d = t.history(period="5d", interval="1d", auto_adjust=False)
                 if d is not None and not d.empty:
+                    daily = d
                     if _bar_session_date(d.index[-1]) == today:
-                        return round(fi_price, 2), "fast_info"
+                        return round(fi_price, 2), "fast_info", str(today)
             except Exception:
                 pass
         # Fallback: 1m intraday last close (self-timestamped)
@@ -172,13 +214,30 @@ def _fetch_live_quote(symbol: str) -> Tuple[Optional[float], str]:
                 if not closes.empty and _bar_session_date(hist.index[-1]) == today:
                     px = float(closes.iloc[-1])
                     if math.isfinite(px) and px > 0:
-                        return round(px, 2), "intraday_1m"
+                        return round(px, 2), "intraday_1m", str(today)
         except Exception:
             pass
+        # Delayed fallback: latest daily close with explicit as-of date
+        if allow_delayed:
+            try:
+                d = daily
+                if d is None:
+                    d = t.history(period="5d", interval="1d", auto_adjust=False)
+                if d is not None and not d.empty:
+                    closes = d["Close"].dropna()
+                    if not closes.empty:
+                        asof = _bar_session_date(d.index[-1])
+                        px = float(closes.iloc[-1])
+                        if math.isfinite(px) and px > 0:
+                            print(f"[CRON][SCANNER][DELAYED-QUOTE] {symbol} using daily close {px:.2f} as of {asof}")
+                            return round(px, 2), "delayed_daily", str(asof)
+            except Exception:
+                pass
+            return None, "delayed-unavailable", None
     except Exception as exc:
         print(f"[CRON][SCANNER][WARN] live quote fetch failed for {symbol}: {exc}")
-        return None, "fetch-error"
-    return None, "stale-or-pre-open (no same-session bar)"
+        return None, "fetch-error", None
+    return None, "stale-or-pre-open (no same-session bar)", None
 
 
 def _has_active_signal(ticker: str) -> bool:
@@ -239,6 +298,7 @@ def _run_strategy_batch(
     strategy: "Any",
     risk: "Any",
     stats: Optional[Dict[str, Any]] = None,
+    max_lag: int = 0,
 ) -> Tuple[List[Dict[str, Any]], int, List[Dict[str, Any]]]:
     """Run the official StrategyEngine + RiskManager over one batch frame.
 
@@ -246,8 +306,10 @@ def _run_strategy_batch(
     technical computation (default-deny). Returns (records, evaluated_count,
     near_misses) — near_misses carry live values for tickers that met 2/3
     confluence checks but failed the strict entry criteria.
-    When `stats` is provided it is filled with {"stale": n, "stale_dates": [...]}
-    for the data-feed freeze monitor (item: silent Yahoo freezes).
+
+    Delayed-data mode (max_lag > 0): bars up to max_lag sessions old are
+    EVALUATED (never fabricated); stats["delayed_eval"] counts them and the
+    published card carries an explicit delayed-data badge.
     """
     import math
     import pandas as pd  # type: ignore
@@ -275,8 +337,9 @@ def _run_strategy_batch(
             # Same-day validation: the latest bar MUST belong to the CURRENT
             # Cairo session date. Yesterday's bar / pre-open placeholder = stale.
             bar_date = _bar_session_date(df.index[-1])
-            if bar_date != now_cairo().date():
-                print(f"[CRON][SCANNER][STALE-FRAME] {ticker} last bar {bar_date} != session {now_cairo().date()} - candidate dropped")
+            lag = _sessions_lag(bar_date, now_cairo().date())
+            if lag > max_lag:
+                print(f"[CRON][SCANNER][STALE-FRAME] {ticker} last bar {bar_date} (lag {lag} sessions) != session {now_cairo().date()} - candidate dropped")
                 if stats is not None:
                     stats["stale"] = int(stats.get("stale", 0) or 0) + 1
                     try:
@@ -284,6 +347,9 @@ def _run_strategy_batch(
                     except Exception:
                         pass
                 continue
+            if lag > 0 and stats is not None:
+                stats["delayed_eval"] = int(stats.get("delayed_eval", 0) or 0) + 1
+                print(f"[CRON][SCANNER][DELAYED-EVAL] {ticker} bar {bar_date} (lag {lag}) - evaluating with delayed badge")
             evaluated += 1
             signal = strategy.evaluate(ticker, df)
             if signal is None:
@@ -361,6 +427,7 @@ def _publish_signal(
     notifier: "Any",
     risk: "Any",
     dry_run: bool,
+    allow_delayed: bool = False,
 ) -> Dict[str, Any]:
     """Dispatch one approved plan: market gate -> Live Price Guard -> reprice -> card -> dispatch.
 
@@ -402,14 +469,18 @@ def _publish_signal(
         print(f"[CRON][SCANNER] {ticker} already has an ACTIVE signal - publish skipped (dedup)")
         return outcome
 
-    # 2) Live Price Guard — entry must match the CURRENT live price, not a lagging bar
-    live_price, quote_source = _fetch_live_quote(ticker)
+    # 2) Live Price Guard — entry must match the CURRENT live price, not a lagging bar.
+    # Delayed mode (allow_delayed): accept the latest daily close with an
+    # explicit as-of date; the card carries a delayed-data badge.
+    live_price, quote_source, quote_asof = _fetch_live_quote(ticker, allow_delayed=allow_delayed)
     if live_price is None or live_price <= 0:
         outcome["guard"] = f"skipped-no-live-quote ({quote_source})"
         print(f"[CRON][SCANNER] {ticker} no valid live quote ({quote_source}) - publish skipped (cannot validate entry)")
         return outcome
     rec["live_price"] = live_price
     rec["quote_source"] = quote_source
+    rec["quote_asof"] = quote_asof
+    rec["delayed_quote"] = (quote_source == "delayed_daily")
     calc_entry = float(plan.entry_price)
     tp1 = float(plan.target_1 or 0)
     if tp1 > 0 and live_price > tp1:
@@ -457,6 +528,11 @@ def _publish_signal(
 
     # 4) Official Signal Card Formatter — real Shariah status featured on the card
     card = notifier.format_channel_broadcast(plan, 0)
+    if rec.get("delayed_quote"):
+        card += (
+            f"\n⚠️ دخول محسوب على سعر متأخر (آخر تحديث {rec.get('quote_asof') or 'غير معروف'}) - "
+            f"راجع السعر الحالي قبل التنفيذ."
+        )
     markup = build_join_markup(0, clean_ticker(plan.symbol))
     if dry_run:
         print(f"[CRON][SCANNER][DRY-RUN][TELEGRAM PAYLOAD] {ticker}")
@@ -562,6 +638,14 @@ def run_scan_pipeline(dry_run: bool = False) -> Dict[str, Any]:
     all_records: List[Dict[str, Any]] = []
     all_near_misses: List[Dict[str, Any]] = []
     scan_stats: Dict[str, Any] = {}  # stale-frame census for the feed-freeze monitor
+    # Delayed-data mode: evaluate bars up to max_lag sessions old (SCANNER_MAX_BAR_LAG,
+    # default 2). 0 = strict same-session only. Publishing still requires a live
+    # quote, or an explicitly badged delayed quote.
+    max_lag = _scanner_max_lag()
+    allow_delayed = max_lag > 0
+    result["max_bar_lag"] = max_lag
+    if max_lag > 0:
+        print(f"[CRON][SCANNER] delayed-data mode ON: evaluating bars up to {max_lag} session(s) old (badged)")
     for idx, batch in enumerate(batches, start=1):
         t0 = datetime.now(timezone.utc)
         try:
@@ -576,7 +660,7 @@ def run_scan_pipeline(dry_run: bool = False) -> Dict[str, Any]:
                 auto_adjust=True,
             )
             b_secs = (datetime.now(timezone.utc) - t0).total_seconds()
-            records, evaluated, near_misses = _run_strategy_batch(batch, data, strategy, risk, stats=scan_stats)
+            records, evaluated, near_misses = _run_strategy_batch(batch, data, strategy, risk, stats=scan_stats, max_lag=max_lag)
             all_records.extend(records)
             all_near_misses.extend(near_misses)
             result["batches"].append({
@@ -596,6 +680,7 @@ def run_scan_pipeline(dry_run: bool = False) -> Dict[str, Any]:
     print(f"[CRON][SCANNER] evaluation complete: {result['evaluated']} evaluated, {len(all_records)} signal(s)")
     stale_total = int(scan_stats.get("stale", 0) or 0)
     result["stale_frames"] = stale_total
+    result["delayed_eval"] = int(scan_stats.get("delayed_eval", 0) or 0)
     # DATA-FEED FREEZE MONITOR: a silent Yahoo freeze drops the whole universe
     # (evaluated=0) with zero signals and zero errors. Page the admin instead
     # of staying silent (throttled to one alert per day by _notify_admin).
@@ -640,7 +725,7 @@ def run_scan_pipeline(dry_run: bool = False) -> Dict[str, Any]:
         if notifier is None:
             outcome: Dict[str, Any] = {"ticker": rec["ticker"], "guard": "skipped-no-notifier", "supabase": "skipped", "telegram": "skipped"}
         else:
-            outcome = _publish_signal(rec, shariah, notifier, risk, dry_run)
+            outcome = _publish_signal(rec, shariah, notifier, risk, dry_run, allow_delayed=allow_delayed)
         plan = rec["plan"]
         result["signals"].append({
             "ticker": rec["ticker"],
@@ -650,6 +735,8 @@ def run_scan_pipeline(dry_run: bool = False) -> Dict[str, Any]:
             "entry_source": rec.get("entry_source", "daily_close"),
             "live_price": rec.get("live_price"),
             "quote_source": rec.get("quote_source"),
+            "delayed": bool(rec.get("delayed_quote", False)),
+            "price_asof": rec.get("quote_asof"),
             "stop_loss": plan.stop_loss,
             "target_1": plan.target_1,
             "target_2": plan.target_2,

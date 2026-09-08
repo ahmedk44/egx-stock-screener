@@ -318,7 +318,13 @@ def fetch_active_signals(limit: int = 10) -> List[Dict[str, Any]]:
     return []
 
 def fetch_current_price_yfinance(ticker: str) -> Optional[float]:
-    """Fetch latest closing price via yfinance for a ticker, with fallbacks."""
+    """Fetch latest closing price via yfinance for a ticker, fail-closed on stale feed.
+
+    Bars more than MONITOR_PRICE_MAX_LAG sessions old return None (the monitor
+    treats None as neutral: no SL/target/trailing events). Mild session-boundary
+    lag (<=1) is tolerated so normal mornings keep working; deep freezes go
+    silent instead of acting on old prices as "current".
+    """
     if yf is None:
         return None
     try:
@@ -331,6 +337,15 @@ def fetch_current_price_yfinance(ticker: str) -> Optional[float]:
             hist.columns = [c[0] if isinstance(c, tuple) else c for c in hist.columns]
         if "Close" not in hist.columns:
             return None
+        try:
+            _ts = hist.index[-1]
+            _ts = _ts.to_pydatetime() if hasattr(_ts, "to_pydatetime") else _ts
+            _bar = _ts.date()
+            if _sessions_lag_common(_bar, cairo_today()) > MONITOR_PRICE_MAX_LAG:
+                logger.info(f"[STALE-PRICE] {ticker}: last bar {_bar} - returning None (fail-closed)")
+                return None
+        except Exception:
+            pass
         close = float(hist["Close"].iloc[-1])
         if not math.isfinite(close) or close <= 0:
             return None
@@ -338,6 +353,30 @@ def fetch_current_price_yfinance(ticker: str) -> Optional[float]:
     except Exception as e:
         logger.debug(f"yfinance fetch for {ticker} failed: {e}")
         return None
+
+
+# Monitor price safety: max tolerated bar lag (sessions) before fail-closed.
+# 1 = normal session-boundary lag OK (e.g. Thursday bars on Sunday morning);
+# deeper freezes return None so the monitor NEVER closes/alerts on old prices.
+MONITOR_PRICE_MAX_LAG = 1
+
+
+def _sessions_lag_common(bar_date, today) -> int:
+    """Trading-session lag (Sun-Thu) between two dates. Unknown -> 999."""
+    try:
+        if bar_date is None or today is None:
+            return 999
+        if bar_date >= today:
+            return 0
+        from datetime import timedelta
+        lag, day = 0, bar_date + timedelta(days=1)
+        while day <= today:
+            if day.weekday() in (6, 0, 1, 2, 3):  # Sun-Thu EGX sessions
+                lag += 1
+            day += timedelta(days=1)
+        return lag
+    except Exception:
+        return 999
 
 def enrich_active_signals_with_prices(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """For each active signal, fetch current price and compute pnl_pct and status_summary.

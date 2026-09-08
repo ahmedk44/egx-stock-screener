@@ -66,6 +66,14 @@ _STOCKS: List[StockMeta] = [
     StockMeta("DOMT.CA", "دومتي للصناعات الغذائية", "Arabian Food Industries (Domty)", "Food & Beverage", ShariahStatus.COMPLIANT),
     StockMeta("JUFO.CA", "جهينة للصناعات الغذائية", "Juhayna Food Industries", "Food & Beverage", ShariahStatus.NEEDS_REVIEW),
     StockMeta("SUGR.CA", "دلتا للسكر", "Delta Sugar", "Food & Beverage", ShariahStatus.COMPLIANT),
+    # --- Expanded 2026-09-08: liquid mid-caps from the news universe (main.TICKERS).
+    # Shariah flags follow the team's own EGX33 list (FAIT/ORWE/EFIH COMPLIANT);
+    # CERA/MCRO are NEEDS_REVIEW (not vetted yet - shown honestly on cards).
+    StockMeta("CERA.CA", "سيراميكا ريماس", "Ceramica Remas", "Industrials", ShariahStatus.NEEDS_REVIEW),
+    StockMeta("MCRO.CA", "ماكرو جروب للأدوية", "Macro Group Pharmaceuticals", "Pharmaceuticals", ShariahStatus.NEEDS_REVIEW),
+    StockMeta("ORWE.CA", "الشرقية للسجاد", "Oriental Weavers", "Industrials", ShariahStatus.COMPLIANT),
+    StockMeta("FAIT.CA", "بنك فيصل الإسلامي", "Faisal Islamic Bank", "Banking", ShariahStatus.COMPLIANT),
+    StockMeta("EFIH.CA", "إي فاينانس للاستثمارات المالية والرقمنة", "e-finance", "Technology", ShariahStatus.COMPLIANT),
 ]
 
 _REGISTRY: Dict[str, StockMeta] = {meta.symbol: meta for meta in _STOCKS}
