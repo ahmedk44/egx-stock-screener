@@ -369,31 +369,18 @@ def enrich_active_signals_with_prices(signals: List[Dict[str, Any]]) -> List[Dic
     return enriched
 
 def format_active_signals_section(enriched: List[Dict[str, Any]]) -> str:
-    """Legacy format - kept for backward compat. New code should use format_context_aware_section."""
+    """Legacy format - aggregate only (per-trade details never go public).
+
+    Kept for backward compat. New code should use format_context_aware_section.
+    """
     header = "🎯 **متابعة أسهم المنظومة والمحفظة | Active Signals Tracker:**"
     if not enriched:
         return f"{header}\nلا توجد صفقات مفتوحة حالياً في المنظومة."
-    lines = [header]
-    for s in enriched:
-        ticker = s.get("ticker_bare") or s.get("ticker", "UNKNOWN").replace(".CA","")
-        strat = s.get("strategy_type", "")
-        # Map strategy to short label
-        strat_label = strat
-        if "scal" in strat.lower():
-            strat_label = "Scalp"
-        elif "swing" in strat.lower():
-            strat_label = "Swing"
-        elif "invest" in strat.lower():
-            strat_label = "Invest"
-        cur = s.get("current_price")
-        pnl = s.get("pnl_pct")
-        status = s.get("status_summary", "مستقر")
-        cur_str = f"{cur:.2f}" if isinstance(cur, (int,float)) else "-"
-        pnl_str = f"{pnl:+.2f}%" if isinstance(pnl, (int,float)) else "0.00%"
-        # Use emoji based on pnl
-        emoji = "🟢" if (pnl or 0) >= 0 else "🔴"
-        lines.append(f"• {emoji} {ticker} ({strat_label}): السعر الحالي {cur_str} EGP | نسبة التغير {pnl_str} | الحالة: {status}")
-    return "\n".join(lines)
+    return (
+        f"{header}\n"
+        f"🟢 الصفقات النشطة تحت المتابعة: {len(enriched)}\n"
+        "🔒 تفاصيل المتابعة تصل المشتركين في كل صفقة على الخاص فقط."
+    )
 
 
 # ==============================================================================
@@ -740,19 +727,14 @@ def format_context_aware_section(categories: Dict[str, List[Dict[str, Any]]]) ->
     if not active and not watchlist and not avoid:
         return f"{header}\nلا توجد صفقات مفتوحة حالياً في المنظومة."
 
-    # A. Active Trades Impact
+    # A. Active Trades Impact — PRIVACY: public bulletins NEVER list per-trade
+    # details (ticker / price / entry / targets). A trade followed by a single
+    # user must not be exposed to the whole channel. Publish only the aggregate
+    # count; each subscriber's full lifecycle reaches them privately via DMs.
     if active:
         lines.append("")
-        lines.append("🟢 **صفقاتنا النشطة (Active Trades Impact):**")
-        for a in active:
-            ticker = a.get("ticker", "UNKNOWN")
-            price = a.get("price")
-            price_str = f"{price:.2f}" if isinstance(price, (int, float)) else "-"
-            impact = a.get("impact", "محايد")
-            emoji = a.get("emoji", "⚖️")
-            reason = a.get("short_reason", "لا توجد تفاصيل")
-            # Format: • {ticker}: السعر {price} EGP | التأثير الأخبار: [إيجابي 🚀 / محايد ⚖️ / سلبي ⚠️] - {short_reason}
-            lines.append(f"• {ticker}: السعر {price_str} EGP | التأثير الأخبار: {impact} {emoji} - {reason}")
+        lines.append(f"🟢 الصفقات النشطة تحت المتابعة: {len(active)}")
+        lines.append("🔒 تفاصيل المتابعة (الدخول/الأهداف/الوقف) تصل المشتركين في كل صفقة على الخاص فقط.")
     # B. Incoming Setups
     if watchlist:
         lines.append("")

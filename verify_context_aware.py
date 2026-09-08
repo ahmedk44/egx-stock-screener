@@ -43,8 +43,11 @@ try:
     print(section)
     ok = True
     ok &= check("Header present", "متابعة أسهم المنظومة والفرص | System Signals & Opportunities" in section)
-    ok &= check("Active header", "صفقاتنا النشطة (Active Trades Impact):" in section)
-    ok &= check("Active bullet format", "COMI: السعر 95.50 EGP | التأثير الأخبار: إيجابي 🚀 - نتائج أعمال" in section)
+    ok &= check("Active aggregate count", "الصفقات النشطة تحت المتابعة: 2" in section)
+    ok &= check("Active privacy note", "على الخاص فقط" in section)
+    ok &= check("No ticker leak (COMI)", "COMI" not in section)
+    ok &= check("No price leak (95.50)", "95.50" not in section)
+    ok &= check("No per-trade impact line", "التأثير الأخبار:" not in section)
     ok &= check("Watchlist header", "أسهم تحت الرادار (Incoming Setups" in section)
     ok &= check("Watchlist bullet format", "ORAS: السبب: إفصاح عن عقد" in section and "تجهيز سيت أب اختراق/شراء" in section)
     ok &= check("Avoid header", "تحذيرات ومخاطر (Avoid Watchlist):" in section)
@@ -53,7 +56,7 @@ try:
     empty_watch = {"active": mock_categories["active"], "watchlist": [], "avoid": mock_categories["avoid"]}
     section2 = format_context_aware_section(empty_watch)
     check("Empty watchlist skipped", "أسهم تحت الرادار" not in section2)
-    check("Active still present when watchlist empty", "صفقاتنا النشطة" in section2)
+    check("Active still present when watchlist empty", "الصفقات النشطة تحت المتابعة" in section2)
     empty_all = {"active": [], "watchlist": [], "avoid": []}
     section3 = format_context_aware_section(empty_all)
     check("All empty shows no-active message", "لا توجد صفقات مفتوحة" in section3)
@@ -101,7 +104,7 @@ try:
         from egx_quant.news.common import format_context_aware_section
         sec = format_context_aware_section(categories)
         print(sec[:1000])
-        check("Section contains all 3 headers", "صفقاتنا النشطة" in sec and "أسهم تحت الرادار" in sec and "تحذيرات ومخاطر" in sec)
+        check("Section contains all 3 headers", "الصفقات النشطة تحت المتابعة" in sec and "أسهم تحت الرادار" in sec and "تحذيرات ومخاطر" in sec)
 except Exception as e:
     print(f"[FAIL] Build categories failed: {e}")
     import traceback
@@ -136,7 +139,7 @@ try:
     card = format_post_market_card(indices, gainers, losers, turnover, ai, active_signals=mock_enriched)
     # The card should contain the new header, not the old one
     check("Post-market card contains new header System Signals & Opportunities", "System Signals & Opportunities" in card)
-    check("Post-market card contains active bullet with news impact", "التأثير الأخبار:" in card)
+    check("Post-market card shows aggregate, no per-trade leak", "الصفقات النشطة تحت المتابعة" in card and "التأثير الأخبار:" not in card)
     check("Post-market card Telegram markdown compliance (no broken **)", card.count("**") % 2 == 0, f"** count {card.count('**')}")
     print(card[:1500])
     print("[PASS] Post-market bulletin with mock OK")
@@ -158,7 +161,7 @@ try:
     ]
     card2 = format_pre_market_card(g, c, news, ai2, active_signals=mock_enriched2)
     check("Pre-market card contains new header", "System Signals & Opportunities" in card2)
-    check("Pre-market card contains active impact", "التأثير الأخبار:" in card2)
+    check("Pre-market card shows aggregate, no per-trade leak", "الصفقات النشطة تحت المتابعة" in card2 and "التأثير الأخبار:" not in card2)
     check("Pre-market Telegram markdown", card2.count("**") % 2 == 0)
     print(card2[:1500])
     print("[PASS] Pre-market bulletin with mock OK")
@@ -174,11 +177,11 @@ try:
     cat = {"active": [{"ticker": "COMI", "price": 95, "impact": "إيجابي", "emoji": "🚀", "short_reason": "قوي"}], "watchlist": [], "avoid": []}
     sec = format_context_aware_section(cat)
     check("Empty watchlist skipped", "أسهم تحت الرادار" not in sec)
-    check("Active still shown", "صفقاتنا النشطة" in sec)
+    check("Active still shown", "الصفقات النشطة تحت المتابعة" in sec)
     # Only watchlist
     cat2 = {"active": [], "watchlist": [{"ticker": "ORAS", "positive_news_trigger": "عقد"}], "avoid": []}
     sec2 = format_context_aware_section(cat2)
-    check("Empty active skipped", "صفقاتنا النشطة" not in sec2)
+    check("Empty active skipped", "الصفقات النشطة تحت المتابعة" not in sec2)
     check("Watchlist shown", "أسهم تحت الرادار" in sec2)
     # All empty
     cat3 = {"active": [], "watchlist": [], "avoid": []}
