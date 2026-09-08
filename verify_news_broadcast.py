@@ -51,14 +51,17 @@ def main():
     print("\n--- Test 1: Post-Market Card Generation (Dry-run) ---")
     try:
         indices = fetch_indices_performance()
-        gainers, losers, turnover = fetch_top_movers()
+        gainers, losers, turnover, _movers_meta = fetch_top_movers()
         ai = generate_ai_sentiment(indices, gainers, losers, turnover)
         card = format_post_market_card(indices, gainers, losers, turnover, ai)
         print(f"Card preview (first 800 chars):\n{card[:800]}\n")
         ok = True
         ok &= check("Post-market title present", POST_MARKET_TITLE in card, POST_MARKET_TITLE)
         ok &= check("Contains ملخص إغلاق البورصة المصرية | Post-Market Bulletin", "ملخص إغلاق البورصة المصرية | Post-Market Bulletin" in card)
-        ok &= check("Contains أداء المؤشرات (EGX30/EGX70/EGX100)", "EGX30" in card and "EGX70" in card and "EGX100" in card)
+        _has_indices = "EGX30" in card and "EGX70" in card and "EGX100" in card
+        _has_delayed = "بيانات السوق متأخرة" in card
+        ok &= check("Indices live OR delayed-disclaimer (never fabricated)", _has_indices or _has_delayed, "EGX30/70/100 or delayed line")
+        ok &= check("No SYNTH tickers in card", "SYN" not in card and "سهم0" not in card and "سهم1" not in card)
         ok &= check("Contains أكبر الرابحين", "أكبر الرابحين" in card)
         ok &= check("Contains أكبر الخاسرين", "أكبر الخاسرين" in card)
         ok &= check("Contains الأعلى تداولاً", "الأعلى تداولاً" in card)

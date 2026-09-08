@@ -238,6 +238,7 @@ def _run_strategy_batch(
     data: "Any",
     strategy: "Any",
     risk: "Any",
+    stats: Optional[Dict[str, Any]] = None,
 ) -> Tuple[List[Dict[str, Any]], int, List[Dict[str, Any]]]:
     """Run the official StrategyEngine + RiskManager over one batch frame.
 
@@ -245,6 +246,8 @@ def _run_strategy_batch(
     technical computation (default-deny). Returns (records, evaluated_count,
     near_misses) — near_misses carry live values for tickers that met 2/3
     confluence checks but failed the strict entry criteria.
+    When `stats` is provided it is filled with {"stale": n, "stale_dates": [...]}
+    for the data-feed freeze monitor (item: silent Yahoo freezes).
     """
     import math
     import pandas as pd  # type: ignore
@@ -274,6 +277,12 @@ def _run_strategy_batch(
             bar_date = _bar_session_date(df.index[-1])
             if bar_date != now_cairo().date():
                 print(f"[CRON][SCANNER][STALE-FRAME] {ticker} last bar {bar_date} != session {now_cairo().date()} - candidate dropped")
+                if stats is not None:
+                    stats["stale"] = int(stats.get("stale", 0) or 0) + 1
+                    try:
+                        stats.setdefault("stale_dates", []).append(str(bar_date))
+                    except Exception:
+                        pass
                 continue
             evaluated += 1
             signal = strategy.evaluate(ticker, df)
@@ -552,6 +561,7 @@ def run_scan_pipeline(dry_run: bool = False) -> Dict[str, Any]:
     batches = [universe[i:i + BATCH_SIZE] for i in range(0, len(universe), BATCH_SIZE)]
     all_records: List[Dict[str, Any]] = []
     all_near_misses: List[Dict[str, Any]] = []
+    scan_stats: Dict[str, Any] = {}  # stale-frame census for the feed-freeze monitor
     for idx, batch in enumerate(batches, start=1):
         t0 = datetime.now(timezone.utc)
         try:
@@ -566,7 +576,7 @@ def run_scan_pipeline(dry_run: bool = False) -> Dict[str, Any]:
                 auto_adjust=True,
             )
             b_secs = (datetime.now(timezone.utc) - t0).total_seconds()
-            records, evaluated, near_misses = _run_strategy_batch(batch, data, strategy, risk)
+            records, evaluated, near_misses = _run_strategy_batch(batch, data, strategy, risk, stats=scan_stats)
             all_records.extend(records)
             all_near_misses.extend(near_misses)
             result["batches"].append({
@@ -584,6 +594,30 @@ def run_scan_pipeline(dry_run: bool = False) -> Dict[str, Any]:
             result["batches"].append({"batch": idx, "tickers": len(batch), "download_seconds": round(b_secs, 1), "error": str(exc)[:150]})
 
     print(f"[CRON][SCANNER] evaluation complete: {result['evaluated']} evaluated, {len(all_records)} signal(s)")
+    stale_total = int(scan_stats.get("stale", 0) or 0)
+    result["stale_frames"] = stale_total
+    # DATA-FEED FREEZE MONITOR: a silent Yahoo freeze drops the whole universe
+    # (evaluated=0) with zero signals and zero errors. Page the admin instead
+    # of staying silent (throttled to one alert per day by _notify_admin).
+    # NOTE: on genuine market holidays this also fires - the message says so.
+    if stale_total >= max(5, (len(universe) // 2) or 1) and not dry_run:
+        try:
+            from collections import Counter as _Counter
+            _dates = [d for d in (scan_stats.get("stale_dates") or []) if d and d != "None"]
+            top_date = _Counter(_dates).most_common(1)[0][0] if _dates else "unknown"
+        except Exception:
+            top_date = "unknown"
+        try:
+            from egx_quant.engine.trade_monitor import _notify_admin
+            _notify_admin(
+                "تجمد مصدر أسعار البورصة",
+                f"آخر شمعة يومية لأغلب الأسهم بتاريخ {top_date} بينما جلسة اليوم {now_cairo().date()} "
+                f"({stale_total}/{len(universe)} سهم مرفوض) - تقييم السكانر متوقف والنشرات قد تعرض بيانات متأخرة. "
+                f"تحقق من مصدر Yahoo (أو عطلة رسمية للسوق).",
+                throttle_key="feed-freeze",
+            )
+        except Exception as e_mon:
+            print(f"[CRON][SCANNER][WARN] freeze admin alert failed: {e_mon}")
     result["near_miss"] = all_near_misses
     for nm in all_near_misses:
         print(

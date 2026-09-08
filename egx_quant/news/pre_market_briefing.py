@@ -55,6 +55,10 @@ try:
         get_cairo_date_str,
         build_context_aware_categories,
         format_context_aware_section,
+        cairo_today,
+        fresh_bar_date,
+        note_bar_date,
+        freshness_line,
     )
 except ImportError:
     try:
@@ -67,6 +71,10 @@ except ImportError:
             get_cairo_date_str,
             build_context_aware_categories,
             format_context_aware_section,
+            cairo_today,
+            fresh_bar_date,
+            note_bar_date,
+            freshness_line,
         )
     except:
         check_already_published = lambda x: False  # type: ignore
@@ -77,6 +85,10 @@ except ImportError:
         build_context_aware_categories = lambda x, **kw: {"active": [], "watchlist": [], "avoid": []}  # type: ignore
         format_context_aware_section = lambda x: "🎯 **متابعة أسهم المنظومة والفرص | System Signals & Opportunities**\nلا توجد صفقات مفتوحة حالياً في المنظومة."  # type: ignore
         get_cairo_date_str = lambda: datetime.now().strftime("%Y-%m-%d")  # type: ignore
+        cairo_today = lambda: datetime.now().date()  # type: ignore
+        fresh_bar_date = lambda frame: (True, None)  # type: ignore
+        note_bar_date = lambda meta, bar_date: None  # type: ignore
+        freshness_line = lambda meta: ""  # type: ignore
 
 logger = logging.getLogger("egx_news.pre_market")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-7s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
@@ -133,13 +145,21 @@ def get_news_channel_id() -> Optional[str]:
     logger.info(f"No NEWS env set — using hard fallback NEWS_CHANNEL_ID={NEWS_FALLBACK} per spec")
     return NEWS_FALLBACK
 
-def fetch_global_cues() -> Dict[str, Dict[str, Any]]:
-    """Fetch global market cues via yfinance."""
+def fetch_global_cues(meta: Optional[Dict[str, Any]] = None) -> Dict[str, Dict[str, Any]]:
+    """Fetch global market cues via yfinance (NO FABRICATION).
+
+    Frames whose last bar is not the current session are dropped as stale;
+    when nothing fresh remains the dict stays empty (card shows the
+    delayed-data disclaimer). Optional `meta` gets
+    {"delayed": bool, "data_asof": str|None, "stale_dropped": int}.
+    """
+    if meta is not None:
+        meta.update({"delayed": False, "data_asof": None, "stale_dropped": 0})
     result: Dict[str, Dict[str, Any]] = {}
     if yf is None:
-        logger.warning("yfinance missing, synthetic global cues")
-        for name in GLOBAL_TICKERS:
-            result[name] = {"close": 5000, "change_pct": 0.3, "ticker": "SYNTH"}
+        logger.warning("yfinance missing - global cues omitted (no synthetic fill)")
+        if meta is not None:
+            meta["delayed"] = True
         return result
     import math
     for name, ticker in GLOBAL_TICKERS.items():
@@ -151,6 +171,14 @@ def fetch_global_cues() -> Dict[str, Dict[str, Any]]:
                 continue
             if hasattr(hist.columns, "levels"):
                 hist.columns = [c[0] if isinstance(c, tuple) else c for c in hist.columns]
+            fresh, bar_date = fresh_bar_date(hist)
+            note_bar_date(meta, bar_date)
+            if not fresh:
+                logger.warning(f"{name} {ticker}: stale bar {bar_date} - skipped (no synthetic fill)")
+                if meta is not None:
+                    meta["stale_dropped"] = int(meta.get("stale_dropped", 0) or 0) + 1
+                    meta["delayed"] = True
+                continue
             close = float(hist["Close"].iloc[-1])
             prev = float(hist["Close"].iloc[-2])
             if not math.isfinite(close) or not math.isfinite(prev) or prev == 0:
@@ -164,21 +192,24 @@ def fetch_global_cues() -> Dict[str, Dict[str, Any]]:
         except Exception as e:
             logger.warning(f"{name} {ticker} failed: {e}")
             continue
-    if not result:
-        for name in list(GLOBAL_TICKERS.keys())[:3]:
-            result[name] = {"ticker": "SYNTH", "close": 5000, "change_pct": 0.2}
+    if not result and meta is not None:
+        meta["delayed"] = True
     return result
 
-def fetch_commodities() -> Dict[str, Dict[str, Any]]:
-    """Fetch commodity updates (Gold, Oil, USD/EGP) via yfinance."""
+def fetch_commodities(meta: Optional[Dict[str, Any]] = None) -> Dict[str, Dict[str, Any]]:
+    """Fetch commodity updates (Gold, Oil, USD/EGP) via yfinance (NO FABRICATION).
+
+    Same contract as fetch_global_cues: stale frames dropped, missing keys stay
+    missing (card shows "لا توجد بيانات" + delayed disclaimer).
+    """
+    if meta is not None:
+        meta.update({"delayed": False, "data_asof": None, "stale_dropped": 0})
     result: Dict[str, Dict[str, Any]] = {}
     if yf is None:
-        logger.warning("yfinance missing, synthetic commodities")
-        return {
-            "Gold": {"close": 2650, "change_pct": 0.15, "ticker": "GC=F"},
-            "Oil WTI": {"close": 78.2, "change_pct": -0.3, "ticker": "CL=F"},
-            "USD/EGP": {"close": 50.85, "change_pct": 0.05, "ticker": "EGP=X"},
-        }
+        logger.warning("yfinance missing - commodities omitted (no synthetic fill)")
+        if meta is not None:
+            meta["delayed"] = True
+        return result
     # Gold
     import math as _math
     for name, ticker in COMMODITY_TICKERS.items():
@@ -189,6 +220,14 @@ def fetch_commodities() -> Dict[str, Dict[str, Any]]:
                 continue
             if hasattr(hist.columns, "levels"):
                 hist.columns = [c[0] if isinstance(c, tuple) else c for c in hist.columns]
+            fresh, bar_date = fresh_bar_date(hist)
+            note_bar_date(meta, bar_date)
+            if not fresh:
+                logger.warning(f"{name} {ticker}: stale bar {bar_date} - skipped (no synthetic fill)")
+                if meta is not None:
+                    meta["stale_dropped"] = int(meta.get("stale_dropped", 0) or 0) + 1
+                    meta["delayed"] = True
+                continue
             close = float(hist["Close"].iloc[-1])
             prev = float(hist["Close"].iloc[-2])
             if not _math.isfinite(close) or not _math.isfinite(prev) or prev == 0:
@@ -215,14 +254,8 @@ def fetch_commodities() -> Dict[str, Dict[str, Any]]:
         except Exception as e:
             logger.warning(f"{name} {ticker} failed: {e}")
             continue
-    # Ensure at least Gold, Oil, USD/EGP
-    if "Gold" not in result:
-        result["Gold"] = {"ticker": "GC=F", "close": 2650, "change_pct": 0.15}
-    if "Oil" not in result and "Oil Brent" not in result:
-        result["Oil"] = {"ticker": "CL=F", "close": 78.2, "change_pct": -0.3}
-    if "USD/EGP" not in result:
-        # Use synthetic but realistic
-        result["USD/EGP"] = {"ticker": "EGP=X", "close": 50.85, "change_pct": 0.05}
+    if not result and meta is not None:
+        meta["delayed"] = True
     return result
 
 def fetch_corporate_actions_and_news(max_items: int = 5) -> List[Dict[str, Any]]:
@@ -359,7 +392,9 @@ def format_pre_market_card(
     ai_summary: str,
     date_str: Optional[str] = None,
     active_signals: Optional[List[Dict[str, Any]]] = None,
+    market_meta: Optional[Dict[str, Any]] = None,
 ) -> str:
+    """Format pre-market card. market_meta adds the delayed-data disclaimer."""
     if not date_str:
         try:
             from zoneinfo import ZoneInfo
@@ -415,6 +450,7 @@ def format_pre_market_card(
         f"{PRE_MARKET_TITLE}\n"
         f"📅 **التاريخ:** {date_str} | ⏰ **قبل الافتتاح:** 08:30 بتوقيت القاهرة\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"{(freshness_line(market_meta) + chr(10)) if freshness_line(market_meta) else ''}"
         f"🌍 **الإشارات العالمية:**\n"
         f"{global_block}\n"
         f"\n"
@@ -486,8 +522,14 @@ def main(dry_run: bool = False, broadcast: bool = True) -> int:
         except Exception as e:
             logger.warning(f"Idempotency check failed (proceeding): {e}")
     try:
-        global_cues = fetch_global_cues()
-        commodities = fetch_commodities()
+        cues_meta: Dict[str, Any] = {}
+        comm_meta: Dict[str, Any] = {}
+        global_cues = fetch_global_cues(meta=cues_meta)
+        commodities = fetch_commodities(meta=comm_meta)
+        market_meta = {
+            "delayed": bool(cues_meta.get("delayed") or comm_meta.get("delayed")),
+            "data_asof": cues_meta.get("data_asof") or comm_meta.get("data_asof"),
+        }
         corporate_news = fetch_corporate_actions_and_news()
         ai_summary = generate_pre_market_ai_summary(global_cues, commodities, corporate_news)
         # Fetch active signals tracker
@@ -498,7 +540,7 @@ def main(dry_run: bool = False, broadcast: bool = True) -> int:
         except Exception as e:
             logger.warning(f"Active signals fetch failed: {e}")
             active_enriched = []
-        card = format_pre_market_card(global_cues, commodities, corporate_news, ai_summary, active_signals=active_enriched)
+        card = format_pre_market_card(global_cues, commodities, corporate_news, ai_summary, active_signals=active_enriched, market_meta=market_meta)
         print(card)
         if broadcast:
             ok = publish_to_news_channel(card, dry_run=dry_run)

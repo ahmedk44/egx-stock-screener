@@ -1,11 +1,12 @@
 name: Pre-Market News Scan
 
 on:
-  # PRIMARY: Vercel Cron 30 5 * * 0-4 -> /api/pre_market (verified firing via news_publish_log).
-  # GHA schedule restored 2026-09-02 as REDUNDANT fallback, staggered +15m after Vercel.
-  # Cross-platform idempotency: Supabase news_publish_log (check_already_published) skips if Vercel already published.
-  schedule:
-    - cron: "45 5 * * 0-4" # 05:45 UTC (08:45 Cairo) Sun-Thu — 15m after Vercel 05:30
+  # GHA SCHEDULE DISABLED (2026-09-08): the 05:45 UTC fallback + runner-queue
+  # delays produced duplicate bulletins alongside Vercel Cron (05:30) and the
+  # cron-job.org backup on /api/pre_market (shared news_publish_log guard still
+  # leaked across heterogeneous triggers). Triggers are now EXCLUSIVELY Vercel
+  # Cron + cron-job.org. Manual runs only.
+  # Previous: 45 5 * * 0-4 (05:45 UTC Sun-Thu, 15m after Vercel 05:30).
   workflow_dispatch:
 
 permissions:

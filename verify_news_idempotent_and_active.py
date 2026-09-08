@@ -88,7 +88,7 @@ try:
 
     # Post-market with active signals
     indices = fetch_indices_performance()
-    gainers, losers, turnover = fetch_top_movers()
+    gainers, losers, turnover, _movers_meta = fetch_top_movers()
     ai = generate_ai_sentiment(indices, gainers, losers, turnover)
     # Get enriched active
     from egx_quant.news.common import fetch_active_signals, enrich_active_signals_with_prices

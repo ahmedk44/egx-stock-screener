@@ -55,6 +55,10 @@ try:
         _verified_session_headlines,
         _is_sanctioned_ticker,
         LLM_GUARDRAILS_AR,
+        cairo_today,
+        fresh_bar_date,
+        note_bar_date,
+        freshness_line,
     )
 except ImportError:
     try:
@@ -70,6 +74,10 @@ except ImportError:
             _verified_session_headlines,
             _is_sanctioned_ticker,
             LLM_GUARDRAILS_AR,
+            cairo_today,
+            fresh_bar_date,
+            note_bar_date,
+            freshness_line,
         )
     except:
         check_already_published = lambda x: False  # type: ignore
@@ -80,6 +88,10 @@ except ImportError:
         build_context_aware_categories = lambda x, **kw: {"active": [], "watchlist": [], "avoid": []}  # type: ignore
         format_context_aware_section = lambda x: "🎯 **متابعة أسهم المنظومة والفرص | System Signals & Opportunities**\nلا توجد صفقات مفتوحة حالياً في المنظومة."  # type: ignore
         get_cairo_date_str = lambda: datetime.now().strftime("%Y-%m-%d")  # type: ignore
+        cairo_today = lambda: datetime.now().date()  # type: ignore
+        fresh_bar_date = lambda frame: (True, None)  # type: ignore
+        note_bar_date = lambda meta, bar_date: None  # type: ignore
+        freshness_line = lambda meta: ""  # type: ignore
         _verified_session_headlines = lambda h: list(h or [])  # type: ignore
         _is_sanctioned_ticker = lambda t: False  # type: ignore
         LLM_GUARDRAILS_AR = ""  # type: ignore
@@ -132,17 +144,24 @@ def get_news_channel_id() -> Optional[str]:
     logger.info(f"No NEWS env set — using hard fallback NEWS_CHANNEL_ID={NEWS_FALLBACK} per spec")
     return NEWS_FALLBACK
 
-def fetch_indices_performance() -> Dict[str, Dict[str, Any]]:
+def fetch_indices_performance(meta: Optional[Dict[str, Any]] = None) -> Dict[str, Dict[str, Any]]:
     """Fetch closing prices & performance for EGX30/EGX70/EGX100 via yfinance.
 
     Optimized: ONE batched yf.download for every candidate index ticker
     (threads=True) instead of sequential per-candidate Ticker.history calls.
+
+    NO FABRICATION: frames whose last bar is not the current Cairo session are
+    dropped as stale; indices with no fresh frame are OMITTED (never synthetic
+    constants). Optional `meta` is filled with
+    {"delayed": bool, "data_asof": str|None, "stale_dropped": int}.
     """
+    if meta is not None:
+        meta.update({"delayed": False, "data_asof": None, "stale_dropped": 0})
     result: Dict[str, Dict[str, Any]] = {}
     if yf is None:
-        logger.warning("yfinance not available, using synthetic indices")
-        for name in INDICES_MAP:
-            result[name] = {"close": 28000 + hash(name) % 5000, "prev_close": 27800 + hash(name) % 5000, "change_pct": 0.85, "volume": 0}
+        logger.warning("yfinance not available - indices omitted (no synthetic fill)")
+        if meta is not None:
+            meta["delayed"] = True
         return result
 
     # One batched download for all candidate index tickers
@@ -196,6 +215,14 @@ def fetch_indices_performance() -> Dict[str, Dict[str, Any]]:
                     else:
                         logger.warning(f"{idx_name} {ticker}: no history or insufficient data")
                     continue
+                fresh, bar_date = fresh_bar_date(frame)
+                note_bar_date(meta, bar_date)
+                if not fresh:
+                    logger.warning(f"{idx_name} {ticker}: stale bar {bar_date} - skipped (no synthetic fill)")
+                    if meta is not None:
+                        meta["stale_dropped"] = int(meta.get("stale_dropped", 0) or 0) + 1
+                        meta["delayed"] = True
+                    continue
                 close = float(frame["Close"].iloc[-1])
                 prev_close = float(frame["Close"].iloc[-2])
                 change_pct = (close - prev_close) / prev_close * 100 if prev_close else 0
@@ -208,26 +235,30 @@ def fetch_indices_performance() -> Dict[str, Dict[str, Any]]:
                 logger.warning(f"{idx_name} {ticker} failed: {e}")
                 continue
         if not fetched:
-            # Synthetic fallback for this index
-            logger.warning(f"{idx_name}: all tickers failed, using synthetic fallback")
-            base = {"EGX30": 28500, "EGX70": 6500, "EGX100": 9200}.get(idx_name, 10000)
-            result[idx_name] = {"ticker": "SYNTH", "close": float(base), "prev_close": float(base*0.9915), "change_pct": 0.85, "volume": 0}
+            # No fabrication: omit the index; the card shows the delayed-data
+            # disclaimer instead of synthetic constants.
+            logger.warning(f"{idx_name}: no fresh frame - omitted (no synthetic fill)")
+            if meta is not None:
+                meta["delayed"] = True
     return result
 
-def fetch_top_movers() -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+def fetch_top_movers() -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
     """Aggregate top gainers, top losers, highest turnover from TICKERS.
 
     Optimized: ONE batched yf.download for the whole universe (threads=True)
     instead of a sequential per-ticker Ticker.history loop (~20x fewer HTTP calls).
 
-    Returns (gainers, losers, turnover) each as list of dicts {symbol, name, close, change_pct, volume, turnover}
+    NO FABRICATION: only same-session bars are ranked; stale frames are dropped
+    and synthetic SYN* fills are gone. Returns (gainers, losers, turnover, meta)
+    with meta={"delayed": bool, "data_asof": str|None, "fresh": int, "stale_dropped": int}.
+    Empty buckets stay empty - the card renders "لا يوجد" + delayed disclaimer.
     """
     stocks: List[Dict[str, Any]] = []
+    movers_meta: Dict[str, Any] = {"delayed": False, "data_asof": None, "fresh": 0, "stale_dropped": 0}
     if yf is None:
-        logger.warning("yfinance missing, generating synthetic movers")
-        for i, t in enumerate(TICKERS[:10]):
-            change = (5 - i) * 1.2  # descending
-            stocks.append({"symbol": t, "name": STOCK_NAMES_AR.get(t, t), "close": 50 + i, "prev_close": 50, "change_pct": change, "volume": 1000000 - i*50000, "turnover": (50+i)*(1000000 - i*50000)})
+        logger.warning("yfinance missing - movers omitted (no synthetic fill)")
+        movers_meta["delayed"] = True
+        return [], [], [], movers_meta
     else:
         # Dedupe while preserving order (fallback TICKERS list may repeat entries)
         universe = list(dict.fromkeys(t.strip().upper() for t in TICKERS if t))
@@ -262,6 +293,12 @@ def fetch_top_movers() -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List
                     frame = frame.dropna(subset=["Close"])
                     if len(frame) < 2:
                         continue
+                    fresh, bar_date = fresh_bar_date(frame)
+                    note_bar_date(movers_meta, bar_date)
+                    if not fresh:
+                        movers_meta["stale_dropped"] = int(movers_meta.get("stale_dropped", 0) or 0) + 1
+                        logger.debug(f"{ticker}: stale bar {bar_date} - dropped from movers")
+                        continue
                     close = float(frame["Close"].iloc[-1])
                     prev_close = float(frame["Close"].iloc[-2])
                     if not prev_close or prev_close == 0:
@@ -287,25 +324,24 @@ def fetch_top_movers() -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List
             stocks = []
 
     if not stocks:
-        logger.warning("No stocks fetched, using synthetic fallback")
-        for i, t in enumerate(TICKERS[:6]):
-            change = (3 - i) * 0.8
-            stocks.append({"symbol": t, "name": STOCK_NAMES_AR.get(t, t), "close": 40 + i, "prev_close": 40, "change_pct": change, "volume": 500000, "turnover": (40+i)*500000})
+        logger.warning("No fresh stocks - movers omitted (no synthetic fill)")
+        movers_meta["delayed"] = True
 
     # Sort
     gainers = sorted([s for s in stocks if s["change_pct"] > 0], key=lambda x: x["change_pct"], reverse=True)[:5]
     losers = sorted([s for s in stocks if s["change_pct"] < 0], key=lambda x: x["change_pct"])[:5]
     turnover = sorted(stocks, key=lambda x: x["turnover"], reverse=True)[:5]
 
-    # Ensure at least 3 entries per category for formatting (fill with synthetic if needed)
-    if len(gainers) < 3:
-        gainers += [{"symbol": f"SYN{i}.CA", "name": f"سهم{i}", "close": 55, "change_pct": 2.5 - i*0.3, "volume": 800000, "turnover": 40000000} for i in range(3 - len(gainers))]
-    if len(losers) < 3:
-        losers += [{"symbol": f"SYN{i}.CA", "name": f"سهم{i}", "close": 35, "change_pct": -1.5 - i*0.3, "volume": 600000, "turnover": 20000000} for i in range(3 - len(losers))]
-    if len(turnover) < 3:
-        turnover += gainers[:3-len(turnover)]
+    # Empty buckets stay empty (the card renders "لا يوجد" + delayed disclaimer).
+    movers_meta["fresh"] = len(stocks)
+    try:
+        universe_n = len(universe)
+    except Exception:
+        universe_n = 0
+    if not stocks or int(movers_meta.get("stale_dropped", 0) or 0) >= max(3, (universe_n // 4) or 0):
+        movers_meta["delayed"] = True
 
-    return gainers, losers, turnover
+    return gainers, losers, turnover, movers_meta
 
 def generate_ai_sentiment(
     indices: Dict[str, Dict[str, Any]],
@@ -446,8 +482,13 @@ def format_post_market_card(
     ai_summary: str,
     date_str: Optional[str] = None,
     active_signals: Optional[List[Dict[str, Any]]] = None,
+    market_meta: Optional[Dict[str, Any]] = None,
 ) -> str:
-    """Format card with required title and sections, including Active Signals Tracker."""
+    """Format card with required title and sections, including Active Signals Tracker.
+
+    market_meta (from fetch_* metas): when delayed, a data-delayed disclaimer
+    is shown instead of letting empty/stale numbers pass as today's prices.
+    """
     if not date_str:
         try:
             from zoneinfo import ZoneInfo
@@ -516,6 +557,7 @@ def format_post_market_card(
         f"{POST_MARKET_TITLE}\n"
         f"📅 **التاريخ:** {date_str} | ⏰ **الإغلاق:** 15:30 بتوقيت القاهرة (النشرة الختامية)\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"{(freshness_line(market_meta) + chr(10)) if freshness_line(market_meta) else ''}"
         f"📊 **أداء المؤشرات:**\n"
         f"{idx_block}\n"
         f"\n"
@@ -731,11 +773,16 @@ def main(dry_run: bool = False, broadcast: bool = True) -> int:
     try:
         import time as _time
         _t_fetch = _time.monotonic()
-        indices = fetch_indices_performance()
+        indices_meta: Dict[str, Any] = {}
+        indices = fetch_indices_performance(meta=indices_meta)
         print(f"[TIMING] fetch_indices_performance: {_time.monotonic() - _t_fetch:.1f}s")
         _t_movers = _time.monotonic()
-        gainers, losers, turnover = fetch_top_movers()
+        gainers, losers, turnover, movers_meta = fetch_top_movers()
         print(f"[TIMING] fetch_top_movers: {_time.monotonic() - _t_movers:.1f}s")
+        market_meta = {
+            "delayed": bool(indices_meta.get("delayed") or movers_meta.get("delayed")),
+            "data_asof": movers_meta.get("data_asof") or indices_meta.get("data_asof"),
+        }
         _t_ai = _time.monotonic()
         ai_summary = generate_ai_sentiment(indices, gainers, losers, turnover)
         print(f"[TIMING] generate_ai_sentiment: {_time.monotonic() - _t_ai:.1f}s")
@@ -749,7 +796,7 @@ def main(dry_run: bool = False, broadcast: bool = True) -> int:
         except Exception as e:
             logger.warning(f"Active signals fetch failed: {e}")
             active_enriched = []
-        card = format_post_market_card(indices, gainers, losers, turnover, ai_summary, active_signals=active_enriched)
+        card = format_post_market_card(indices, gainers, losers, turnover, ai_summary, active_signals=active_enriched, market_meta=market_meta)
         print(card)
         if broadcast:
             ok = publish_to_news_channel(card, dry_run=dry_run)

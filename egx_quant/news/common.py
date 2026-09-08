@@ -59,6 +59,63 @@ def get_cairo_date_str() -> str:
         cairo = timezone(timedelta(hours=3))
         return datetime.now(cairo).strftime("%Y-%m-%d")
 
+# ---------------------------------------------------------------------------
+# Bulletin data-integrity helpers: session-date validation + delayed disclaimer.
+# NOTHING fabricated: stale frames are dropped (never synthetic constants),
+# and the card shows an explicit delayed-data line instead of fake numbers.
+# ---------------------------------------------------------------------------
+
+def cairo_today():
+    """Current session date in Africa/Cairo (datetime.date)."""
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo("Africa/Cairo")).date()
+    except Exception:
+        from datetime import timezone as _tz
+        return datetime.now(_tz.utc).date()
+
+
+def fresh_bar_date(frame) -> tuple:
+    """(is_fresh, bar_date): last-bar session vs Cairo today (scanner-grade rule)."""
+    try:
+        ts = frame.index[-1]
+        ts = ts.to_pydatetime() if hasattr(ts, "to_pydatetime") else ts
+        if getattr(ts, "tzinfo", None) is not None:
+            try:
+                from zoneinfo import ZoneInfo
+                bar_date = ts.astimezone(ZoneInfo("Africa/Cairo")).date()
+            except Exception:
+                bar_date = ts.date()
+        else:
+            # Naive index = exchange-local (yfinance daily convention)
+            bar_date = ts.date()
+        return (bar_date == cairo_today()), bar_date
+    except Exception:
+        return False, None
+
+
+def note_bar_date(meta, bar_date) -> None:
+    """Track the newest bar date seen (for the delayed-data disclaimer)."""
+    if not isinstance(meta, dict) or not bar_date:
+        return
+    try:
+        cur = str(meta.get("data_asof") or "")
+        if not cur or str(bar_date) > cur:
+            meta["data_asof"] = str(bar_date)
+    except Exception:
+        pass
+
+
+def freshness_line(meta) -> str:
+    """Public disclaimer when market data is delayed (else empty string)."""
+    try:
+        if isinstance(meta, dict) and meta.get("delayed"):
+            asof = meta.get("data_asof") or "غير معروف"
+            return f"⚠️ **بيانات السوق متأخرة** (آخر تحديث {asof}) - الأرقام أدناه للاسترشاد وليست أسعار اليوم."
+    except Exception:
+        pass
+    return ""
+
 def _read_local_log() -> List[Dict[str, Any]]:
     try:
         if os.path.exists(LOCAL_LOG_PATH):
