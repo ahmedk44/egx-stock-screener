@@ -1,9 +1,11 @@
 name: Real-Time Target & SL Monitor
 
 on:
-  # schedule: DISABLED — migrated to Vercel Cron / cron-job.org (see vercel.json crons & scripts/setup_cronjobs.py)
-  # Previous: */15 7-11 * * 0-4 → 07:00-11:30 UTC (10:00-14:30 Cairo / 11:00-15:30 Oman Sun-Thu) — now triggers via https://.../api/cron/scanner
-  # Keeping workflow_dispatch for manual runs only (prevents double-posting & GH queue delays)
+  # BACKUP SCHEDULE (re-enabled 2026-09-14): cron-job.org may fail silently.
+  # This runs every 15 minutes as fallback during EGX session.
+  # Primary schedule is cron-job.org */5 — see scripts/setup_cronjobs.py.
+  schedule:
+    - cron: "*/15 6-12 * * 0-4"  # Every 15 min, 06:00-12:00 UTC (09:00-15:00 Cairo) Sun-Thu
   workflow_dispatch:
 
 permissions:
