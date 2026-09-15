@@ -1,1 +1,68 @@
-[]
+[
+  {
+    "ticker": "COMI.CA",
+    "entry_price": 133.32000732421875,
+    "current_stop_loss": 122.65440673828125,
+    "target_1": 146.65200805664062,
+    "target_2": 159.9840087890625,
+    "target_3": 179.9820098876953,
+    "trade_track": "🏛️ استثمار طويل (Invest)",
+    "timestamp": "2026-09-15T12:46:40.795046+00:00",
+    "status": "PENDING"
+  },
+  {
+    "ticker": "EAST.CA",
+    "entry_price": 33.099998474121094,
+    "current_stop_loss": 30.45199859619141,
+    "target_1": 36.40999832153321,
+    "target_2": 39.71999816894531,
+    "target_3": 44.68499794006348,
+    "trade_track": "🏛️ استثمار طويل (Invest)",
+    "timestamp": "2026-09-15T12:46:52.804718+00:00",
+    "status": "PENDING"
+  },
+  {
+    "ticker": "HELI.CA",
+    "entry_price": 7.949999809265137,
+    "current_stop_loss": 7.472999820709228,
+    "target_1": 8.347499799728395,
+    "target_2": 8.74499979019165,
+    "target_3": 9.30149977684021,
+    "trade_track": "📈 تداول سوينغ (Swing)",
+    "timestamp": "2026-09-15T12:47:07.778636+00:00",
+    "status": "PENDING"
+  },
+  {
+    "ticker": "HRHO.CA",
+    "entry_price": 25.25,
+    "current_stop_loss": 23.23,
+    "target_1": 27.775000000000002,
+    "target_2": 30.299999999999997,
+    "target_3": 34.087500000000006,
+    "trade_track": "📈 تداول سوينغ (Swing)",
+    "timestamp": "2026-09-15T12:47:24.541037+00:00",
+    "status": "PENDING"
+  },
+  {
+    "ticker": "ISPH.CA",
+    "entry_price": 12.34000015258789,
+    "current_stop_loss": 11.35280014038086,
+    "target_1": 13.57400016784668,
+    "target_2": 14.808000183105468,
+    "target_3": 16.659000205993653,
+    "trade_track": "🏛️ استثمار طويل (Invest)",
+    "timestamp": "2026-09-15T12:47:39.339354+00:00",
+    "status": "PENDING"
+  },
+  {
+    "ticker": "PHDC.CA",
+    "entry_price": 14.0,
+    "current_stop_loss": 12.88,
+    "target_1": 15.400000000000002,
+    "target_2": 16.8,
+    "target_3": 18.900000000000002,
+    "trade_track": "📈 تداول سوينغ (Swing)",
+    "timestamp": "2026-09-15T12:47:54.201390+00:00",
+    "status": "PENDING"
+  }
+]
