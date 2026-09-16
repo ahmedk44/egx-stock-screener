@@ -64,5 +64,38 @@
     "trade_track": "📈 تداول سوينغ (Swing)",
     "timestamp": "2026-09-15T12:47:54.201390+00:00",
     "status": "PENDING"
+  },
+  {
+    "ticker": "ETEL.CA",
+    "entry_price": 132.0,
+    "current_stop_loss": 128.04,
+    "target_1": 135.29999999999998,
+    "target_2": 138.6,
+    "target_3": 142.56,
+    "trade_track": "⚡ مضاربة لحظية (Scalp)",
+    "timestamp": "2026-09-16T12:42:18.726294+00:00",
+    "status": "PENDING"
+  },
+  {
+    "ticker": "GBCO.CA",
+    "entry_price": 30.200000762939453,
+    "current_stop_loss": 28.388000717163084,
+    "target_1": 31.710000801086426,
+    "target_2": 33.2200008392334,
+    "target_3": 35.33400089263916,
+    "trade_track": "📈 تداول سوينغ (Swing)",
+    "timestamp": "2026-09-16T12:42:30.960310+00:00",
+    "status": "PENDING"
+  },
+  {
+    "ticker": "SKPC.CA",
+    "entry_price": 18.100000381469727,
+    "current_stop_loss": 17.01400035858154,
+    "target_1": 19.005000400543214,
+    "target_2": 19.9100004196167,
+    "target_3": 21.17700044631958,
+    "trade_track": "📈 تداول سوينغ (Swing)",
+    "timestamp": "2026-09-16T12:43:56.421019+00:00",
+    "status": "PENDING"
   }
 ]
