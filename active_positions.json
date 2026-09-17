@@ -97,5 +97,49 @@
     "trade_track": "📈 تداول سوينغ (Swing)",
     "timestamp": "2026-09-16T12:43:56.421019+00:00",
     "status": "PENDING"
+  },
+  {
+    "ticker": "BINV.CA",
+    "entry_price": 62.25,
+    "current_stop_loss": 60.3825,
+    "target_1": 63.80624999999999,
+    "target_2": 65.3625,
+    "target_3": 67.23,
+    "trade_track": "⚡ مضاربة لحظية (Scalp)",
+    "timestamp": "2026-09-17T12:40:34.999849+00:00",
+    "status": "PENDING"
+  },
+  {
+    "ticker": "CERA.CA",
+    "entry_price": 1.4700000286102295,
+    "current_stop_loss": 1.3818000268936157,
+    "target_1": 1.543500030040741,
+    "target_2": 1.6170000314712525,
+    "target_3": 1.7199000334739685,
+    "trade_track": "📈 تداول سوينغ (Swing)",
+    "timestamp": "2026-09-17T12:40:49.247652+00:00",
+    "status": "PENDING"
+  },
+  {
+    "ticker": "ORWE.CA",
+    "entry_price": 26.799999237060547,
+    "current_stop_loss": 25.191999282836914,
+    "target_1": 28.139999198913575,
+    "target_2": 29.479999160766603,
+    "target_3": 31.355999107360837,
+    "trade_track": "📈 تداول سوينغ (Swing)",
+    "timestamp": "2026-09-17T12:42:27.707100+00:00",
+    "status": "PENDING"
+  },
+  {
+    "ticker": "TMGH.CA",
+    "entry_price": 95.0,
+    "current_stop_loss": 87.4,
+    "target_1": 104.50000000000001,
+    "target_2": 114.0,
+    "target_3": 128.25,
+    "trade_track": "🏛️ استثمار طويل (Invest)",
+    "timestamp": "2026-09-17T12:43:17.308187+00:00",
+    "status": "PENDING"
   }
 ]
