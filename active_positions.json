@@ -141,5 +141,16 @@
     "trade_track": "🏛️ استثمار طويل (Invest)",
     "timestamp": "2026-09-17T12:43:17.308187+00:00",
     "status": "PENDING"
+  },
+  {
+    "ticker": "EALR.CA",
+    "entry_price": 385.010009765625,
+    "current_stop_loss": 361.9094091796875,
+    "target_1": 404.26051025390626,
+    "target_2": 423.5110107421875,
+    "target_3": 450.46171142578123,
+    "trade_track": "📈 تداول سوينغ (Swing)",
+    "timestamp": "2026-09-20T12:32:40.286160+00:00",
+    "status": "PENDING"
   }
 ]
