@@ -61,6 +61,64 @@ def clean_ticker(symbol: str) -> str:
     return s[:-3] if s.endswith(".CA") else s
 
 
+def build_fib_levels(swing_low: float, swing_high: float, entry: float) -> Dict[str, Any]:
+    """Pure helper: retracements + OTE zone + extensions from an impulse leg.
+
+    Retracements measured down from swing_high:
+      38.2% / 50% / 61.8% / 78.6%.
+    OTE golden zone = 50% .. 78.6% (ote_high=50%, ote_low=78.6%).
+    Extensions measured up from max(swing_high, entry):
+      0.618 / 1.0 / 1.618 (same ratios as StrategyEngine.fib_targets).
+    Never raises; returns {} on bad input.
+    """
+    try:
+        lo = float(swing_low)
+        hi = float(swing_high)
+        en = float(entry)
+        rng = hi - lo
+        if not (hi > lo > 0) or rng <= 0 or en <= 0:
+            return {}
+        base = max(hi, en)
+        return {
+            "swing_low": round(lo, 2),
+            "swing_high": round(hi, 2),
+            "ret_382": round(hi - 0.382 * rng, 2),
+            "ret_50": round(hi - 0.50 * rng, 2),
+            "ret_618": round(hi - 0.618 * rng, 2),
+            "ret_786": round(hi - 0.786 * rng, 2),
+            "ote_low": round(hi - 0.786 * rng, 2),
+            "ote_high": round(hi - 0.50 * rng, 2),
+            "ext_618": round(base + 0.618 * rng, 2),
+            "ext_100": round(base + 1.0 * rng, 2),
+            "ext_1618": round(base + 1.618 * rng, 2),
+        }
+    except Exception:
+        return {}
+
+
+def format_fib_block(fib: Optional[Dict[str, Any]], ote_in_zone: Optional[bool] = None) -> List[str]:
+    """Render Fibonacci levels block for Telegram cards (HTML). Empty list when no fib."""
+    if not isinstance(fib, dict) or not fib:
+        return []
+    try:
+        lines = [
+            CARD_SEP,
+            "📐 <b>مستويات فيبوناتشي (Fibonacci):</b>",
+            f"📉 <b>القاع/القمة:</b> {float(fib.get('swing_low', 0)):.2f} / {float(fib.get('swing_high', 0)):.2f} EGP",
+            f"🔻 <b>ارتداد 38.2%:</b> {float(fib.get('ret_382', 0)):.2f} | <b>50%:</b> {float(fib.get('ret_50', 0)):.2f}",
+            f"🔻 <b>ارتداد 61.8%:</b> {float(fib.get('ret_618', 0)):.2f} | <b>78.6%:</b> {float(fib.get('ret_786', 0)):.2f}",
+            f"⭐ <b>منطقة OTE الذهبية (50%-78.6%):</b> {float(fib.get('ote_low', 0)):.2f} - {float(fib.get('ote_high', 0)):.2f}",
+            f"🚀 <b>امتداد 0.618:</b> {float(fib.get('ext_618', 0)):.2f} | <b>1.0:</b> {float(fib.get('ext_100', 0)):.2f} | <b>1.618:</b> {float(fib.get('ext_1618', 0)):.2f}",
+        ]
+        if ote_in_zone is True:
+            lines.append("✅ <b>السعر داخل OTE الآن</b>")
+        elif ote_in_zone is False:
+            lines.append("ℹ️ <b>السعر خارج OTE</b>")
+        return lines
+    except Exception:
+        return []
+
+
 def build_join_markup(trade_id: int, ticker_bare: str) -> Dict[str, Any]:
     """Inline keyboard attaching 'Track Signal' to a channel broadcast."""
     return {
@@ -199,14 +257,16 @@ class TelegramNotifier:
         except:
             return "تحليل فني"
 
-    def format_channel_short_card(self, plan: RiskPlan, trade_id: int, trade_track: Optional[str] = None) -> List[str]:
+    def format_channel_short_card(self, plan: RiskPlan, trade_id: int, trade_track: Optional[str] = None, fib: Optional[Dict[str, Any]] = None, ote_in_zone: Optional[bool] = None) -> List[str]:
         """Professional public channel template with dynamic targets (2-4+).
 
         Header: 🚀 إشارة جديدة | {ticker} ({company_name})
-        Includes Shariah & Strategy, TQI/Grade, Technical Trigger, Execution Levels (dynamic targets), CTA.
+        Includes Shariah & Strategy, TQI/Grade, Technical Trigger, Execution Levels (dynamic targets),
+        Fibonacci levels block (when fib dict supplied), CTA.
         trade_track (optional): explicit track key ("scalping"/"swing"/"investment") -
         overrides inference so the card badge always matches the scanner's
         dynamic classification. Omitted = legacy inference behavior.
+        fib (optional): dict from build_fib_levels() - rendered as 📐 block.
         """
         bare = clean_ticker(plan.symbol)
         # Company name if registry available
@@ -307,6 +367,35 @@ class TelegramNotifier:
                 lines.append(f"🎯 <b>الهدف {ordinal}:</b> {tv:.2f} EGP")
         else:
             lines.append(f"🎯 <b>الهدف الأول:</b> - EGP")
+        # Fibonacci levels block (only when fib dict supplied; auto-fallback
+        # to plan-attached fib_* attributes for legacy callers).
+        try:
+            fib_dict = fib
+            ote_flag = ote_in_zone
+            if fib_dict is None:
+                for attr in ("fib", "fib_levels", "fibonacci"):
+                    v = getattr(plan, attr, None)
+                    if isinstance(v, dict) and v:
+                        fib_dict = v
+                        break
+                if fib_dict is None:
+                    sw_lo = getattr(plan, "swing_low", None)
+                    sw_hi = getattr(plan, "swing_high", None)
+                    if sw_lo is not None and sw_hi is not None:
+                        try:
+                            fib_dict = build_fib_levels(float(sw_lo), float(sw_hi), float(plan.entry_price))
+                        except Exception:
+                            fib_dict = None
+            if ote_flag is None:
+                for attr in ("ote_in_zone", "ote_zone", "in_ote"):
+                    v = getattr(plan, attr, None)
+                    if isinstance(v, bool):
+                        ote_flag = v
+                        break
+            if isinstance(fib_dict, dict) and fib_dict:
+                lines.extend(format_fib_block(fib_dict, ote_flag))
+        except Exception:
+            pass
         lines += [
             CARD_SEP,
             "👇 <b>اضغط الزر للمتابعة وتلقي التحديثات والتحليل المفصل في الخاص:</b>",
@@ -317,8 +406,8 @@ class TelegramNotifier:
         """Alias for format_channel_short_card - professional template."""
         return self.format_channel_short_card(plan, trade_id)
 
-    def format_channel_broadcast(self, plan: RiskPlan, trade_id: int, trade_track: Optional[str] = None) -> str:
-        return "\n".join(self.format_channel_short_card(plan, trade_id, trade_track=trade_track))
+    def format_channel_broadcast(self, plan: RiskPlan, trade_id: int, trade_track: Optional[str] = None, fib: Optional[Dict[str, Any]] = None, ote_in_zone: Optional[bool] = None) -> str:
+        return "\n".join(self.format_channel_short_card(plan, trade_id, trade_track=trade_track, fib=fib, ote_in_zone=ote_in_zone))
 
     def send_text(self, text: str, parse_mode: str = "HTML") -> bool:
         """Direct/private sends. NEVER touches the public channel - the channel
@@ -369,6 +458,8 @@ class TelegramNotifier:
         news_summary: Optional[str] = None,
         macro_analysis: Optional[str] = None,
         financial_analysis: Optional[str] = None,
+        fib: Optional[Dict[str, Any]] = None,
+        ote_in_zone: Optional[bool] = None,
     ) -> str:
         """Full private-DM entry card - dynamic targets + AI intelligence + buttons.
 
@@ -411,7 +502,10 @@ class TelegramNotifier:
             lines.append(f"💰 <b>التكلفة الإجمالية:</b> {allocated_cost:,.2f} EGP")
         if risk_amount is not None:
             lines.append(f"⚠️ <b>المخاطرة:</b> {risk_amount:,.2f} EGP")
-        lines.append(CARD_SEP)
+        if isinstance(fib, dict) and fib:
+            lines.extend(format_fib_block(fib, ote_in_zone))
+        else:
+            lines.append(CARD_SEP)
         # AI Intelligence blocks
         if news_summary and str(news_summary).strip():
             body = str(news_summary).strip()
@@ -437,10 +531,9 @@ class TelegramNotifier:
         lines += ["<i>تداول فوري (Spot) فقط - شراء ثم بيع</i>", CARD_SEP, "👇 استخدم الأزرار أدناه لمتابعة حالة الصفقة أو الخروج:"]
         return "\n".join(lines)
 
-    def format_buy_alert(self, plan: RiskPlan) -> str:
-        """Visual BUY signal card."""
-        return "\n".join(
-            [
+    def format_buy_alert(self, plan: RiskPlan, fib: Optional[Dict[str, Any]] = None, ote_in_zone: Optional[bool] = None) -> str:
+        """Visual BUY signal card (fib block appended when supplied)."""
+        base = [
                 "🟢 <b>[كارت إشارة شراء]</b>",
                 CARD_SEP,
                 "📊 <b>إشارة دخول جديدة | EGX Quant</b>",
@@ -449,6 +542,24 @@ class TelegramNotifier:
                 f"💵 <b>سعر الدخول:</b> {plan.entry_price:.2f} EGP",
                 f"🛑 <b>وقف الخسارة:</b> {plan.stop_loss:.2f} EGP",
                 f"🎯 <b>جني الأرباح:</b> {plan.take_profit:.2f} EGP",
+        ]
+        try:
+            if isinstance(fib, dict) and fib:
+                base.extend(format_fib_block(fib, ote_in_zone))
+            else:
+                sw_lo = getattr(plan, "swing_low", None)
+                sw_hi = getattr(plan, "swing_high", None)
+                if sw_lo is not None and sw_hi is not None:
+                    try:
+                        auto_fib = build_fib_levels(float(sw_lo), float(sw_hi), float(plan.entry_price))
+                        if auto_fib:
+                            ote = getattr(plan, "ote_in_zone", None)
+                            base.extend(format_fib_block(auto_fib, ote if isinstance(ote, bool) else None))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        base += [
                 CARD_SEP,
                 f"📦 <b>الكمية المقترحة:</b> {plan.quantity} سهم",
                 f"💰 <b>التكلفة الإجمالية:</b> {plan.allocated_cost:,.2f} EGP",
@@ -456,8 +567,8 @@ class TelegramNotifier:
                 f"📐 <b>التوزيع:</b> {plan.allocation_pct_of_portfolio * 100:.1f}% (سقف 20%)",
                 f"🕌 <b>الشريعة:</b> {self._shariah_flag(plan.symbol)}",
                 CARD_SEP,
-            ]
-        )
+        ]
+        return "\n".join(base)
 
     def format_exit_alert(
         self,

@@ -174,7 +174,9 @@ class StrategyEngine:
             return None
 
         don_high = float(donchian_high(high).iloc[-1])
-        vol_avg = float(sma(volume, DONCHIAN_PERIOD).iloc[-1])
+        # Prior-20 volume average (excludes current bar) — including the
+        # current print dilutes the spike ratio and silently kills scalps.
+        vol_avg = float(sma(volume, DONCHIAN_PERIOD).shift(1).iloc[-1])
         last_volume = float(volume.iloc[-1])
         rsi_series = rsi(close)
         last_rsi = float(rsi_series.iloc[-1])
@@ -184,7 +186,36 @@ class StrategyEngine:
             "volume": math.isfinite(vol_avg) and vol_avg > 0 and last_volume > VOLUME_SPIKE_MULT * vol_avg,
             "rsi": RSI_LOWER_BOUND < last_rsi < RSI_UPPER_BOUND,
         }
+        scalp_lite: Optional[TradeSignal] = None
         if not all(checks.values()):
+            # SCALP-LITE fallback (daily basics need volume): 2/3 confluence +
+            # relaxed momentum (RSI 52-78, price>SMA20, vol>1.3x) still emits a
+            # tighter scalp instead of nothing.
+            try:
+                sma20_val = float(sma(close, DONCHIAN_PERIOD).iloc[-1])
+                vol_relaxed = math.isfinite(vol_avg) and vol_avg > 0 and last_volume > 1.3 * vol_avg
+                rsi_mom = 52.0 < last_rsi < 78.0
+                above_trend = math.isfinite(sma20_val) and last_close > sma20_val
+                met = sum(checks.values())
+                if met >= 2 and vol_relaxed and rsi_mom and above_trend:
+                    scalp_lite = self._build_scalp_signal(sym, df, close, last_close, last_volume, vol_avg, rsi_series, last_rsi, reason="lite-2of3")
+                    if scalp_lite is not None:
+                        logger.info(
+                            "[STRATEGY] %s SCALP-LITE (2/3 + momentum) - BUY | TQI=%.1f targets=%.2f/%.2f/%.2f",
+                            sym, scalp_lite.tqi_score, scalp_lite.target_1, scalp_lite.target_2, scalp_lite.target_3,
+                        )
+                        return scalp_lite
+                # Pure momentum scalp even at 1/3 when trend+volume align
+                if scalp_lite is None and vol_relaxed and rsi_mom and above_trend and last_close > float(sma(close, 9).iloc[-1]):
+                    scalp_lite = self._build_scalp_signal(sym, df, close, last_close, last_volume, vol_avg, rsi_series, last_rsi, reason="momentum")
+                    if scalp_lite is not None:
+                        logger.info(
+                            "[STRATEGY] %s SCALP-MOMENTUM - BUY | TQI=%.1f",
+                            sym, scalp_lite.tqi_score,
+                        )
+                        return scalp_lite
+            except Exception as exc:
+                logger.debug("[STRATEGY] %s scalp-lite check failed: %s", sym, exc)
             logger.info(
                 "[STRATEGY] %s confluence: close=%.2f vs %.2f->%s | vol->%s | rsi=%.1f->%s",
                 sym, last_close, don_high, checks["donchian"], checks["volume"], last_rsi, checks["rsi"],
@@ -242,6 +273,59 @@ class StrategyEngine:
             sym, tqi, ote_ok, ob_hit, divergence, t1, t2, t3,
         )
         return signal
+
+    def _build_scalp_signal(self, sym: str, df: pd.DataFrame, close: pd.Series, last_close: float, last_volume: float, vol_avg: float, rsi_series: pd.Series, last_rsi: float, reason: str = "lite") -> Optional[TradeSignal]:
+        """Tighter scalp signal: closer fib extensions (0.382/0.618/1.0) for fast exits.
+
+        Never raises; returns None when sizing invalid or TQI < 5.0.
+        """
+        try:
+            from egx_quant.database.models import TradeSignal as _TS
+            atr_val = atr_of(df)
+            swing_low, swing_high = impulse_swings(df)
+            range_ = swing_high - swing_low
+            ote_ok = in_ote_zone(last_close, swing_high, range_)
+            ob_hit = order_block_touch(df)
+            divergence = bullish_rsi_divergence(df, rsi_series)
+            tqi = TQI_BASE
+            tqi += 1.0 if ote_ok else 0.25
+            tqi += 1.25 if ob_hit else 0.0
+            tqi += 1.25 if divergence else 0.5
+            tqi = round(min(tqi, 10.0), 1)
+            if tqi < TQI_MIN_THRESHOLD:
+                return None
+            # Tighter scalp targets: 0.382 / 0.618 / 1.0 extensions
+            base = max(swing_high, last_close)
+            unit = range_ if range_ > 0 else (atr_val if math.isfinite(atr_val) and atr_val > 0 else last_close * 0.02)
+            raw = [last_close + unit * m for m in (0.382, 0.618, 1.0)]
+            floor = last_close * 1.005
+            t1, t2, t3 = (round(max(v, floor), 2) for v in raw)
+            stop_loss = round(min(float(df["Low"].astype(float).iloc[-5:].min()) * 0.995, last_close * 0.985), 2)
+            stop_loss = max(stop_loss, 0.01)
+            vol_mult = (last_volume / vol_avg) if vol_avg else 0.0
+            return _TS(
+                symbol=sym,
+                strategy_tag=f"SCALP_MOMENTUM_{reason.upper()}",
+                entry_price=round(last_close, 2),
+                stop_loss=stop_loss,
+                take_profit=t3,
+                target_1=t1,
+                target_2=t2,
+                target_3=t3,
+                tqi_score=tqi,
+                ote_in_zone=ote_ok,
+                smc_ob_confluence=ob_hit,
+                rsi_divergence=divergence,
+                reason_en=(
+                    f"Scalp BUY ({reason}): price>trend RSI={last_rsi:.1f} vol {vol_mult:.1f}x; TQI={tqi}/10"
+                ),
+                reason_ar=(
+                    f"سكالب شرائي ({reason}): زخم لحظي RSI {last_rsi:.1f} وفوليوم {vol_mult:.1f}x؛ الجودة {tqi}/10"
+                ),
+            )
+        except Exception as exc:
+            logger.debug("[STRATEGY] %s scalp build failed: %s", sym, exc)
+            return None
 
 
 def atr_of(df: pd.DataFrame, period: int = RSI_PERIOD) -> float:

@@ -99,8 +99,26 @@ def _universe() -> List[str]:
     return symbols
 
 
+def _valid_secrets() -> tuple:
+    """Accepted endpoint secrets: CRON_SECRET + CRON_SECRET_NEW (rotation window).
+
+    Zero-downtime rotation: deploy this first, set CRON_SECRET_NEW in Vercel env,
+    move cron-job.org URLs to the new value, verify (?dry_run=1 probes), then
+    promote NEW -> CRON_SECRET and unset NEW. Either value is accepted meanwhile.
+    """
+    out = []
+    for var in ("CRON_SECRET", "CRON_SECRET_NEW"):
+        try:
+            v = (os.environ.get(var) or "").strip()
+        except Exception:
+            v = ""
+        if v and v not in out:
+            out.append(v)
+    return tuple(out)
+
+
 def _is_authorized(handler: BaseHTTPRequestHandler) -> tuple[bool, str]:
-    cron_secret = (os.environ.get("CRON_SECRET") or "").strip()
+    secrets = _valid_secrets()
     vercel_cron = handler.headers.get("x-vercel-cron") or handler.headers.get("X-Vercel-Cron")
     if vercel_cron == "1":
         return True, "x-vercel-cron"
@@ -110,18 +128,18 @@ def _is_authorized(handler: BaseHTTPRequestHandler) -> tuple[bool, str]:
         qs = parse_qs(parsed.query)
         for key in ("secret", "cron_secret", "CRON_SECRET", "token", "auth", "key"):
             vals = qs.get(key, [])
-            if vals and cron_secret and vals[0].strip() == cron_secret:
+            if vals and secrets and vals[0].strip() in secrets:
                 return True, f"query:{key}"
-            if vals and not cron_secret:
+            if vals and not secrets:
                 return True, f"query:{key} (no-secret)"
-        if cron_secret and parsed.query and cron_secret in parsed.query:
+        if secrets and parsed.query and any(s in parsed.query for s in secrets):
             return True, "query:raw"
     except Exception:
         pass
     auth = handler.headers.get("Authorization") or handler.headers.get("authorization") or ""
-    if cron_secret and auth.strip() == f"Bearer {cron_secret}":
+    if secrets and any(auth.strip() == f"Bearer {s}" for s in secrets):
         return True, "bearer"
-    if cron_secret:
+    if secrets:
         return False, "missing/invalid bearer (CRON_SECRET set) — use header Authorization: Bearer <CRON_SECRET> or query ?secret=<CRON_SECRET>"
     return True, "no-secret (open)"
 
@@ -361,10 +379,12 @@ def _rr_ratio(plan: "Any") -> Optional[float]:
     return None
 
 
-# Dynamic track classification thresholds (aligned with STRATEGY_PLAN in
-# main.py: scalp SL<=3.5%/T1<=4%, invest TQI>=8 & T3>=12%, else balanced swing).
-TRACK_SCALP_MAX_SL = 0.035
-TRACK_SCALP_MAX_T1 = 0.04
+# Dynamic track classification thresholds.
+# WIDENED for daily scalp basics: scalp SL<=5.0%/T1<=6% (was 3.5%/4% which
+# starved the scalp channel because fib targets are naturally wider).
+# Explicit SCALP_MOMENTUM tags from StrategyEngine always map to scalping.
+TRACK_SCALP_MAX_SL = 0.05
+TRACK_SCALP_MAX_T1 = 0.06
 TRACK_INVEST_MIN_TQI = 8.0
 TRACK_INVEST_MIN_T3 = 0.12
 # Absurd P/E ceiling for the invest track (EGX large-cap context): a TQI>=8
@@ -381,15 +401,22 @@ TRACK_CHANNEL_ENVS: Dict[str, tuple] = {
 }
 
 
-def classify_track(entry: Any, stop: Any, t1: Any, t3: Any, tqi: Any, pe: Any = None) -> str:
+def classify_track(entry: Any, stop: Any, t1: Any, t3: Any, tqi: Any, pe: Any = None, strategy_tag: Any = None) -> str:
     """Dynamic track from the REALIZED signal fingerprint (pure, testable).
 
     invest:     TQI >= 8.0 with wide third target (>= +12%) and sane P/E
                 (None = unknown, never blocks; > 15 demotes to swing).
-    scalping:   tight stop (<= 3.5%) with close first target (<= 4%) - fast setup.
+    scalping:   explicit SCALP tag wins; else tight stop (<=5%) with close
+                first target (<=6%) - fast setup for daily basics.
     swing:      default balanced profile (Donchian confluence standard).
-    invest is checked first (quality dominates speed).
+    invest is checked first (quality dominates speed), scalp-tag second.
     """
+    try:
+        tag = str(strategy_tag or "").upper()
+        if "SCALP" in tag:
+            return "scalping"
+    except Exception:
+        pass
     try:
         e = float(entry)
         sl_d = (e - float(stop)) / e if e else 1.0
@@ -406,11 +433,6 @@ def classify_track(entry: Any, stop: Any, t1: Any, t3: Any, tqi: Any, pe: Any = 
         if pe_v is not None and pe_v > TRACK_INVEST_MAX_PE:
             print(f"[CRON][SCANNER] TRACK demote: invest blocked by absurd P/E {pe_v} -> swing")
             return "swing"
-        return "investment"
-    if sl_d <= TRACK_SCALP_MAX_SL and t1_d <= TRACK_SCALP_MAX_T1:
-        return "scalping"
-    return "swing"
-    if tq >= TRACK_INVEST_MIN_TQI and t3_d >= TRACK_INVEST_MIN_T3:
         return "investment"
     if sl_d <= TRACK_SCALP_MAX_SL and t1_d <= TRACK_SCALP_MAX_T1:
         return "scalping"
@@ -563,7 +585,8 @@ def _run_strategy_batch(
                 volume = df["Volume"].astype(float)
                 last_close = float(close.iloc[-1])
                 don = float(donchian_high(high).iloc[-1])
-                vol_avg = float(sma_fn(volume, DONCHIAN_PERIOD).iloc[-1])
+                # Prior-20 avg (excludes current bar) — matches engine fix.
+                vol_avg = float(sma_fn(volume, DONCHIAN_PERIOD).shift(1).iloc[-1])
                 last_vol = float(volume.iloc[-1])
                 last_rsi = float(rsi_fn(close).iloc[-1])
                 last_sma20 = float(sma_fn(close, 20).iloc[-1])
@@ -722,12 +745,33 @@ def _publish_signal(
     # 3) Dynamic reprice — SL/TP1-3 recalculated from the CURRENT LIVE price
     df = rec.get("df")
     t1 = t2 = t3 = None
+    fib_dict: Dict[str, Any] = {}
+    ote_flag: Optional[bool] = None
+    try:
+        ote_flag = bool(getattr(rec.get("signal"), "ote_in_zone", None)) if rec.get("signal") is not None else None
+    except Exception:
+        ote_flag = None
     if df is not None:
         try:
             swing_low, swing_high = impulse_swings(df)
             range_ = swing_high - swing_low
             atr_val = atr_fn(df)
             t1, t2, t3 = fib_targets(live_price, swing_high, range_, atr_val)
+            try:
+                from egx_quant.utils.telegram_notifier import build_fib_levels as _build_fib
+                fib_dict = _build_fib(swing_low, swing_high, live_price) or {}
+                rec["fib"] = fib_dict
+                rec["swing_low"] = swing_low
+                rec["swing_high"] = swing_high
+                try:
+                    from egx_quant.core.strategy_engine import in_ote_zone as _in_ote
+                    if ote_flag is None:
+                        ote_flag = bool(_in_ote(float(live_price), float(swing_high), float(range_)))
+                except Exception:
+                    pass
+                rec["ote_in_zone"] = ote_flag
+            except Exception:
+                pass
         except Exception as exc:
             print(f"[CRON][SCANNER][WARN] {ticker} fib reprice failed ({exc}) - falling back to ATR-only plan")
             t1 = t2 = t3 = None
@@ -763,12 +807,20 @@ def _publish_signal(
     except Exception:
         pe_ratio = None
     rec["pe_ratio"] = pe_ratio
-    track = classify_track(plan.entry_price, plan.stop_loss, plan.target_1, plan.target_3, plan.tqi_score, pe=pe_ratio)
+    try:
+        _stag = getattr(rec.get("signal"), "strategy_tag", None)
+    except Exception:
+        _stag = None
+    track = classify_track(plan.entry_price, plan.stop_loss, plan.target_1, plan.target_3, plan.tqi_score, pe=pe_ratio, strategy_tag=_stag)
     rec["track"] = track
     print(f"[CRON][SCANNER] TRACK {ticker}: {track} (tqi={plan.tqi_score} rr_tp1={_rr_ratio(plan)} pe={pe_ratio})")
 
-    # 5) Official Signal Card Formatter — real Shariah status + explicit track badge
-    card = notifier.format_channel_broadcast(plan, 0, trade_track=track)
+    # 5) Official Signal Card Formatter — real Shariah status + explicit track badge + Fibonacci block
+    try:
+        card = notifier.format_channel_broadcast(plan, 0, trade_track=track, fib=fib_dict or None, ote_in_zone=ote_flag)
+    except TypeError:
+        # Backward-compat with older notifier signature
+        card = notifier.format_channel_broadcast(plan, 0, trade_track=track)
     if rec.get("delayed_quote"):
         card += (
             f"\n⚠️ دخول محسوب على سعر متأخر (آخر تحديث {rec.get('quote_asof') or 'غير معروف'}) - "
@@ -990,7 +1042,6 @@ def run_scan_pipeline(dry_run: bool = False) -> Dict[str, Any]:
         notifier = None
 
     # oanor pre-fetch (ONE batched call for all candidates; skipped when empty).
-    # TV hints resolve per ticker inside _fetch_live_quote (few candidates).
     oanor_map: Dict[str, Any] = {}
     allow_oanor = False
     try:
@@ -1008,11 +1059,45 @@ def run_scan_pipeline(dry_run: bool = False) -> Dict[str, Any]:
             oanor_map = {}
     result["allow_oanor"] = allow_oanor
 
+    # TV pre-fetch (ONE batched snapshot for candidates oanor missed; free, no
+    # key). Previously allow_tv was never enabled here so the TV branch inside
+    # _fetch_live_quote was dead in production and Yahoo-missed candidates were
+    # dropped at the Live Price Guard. TV quotes are session-gated + sanity
+    # banded + badged on the card, never silent.
+    tv_map: Dict[str, Any] = {}
+    allow_tv = False
+    try:
+        from egx_quant.utils.tv_fallback import tv_enabled, fetch_tv_quotes
+        allow_tv = bool(tv_enabled())
+    except Exception:
+        pass
+    if allow_tv and all_records:
+        try:
+            needy = [rec["ticker"] for rec in all_records if rec["ticker"] not in oanor_map]
+            if needy:
+                tv_map = fetch_tv_quotes(needy)
+                if tv_map:
+                    print(f"[CRON][SCANNER] TV pre-fetch resolved {len(tv_map)} quote(s)")
+        except Exception as e_tv:
+            print(f"[CRON][SCANNER][WARN] TV pre-fetch failed: {e_tv}")
+            tv_map = {}
+    result["allow_tv"] = allow_tv
+
+    guard_stats: Dict[str, int] = {}
+    quote_sources: Dict[str, int] = {}
     for rec in all_records:
         if notifier is None:
             outcome: Dict[str, Any] = {"ticker": rec["ticker"], "guard": "skipped-no-notifier", "supabase": "skipped", "telegram": "skipped"}
         else:
-            outcome = _publish_signal(rec, shariah, notifier, risk, dry_run, allow_delayed=allow_delayed, allow_oanor=allow_oanor, oanor_map=oanor_map)
+            outcome = _publish_signal(rec, shariah, notifier, risk, dry_run, allow_delayed=allow_delayed, allow_tv=allow_tv, tv_map=tv_map, allow_oanor=allow_oanor, oanor_map=oanor_map)
+        try:
+            _g = str(outcome.get("guard", "unknown"))
+            _gkey = "passed" if _g.startswith("passed") else (_g.split("(")[0].strip()[:60] or "unknown")
+            guard_stats[_gkey] = int(guard_stats.get(_gkey, 0) or 0) + 1
+            _qs = str(rec.get("quote_source") or outcome.get("quote_source") or "none")
+            quote_sources[_qs] = int(quote_sources.get(_qs, 0) or 0) + 1
+        except Exception:
+            pass
         plan = rec["plan"]
         result["signals"].append({
             "ticker": rec["ticker"],
@@ -1038,6 +1123,12 @@ def run_scan_pipeline(dry_run: bool = False) -> Dict[str, Any]:
             "publish": outcome,
         })
     result["signals_found"] = len(all_records)
+    result["guard_stats"] = guard_stats
+    result["quote_sources"] = quote_sources
+    try:
+        print(f"[CRON][SCANNER] guards: {guard_stats} | quote_sources: {quote_sources}")
+    except Exception:
+        pass
 
     # Trade monitor (target/SL/trailing alerts) within remaining budget
     elapsed = (datetime.now(timezone.utc) - started).total_seconds()

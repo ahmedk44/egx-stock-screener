@@ -56,6 +56,21 @@ def load_webhook_module():
     return mod
 
 
+def _webhook_fn(mod):
+    """Resolve the callable webhook logic (function, not the HTTP class).
+
+    api/webhook.py exposes `class handler(BaseHTTPRequestHandler)` for Vercel,
+    which CANNOT be called as handler(req). The real logic is `_handler_impl`
+    (aliased as `py_handler`). This helper picks the function so tests never
+    instantiate the HTTP class.
+    """
+    for attr in ("py_handler", "_handler_impl", "_py_handler"):
+        fn = getattr(mod, attr, None)
+        if callable(fn):
+            return fn
+    raise AssertionError("webhook function handler (_handler_impl/py_handler) not found")
+
+
 class FakeResp:
     def __init__(self, status_code: int = 200, body: Any = None, text: str = "") -> None:
         self.status_code = status_code
@@ -231,7 +246,8 @@ def test_process_ticker_sends_short_card_only() -> None:
         return True
 
     # Minimal daily frame so indicator helpers / synthetic delta run offline.
-    idx = pd.date_range("2026-01-01", periods=90, freq="D")
+    # End at TODAY so the stale-frame guard (max 3 sessions lag) passes.
+    idx = pd.date_range(end=pd.Timestamp.today(), periods=90, freq="D")
     base = pd.DataFrame(
         {
             "Open": [10.0 + i * 0.05 for i in range(90)],
@@ -265,6 +281,7 @@ def test_process_ticker_sends_short_card_only() -> None:
              mock.patch.object(screener, "compute_indicators", return_value=ind), \
              mock.patch.object(screener, "fetch_arabic_stock_news", return_value=sentiment), \
              mock.patch.object(screener, "has_volume_spike", return_value=True), \
+             mock.patch.object(screener, "is_market_open", return_value=True), \
              mock.patch.object(screener, "get_trailing_pe", return_value=None), \
              mock.patch.object(screener.yf, "download", return_value=pd.DataFrame()), \
              mock.patch.object(screener, "send_telegram", side_effect=fake_send), \
@@ -339,7 +356,7 @@ def test_webhook_join_flow_registers_and_dms() -> None:
     req = SimpleNamespace(method="POST", body=json.dumps(JOIN_UPDATE).encode("utf-8"))
     with mock.patch.dict(os.environ, env, clear=False):
         with mock.patch.object(mod, "requests", router):
-            result = mod.handler(req)
+            result = _webhook_fn(mod)(req)
 
     check("handler returned OK", result in ("OK", {"statusCode": 200, "body": "OK"}))
     check("fetched trade specs from sent_alerts", router.method_called("GET", "sent_alerts"))
@@ -381,15 +398,17 @@ def test_webhook_join_flow_already_joined() -> None:
     req = SimpleNamespace(method="POST", body=json.dumps(JOIN_UPDATE).encode("utf-8"))
     with mock.patch.dict(os.environ, env, clear=False):
         with mock.patch.object(mod, "requests", router):
-            mod.handler(req)
+            _webhook_fn(mod)(req)
     answer_posts = router.posts_to("answerCallbackQuery")
     check("answered with already-following popup",
           any("بالفعل" in str(p.get("text", "")) for p in answer_posts))
-    check("still re-sends the private card", len(router.posts_to("sendMessage")) >= 1)
+    # Idempotent 409 path intentionally sends popup + NO DM (anti-spam):
+    # webhook.py logs "already-joined (409) dm=False".
+    check("no duplicate DM on already-joined (idempotent)", len(router.posts_to("sendMessage")) == 0)
 
 
 def test_webhook_act_regression() -> None:
-    print("\n--- Test 7: act_/dis_/cls_ regression after refactor ---")
+    print("\n--- Test 7: legacy act_/dis_/cls_ deprecated (no DB write) ---")
     mod = load_webhook_module()
     update = {
         "update_id": 1002,
@@ -410,9 +429,13 @@ def test_webhook_act_regression() -> None:
     req = SimpleNamespace(method="POST", body=json.dumps(update).encode("utf-8"))
     with mock.patch.dict(os.environ, env, clear=False):
         with mock.patch.object(mod, "requests", router):
-            mod.handler(req)
-    check("act_ still writes to active_positions",
-          router.method_called("POST", "active_positions"))
+            _webhook_fn(mod)(req)
+    # Legacy 3-button path was deliberately purged (webhook.py: "3-button path
+    # purged; no DB write") — assert the deprecation, not the old write.
+    check("legacy act_ writes NOTHING to active_positions (purged)",
+          not router.method_called("POST", "active_positions"))
+    check("legacy act_ still answered (spinner killed)",
+          len(router.posts_to("answerCallbackQuery")) >= 1)
 
 
 # --------------------------------------------------------------------------

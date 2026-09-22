@@ -250,8 +250,8 @@ STRATEGY_PLAN: Dict[str, Dict[str, Any]] = {
         "allocation_ar": "5% - 10% من رأس المال",
         "duration_ar": "مضاربة لحظية / سريعة (داخل اليوم)",
         "technical_reason_ar": (
-            "اختراق لحظي لمستوى مقاومة مع تضخم واضح في حجم التداول اللحظي (RVOL) "
-            "وكسر السعر لأعلى المتوسط المتحرك EMA9 / VWAP مع زخم لحظي قوي"
+            "زخم لحظي: السعر أعلى EMA9 وEMA20 مع RSI فوق 52 وفوليوم مرتفع "
+            "(1.4x) وامتدادات فيبوناتشي كأهداف — راجع بلوك 📐 فيبوناتشي"
         ),
     },
     SWING: {
@@ -425,15 +425,14 @@ def is_market_open(now: Optional[datetime] = None) -> bool:
             if weekday in (4, 5):
                 return False
 
-        # Strict trading hours: 10:00 AM to 02:30 PM Cairo
+        # Strict trading hours: 10:00 inclusive -> 14:30 EXCLUSIVE Cairo
+        # (aligned with egx_calendar.SESSION_CLOSE). 14:30:00 sharp = closed
+        # so no new signal can tie/lose the race with the close bulletin.
         market_open = dt_time(10, 0)
         market_close = dt_time(14, 30)
         current_time = cairo_now.time()
-        # Strict check: >=10:00 and <=14:30 (inclusive start, inclusive end for 14:30:00)
-        # Use <= for 14:30:00, but >14:30:00 is closed
-        if current_time < market_open or current_time > market_close:
+        if current_time < market_open or current_time >= market_close:
             return False
-        # Also ensure not before 10:00:00 and not after 14:30:00
         return True
     except Exception as exc:
         logger.warning("is_market_open check failed: %s", exc)
@@ -464,7 +463,20 @@ def save_state(state: Dict[str, Any], path: str = STATE_FILE) -> None:
         logger.warning("Failed to write %s: %s", path, exc)
 
 
-def is_duplicate(state: Dict[str, Any], ticker: str, strategy: str) -> bool:
+def dedup_window_for_strategy(strategy: Any) -> int:
+    """Per-track dedup window: scalps re-alert faster (daily basics), swing/invest slower."""
+    try:
+        s = str(strategy or "").strip().lower()
+        if "scalp" in s:
+            return 4
+        if "swing" in s:
+            return 12
+        return DUPLICATE_WINDOW_HOURS
+    except Exception:
+        return DUPLICATE_WINDOW_HOURS
+
+
+def is_duplicate(state: Dict[str, Any], ticker: str, strategy: str, window_hours: Optional[int] = None) -> bool:
     """Return True if this stock+strategy was alerted within the window."""
     try:
         nt = normalize_ticker(ticker)
@@ -484,7 +496,8 @@ def is_duplicate(state: Dict[str, Any], ticker: str, strategy: str) -> bool:
             return False
         if last_time.tzinfo is None:
             last_time = last_time.replace(tzinfo=timezone.utc)
-        return now_utc() - last_time < timedelta(hours=DUPLICATE_WINDOW_HOURS)
+        window = int(window_hours) if window_hours is not None else dedup_window_for_strategy(strategy)
+        return now_utc() - last_time < timedelta(hours=window)
     except Exception:
         return False
 
@@ -3099,12 +3112,83 @@ def get_trailing_pe(ticker: str) -> Optional[float]:
 
 
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """Attach RSI, EMA20, SMA50 and 20-day average volume to the frame."""
+    """Attach RSI, EMA9 (scalp), EMA20, SMA50 and 20-day average volume to the frame."""
     df["RSI"] = ta.rsi(df["Close"], length=RSI_LENGTH)
+    try:
+        df["EMA9"] = ta.ema(df["Close"], length=9)
+    except Exception:
+        df["EMA9"] = df["Close"].ewm(span=9, adjust=False).mean()
     df["EMA20"] = ta.ema(df["Close"], length=EMA_LENGTH)
     df["SMA50"] = ta.sma(df["Close"], length=SMA_LENGTH)
-    df["VolMA20"] = df["Volume"].rolling(VOLUME_AVG_WINDOW).mean()
+    # Prior-20 average (excludes current bar) so today's spike isn't diluted
+    # by itself — classic screener bug that silently suppressed scalps.
+    df["VolMA20"] = df["Volume"].shift(1).rolling(VOLUME_AVG_WINDOW).mean()
     return df
+
+
+def compute_fib_levels(df: pd.DataFrame, entry: Optional[float] = None, lookback: int = 45) -> Dict[str, Any]:
+    """Compute Fibonacci retracements/extensions + OTE zone from recent impulse leg.
+
+    Pure screener-side mirror of egx_quant StrategyEngine math (no new deps).
+    Returns {} on bad input. Never raises.
+    """
+    try:
+        if df is None or df.empty or len(df) < 5:
+            return {}
+        for col in ("High", "Low", "Close"):
+            if col not in df.columns:
+                return {}
+        window = df.iloc[-lookback:] if len(df) >= lookback else df
+        sw_lo = float(window["Low"].min())
+        sw_hi = float(window["High"].max())
+        rng = sw_hi - sw_lo
+        if not (sw_hi > sw_lo > 0) or rng <= 0:
+            return {}
+        try:
+            en = float(entry) if entry is not None else float(df["Close"].iloc[-1])
+        except Exception:
+            en = sw_hi
+        if not en or en <= 0:
+            en = sw_hi
+        last_close = float(df["Close"].iloc[-1])
+        base = max(sw_hi, en)
+        retrace = (sw_hi - last_close) / rng if rng else 999.0
+        return {
+            "swing_low": round(sw_lo, 2),
+            "swing_high": round(sw_hi, 2),
+            "ret_382": round(sw_hi - 0.382 * rng, 2),
+            "ret_50": round(sw_hi - 0.50 * rng, 2),
+            "ret_618": round(sw_hi - 0.618 * rng, 2),
+            "ret_786": round(sw_hi - 0.786 * rng, 2),
+            "ote_low": round(sw_hi - 0.786 * rng, 2),
+            "ote_high": round(sw_hi - 0.50 * rng, 2),
+            "ote_in_zone": bool(0.48 <= retrace <= 0.81),
+            "ext_618": round(base + 0.618 * rng, 2),
+            "ext_100": round(base + 1.0 * rng, 2),
+            "ext_1618": round(base + 1.618 * rng, 2),
+        }
+    except Exception:
+        return {}
+
+
+def format_fib_block_main(fib: Optional[Dict[str, Any]]) -> str:
+    """Render Fibonacci block for legacy Markdown cards. Empty string when no fib."""
+    if not isinstance(fib, dict) or not fib:
+        return ""
+    try:
+        lines = [
+            "📐 مستويات فيبوناتشي (Fibonacci):",
+            f"📉 القاع/القمة: {float(fib.get('swing_low', 0)):.2f} / {float(fib.get('swing_high', 0)):.2f} EGP",
+            f"🔻 ارتداد 38.2%: {float(fib.get('ret_382', 0)):.2f} | 50%: {float(fib.get('ret_50', 0)):.2f}",
+            f"🔻 ارتداد 61.8%: {float(fib.get('ret_618', 0)):.2f} | 78.6%: {float(fib.get('ret_786', 0)):.2f}",
+            f"⭐ منطقة OTE الذهبية (50%-78.6%): {float(fib.get('ote_low', 0)):.2f} - {float(fib.get('ote_high', 0)):.2f}",
+            f"🚀 امتداد 0.618: {float(fib.get('ext_618', 0)):.2f} | 1.0: {float(fib.get('ext_100', 0)):.2f} | 1.618: {float(fib.get('ext_1618', 0)):.2f}",
+        ]
+        if fib.get("ote_in_zone") is True:
+            lines.append("✅ السعر داخل OTE الآن")
+        return "\n".join(lines)
+    except Exception:
+        return ""
 
 
 def latest(df: pd.DataFrame, column: str) -> Optional[float]:
@@ -3464,16 +3548,42 @@ def fetch_arabic_stock_news(stock_name_ar: str, ticker: str) -> str:
 
 
 def _summarize_with_gemini(content: str, ticker: str) -> str:
-    """Send an Arabic prompt to Gemini 3.6 Flash and return its summary."""
+    """Send an Arabic prompt to Gemini and return its summary.
+
+    Model fallback chain (same pattern as news bulletins): primary model from
+    GEMINI_MODEL env (default gemini-3.6-flash), then gemini-2.0-flash,
+    gemini-1.5-flash. Never blocks signal delivery — quota errors return
+    neutral, other errors return the fallback prompt.
+    """
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         logger.warning("GEMINI_API_KEY not set; skipping sentiment analysis.")
         return GEMINI_FALLBACK_PROMPT
     try:
         client = genai.Client(api_key=api_key)
-        response = client.models.generate_content(model=GEMINI_MODEL, contents=content)
-        text = (response.text or "").strip()
-        return text if text else GEMINI_FALLBACK_PROMPT
+        primary = (os.environ.get("GEMINI_MODEL") or GEMINI_MODEL).strip() or GEMINI_MODEL
+        models = [primary]
+        for fb in ("gemini-2.0-flash", "gemini-1.5-flash"):
+            if fb not in models:
+                models.append(fb)
+        last_exc: Optional[Exception] = None
+        for model in models:
+            try:
+                response = client.models.generate_content(model=model, contents=content)
+                text = (response.text or "").strip()
+                if text:
+                    return text
+                logger.warning("[%s] Gemini %s returned empty text; trying next", ticker, model)
+            except Exception as exc:
+                last_exc = exc
+                logger.warning("[%s] Gemini %s failed: %s", ticker, model, exc)
+                continue
+        if last_exc is None:
+            return GEMINI_FALLBACK_PROMPT
+        # All models failed: re-raise the last error so the quota-aware
+        # handler below classifies it exactly like the old single-model path
+        # (429 -> neutral "🟢 محايد", other -> GEMINI_FALLBACK_PROMPT).
+        raise last_exc
     except Exception as exc:
         # Graceful Gemini 429 quota fallback – catch ResourceExhausted or HTTP 429
         is_quota_error = False
@@ -3738,6 +3848,14 @@ def build_channel_signal_card(strategy: Any, ticker: Any, ctx: Any, sentiment: A
                 lines.append(f"🎯 الهدف {ordinal}: {tv:.2f} EGP")
         else:
             lines.append(f"🎯 الهدف الأول: - EGP")
+        try:
+            fib_legacy = ctx.get("fib") if isinstance(ctx, dict) else None
+            fib_txt = format_fib_block_main(fib_legacy) if isinstance(fib_legacy, dict) and fib_legacy else ""
+            if fib_txt:
+                lines.append(sep)
+                lines.append(fib_txt)
+        except Exception:
+            pass
         lines += [
             sep,
             "👇 اضغط الزر للمتابعة وتلقي التحديثات والتحليل المفصل في الخاص:",
@@ -3796,6 +3914,16 @@ def build_unified_channel_card(
 
             tvals = [float(t) for t in (targets or []) if t is not None]
             entry_f = float(entry_price) if entry_price is not None else 0.0
+            fib_ctx = None
+            ote_ctx = None
+            try:
+                if isinstance(ctx, dict):
+                    fib_ctx = ctx.get("fib") if isinstance(ctx.get("fib"), dict) else None
+                    ote_ctx = ctx.get("fib", {}).get("ote_in_zone") if isinstance(ctx.get("fib"), dict) else None
+                    if ote_ctx is None:
+                        ote_ctx = ctx.get("ote_in_zone")
+            except Exception:
+                fib_ctx, ote_ctx = None, None
             plan = SimpleNamespace(
                 symbol=normalize_ticker(str(ticker)),
                 entry_price=entry_f,
@@ -3807,7 +3935,10 @@ def build_unified_channel_card(
                 tqi_score=float(tqi_score) if tqi_score is not None else 5.0,
                 strategy_type=str(strategy or ""),
             )
-            return "\n".join(notifier.format_channel_short_card(plan, 0))
+            try:
+                return "\n".join(notifier.format_channel_short_card(plan, 0, trade_track=str(strategy or ""), fib=fib_ctx, ote_in_zone=ote_ctx if isinstance(ote_ctx, bool) else None))
+            except TypeError:
+                return "\n".join(notifier.format_channel_short_card(plan, 0))
         except Exception as exc:
             logger.warning("format_channel_short_card failed (%s); using legacy card", exc)
     return build_channel_signal_card(strategy, ticker, ctx or {}, sentiment)
@@ -5059,6 +5190,14 @@ def build_message(strategy: Any, ticker: Any, ctx: Any, sentiment: Any) -> str:
         except Exception:
             targets_block = "\n".join([f"🎯 الهدف {ordinals_dm.get(i, f'{i}')}: {tv:.2f} EGP" for i, tv in enumerate(target_prices, 1)]) if 'target_prices' in locals() else "🎯 الهدف الأول: - EGP"
 
+        # Build Fibonacci block from ctx (injected by process_ticker) — empty when unavailable
+        try:
+            fib_ctx = ctx.get("fib") if isinstance(ctx, dict) else None
+            fib_block = format_fib_block_main(fib_ctx) if isinstance(fib_ctx, dict) and fib_ctx else ""
+            fib_section = f"\n{fib_block}\n" if fib_block else ""
+        except Exception:
+            fib_section = ""
+
         return (
             f"اسم السهم : {stock_name_ar} {clean_ticker}\n"
             f"\n"
@@ -5073,6 +5212,7 @@ def build_message(strategy: Any, ticker: Any, ctx: Any, sentiment: Any) -> str:
             f"سعر الدخول : {entry_price:.2f} 🏷\n"
             f"\n"
             f"{targets_block}\n"
+            f"{fib_section}"
             f"\n"
             f"وقف الخسارة : {sl_condition} {stop_loss:.2f} ({sl_pct * 100:.1f}%) ⛔️\n"
             f"\n"
@@ -5115,35 +5255,61 @@ def build_message(strategy: Any, ticker: Any, ctx: Any, sentiment: Any) -> str:
 # --------------------------------------------------------------------------
 
 
+def has_volume_spike_relaxed(df: pd.DataFrame, mult: float = 1.4) -> bool:
+    """Relaxed volume check for scalps (default 1.4x vs strict 1.8x). Never raises."""
+    try:
+        if len(df) < VOLUME_AVG_WINDOW:
+            return False
+        current_vol = latest(df, "Volume")
+        avg_vol = latest(df, "VolMA20")
+        if current_vol is None or avg_vol is None or avg_vol <= 0:
+            return False
+        return current_vol > float(mult) * avg_vol
+    except Exception:
+        return False
+
+
 def evaluate_strategies(ticker: str, df: pd.DataFrame) -> List[str]:
-    """Return the list of strategies whose conditions are met for a ticker."""
+    """Return the list of strategies whose conditions are met for a ticker.
+
+    Scalp intentionally has THREE paths (daily-basics need volume):
+      A (strict momentum): RSI>55 + price>EMA20 + volume>1.8x (legacy).
+      B (EMA9 trend): price>EMA9 + price>EMA20 + RSI>52 + volume>1.4x.
+      C (breakout proximity): close within +1.5% above EMA20 + RSI 50-72 + volume>1.2x.
+    Swing/investment unchanged.
+    """
     ind = compute_indicators(df)
 
     price = latest(ind, "Close")
     rsi = latest(ind, "RSI")
+    ema9 = latest(ind, "EMA9")
     ema20 = latest(ind, "EMA20")
     sma50 = latest(ind, "SMA50")
     spike = has_volume_spike(ind)
     volume_ratio: Optional[float] = None
-    if spike:
+    try:
         current_vol = latest(ind, "Volume")
         avg_vol = latest(ind, "VolMA20")
         if current_vol is not None and avg_vol:
             volume_ratio = current_vol / avg_vol
+    except Exception:
+        volume_ratio = None
 
     logger.info(
-        "[%s] close=%s rsi=%s ema20=%s sma50=%s vol_spike=%s",
+        "[%s] close=%s rsi=%s ema9=%s ema20=%s sma50=%s vol_spike=%s vol_ratio=%s",
         ticker,
         fmt(price),
         fmt(rsi, 1),
+        fmt(ema9),
         fmt(ema20),
         fmt(sma50),
         spike,
+        fmt(volume_ratio, 2) if volume_ratio is not None else "n/a",
     )
 
     signals: List[str] = []
 
-    # --- Scalping: RSI > 55 AND volume spike AND price > EMA 20 -------------
+    # --- Scalping path A (strict legacy) -------------------------------------
     if (
         rsi is not None
         and price is not None
@@ -5153,6 +5319,37 @@ def evaluate_strategies(ticker: str, df: pd.DataFrame) -> List[str]:
         and price > ema20
     ):
         signals.append(SCALPING)
+
+    # --- Scalping path B (EMA9 trend + relaxed volume) ------------------------
+    if (
+        SCALPING not in signals
+        and rsi is not None
+        and price is not None
+        and ema9 is not None
+        and ema20 is not None
+        and rsi > 52
+        and rsi < 78
+        and price > ema9
+        and price > ema20
+        and has_volume_spike_relaxed(ind, 1.4)
+    ):
+        signals.append(SCALPING)
+        logger.info("[%s] scalp path-B (EMA9 trend) triggered.", ticker)
+
+    # --- Scalping path C (breakout proximity, low-volume tolerant) ------------
+    if (
+        SCALPING not in signals
+        and rsi is not None
+        and price is not None
+        and ema20 is not None
+        and rsi > 50
+        and rsi < 72
+        and price > ema20
+        and price <= ema20 * 1.015
+        and has_volume_spike_relaxed(ind, 1.2)
+    ):
+        signals.append(SCALPING)
+        logger.info("[%s] scalp path-C (breakout proximity) triggered.", ticker)
 
     # --- Swing: price crossed above EMA 20 AND RSI > 50 ----------------------
     if crossed_above_ema20(ind) and rsi is not None and rsi > 50:
@@ -5169,11 +5366,54 @@ def evaluate_strategies(ticker: str, df: pd.DataFrame) -> List[str]:
 
 
 def process_ticker(ticker: str, state: Dict[str, Any]) -> None:
-    """Fetch data for a ticker, evaluate signals and send alerts."""
+    """Fetch data for a ticker, evaluate signals and send alerts.
+
+    MARKET HOURS GATE: intraday signals are NEVER emitted outside the EGX
+    session (Sun-Thu 10:00-14:30 Cairo). This fixes post-close bulletins
+    arriving before late signals. Manual override via ALLOW_AFTER_CLOSE=1.
+    """
+    try:
+        allow_late = (os.environ.get("ALLOW_AFTER_CLOSE") or "").strip() in ("1", "true", "True")
+        if not allow_late and not is_market_open():
+            logger.info("[%s] skipped - market closed (no intraday emission after close).", ticker)
+            return
+    except Exception:
+        pass
     df = fetch_price_history(ticker)
     if df is None:
         logger.info("[%s] skipped (no data).", ticker)
         return
+    # Stale-frame guard: drop frames with no same-session bar when market is open
+    # (yfinance daily lag). Never fabricates - just skips the ticker this run.
+    try:
+        if df is not None and not df.empty:
+            last_ts = df.index[-1]
+            try:
+                import pandas as _pd  # type: ignore
+                if hasattr(last_ts, "to_pydatetime"):
+                    last_ts = last_ts.to_pydatetime()
+            except Exception:
+                pass
+            try:
+                from zoneinfo import ZoneInfo as _ZI
+                _cairo = _ZI("Africa/Cairo")
+                _today = now_cairo().date()
+                _bar_day = last_ts.date() if hasattr(last_ts, "date") else None
+                if _bar_day is not None:
+                    # Count Sun-Thu sessions lag; >3 sessions = dead frame
+                    from datetime import timedelta as _td
+                    _lag, _d = 0, _bar_day + _td(days=1)
+                    while _d <= _today:
+                        if _d.weekday() in (6, 0, 1, 2, 3):
+                            _lag += 1
+                        _d += _td(days=1)
+                    if _lag > 3:
+                        logger.info("[%s] skipped - stale frame %s (lag %d sessions).", ticker, _bar_day, _lag)
+                        return
+            except Exception:
+                pass
+    except Exception:
+        pass
 
     signals = evaluate_strategies(ticker, df)
     if not signals:
@@ -5186,9 +5426,14 @@ def process_ticker(ticker: str, state: Dict[str, Any]) -> None:
     sentiment = fetch_arabic_stock_news(stock_name_ar, ticker)
 
     ind = compute_indicators(df)
+    try:
+        _ema9_v = latest(ind, "EMA9") if "EMA9" in getattr(ind, "columns", []) else None
+    except Exception:
+        _ema9_v = None
     ctx: Dict[str, Any] = {
         "price": latest(ind, "Close"),
         "rsi": latest(ind, "RSI"),
+        "ema9": _ema9_v,
         "ema20": latest(ind, "EMA20"),
         "sma50": latest(ind, "SMA50"),
         "volume_ratio": None,
@@ -5199,6 +5444,21 @@ def process_ticker(ticker: str, state: Dict[str, Any]) -> None:
         avg_vol = latest(ind, "VolMA20")
         if current_vol is not None and avg_vol:
             ctx["volume_ratio"] = current_vol / avg_vol
+    # Fibonacci impulse levels (real targets, not fixed %) — injected for cards
+    try:
+        fib_lv = compute_fib_levels(df, ctx.get("price"))
+        if fib_lv:
+            ctx["fib"] = fib_lv
+            ctx["ote_in_zone"] = bool(fib_lv.get("ote_in_zone", False))
+            # Override price targets with REAL fib extensions so numbers match the block
+            try:
+                ctx["target_1"] = float(fib_lv.get("ext_618") or 0) or ctx.get("target_1")
+                ctx["target_2"] = float(fib_lv.get("ext_100") or 0) or ctx.get("target_2")
+                ctx["target_3"] = float(fib_lv.get("ext_1618") or 0) or ctx.get("target_3")
+            except Exception:
+                pass
+    except Exception:
+        pass
 
     # Synthetic Order Flow: 1m delta emulation (free footprint) - for TQI boost
     try:
@@ -5348,19 +5608,40 @@ def process_ticker(ticker: str, state: Dict[str, Any]) -> None:
         except Exception:
             pass
         # Use normalized ticker for all dedup checks and DB writes to prevent COMI vs COMI.CA loop
-        if is_duplicate(state, normalized_ticker, strategy):
+        # Per-track window: scalp 4h (daily basics re-alert), others 12h.
+        try:
+            _dup_window = dedup_window_for_strategy(strategy)
+        except Exception:
+            _dup_window = DUPLICATE_WINDOW_HOURS
+        if is_duplicate(state, normalized_ticker, strategy, window_hours=_dup_window):
             logger.info(
                 "[%s] %s alert already sent within %dh; skipping.",
                 normalized_ticker,
                 strategy,
-                DUPLICATE_WINDOW_HOURS,
+                _dup_window,
             )
             continue
-        # Supabase-backed deduplication: check sent_alerts for (normalized_ticker, strategy, date_sent=Cairo today)
+        # Supabase-backed deduplication: scalp uses 4h-friendly smart hash check,
+        # swing/invest keep strict once-per-day. The daily table check is SKIPPED
+        # for scalps so the same ticker can re-signal intraday with a new setup.
         try:
-            if is_already_sent_today_supabase(normalized_ticker, strategy):
-                logger.info("[%s] %s already sent today (Supabase sent_alerts); skipping duplicate.", normalized_ticker, strategy)
-                continue
+            _is_scalp_track = "scalp" in str(strategy or "").lower()
+            if _is_scalp_track:
+                try:
+                    _sig_hash = generate_signal_hash(
+                        normalized_ticker, strategy,
+                        ctx.get("price") if isinstance(ctx, dict) else None,
+                        str(ctx.get("rsi") or "") if isinstance(ctx, dict) else "",
+                    )
+                    if _sig_hash in _SENT_SIGNAL_HASH_CACHE:
+                        logger.info("[%s] scalp same-setup hash already sent this loop; skipping.", normalized_ticker)
+                        continue
+                except Exception:
+                    pass
+            else:
+                if is_already_sent_today_supabase(normalized_ticker, strategy):
+                    logger.info("[%s] %s already sent today (Supabase sent_alerts); skipping duplicate.", normalized_ticker, strategy)
+                    continue
         except Exception as exc:
             logger.warning("[%s] Supabase dedup check failed (%s); continuing", normalized_ticker, exc)
         # Strict active position check: suppress if position already exists in active_positions (Supabase or local) – use normalized
@@ -5427,18 +5708,30 @@ def process_ticker(ticker: str, state: Dict[str, Any]) -> None:
         except Exception:
             chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
         # Pre-compute trade details for keyboard and persistence (ensures webhook gets full payload)
+        # FIB-FIRST: real fib extensions from ctx override fixed % plan so numbers match the card block.
         try:
             plan_for_pos = STRATEGY_PLAN.get(strategy, {})
             entry_price_pos = float(ctx.get("price") or 0.0) if isinstance(ctx, dict) else 0.0
-            targets_pos = plan_for_pos.get("targets_pct", (0.03, 0.05, 0.08))
-            if not isinstance(targets_pos, (list, tuple)) or len(targets_pos) < 3:
-                targets_pos = (0.03, 0.05, 0.08)
-            p1_pos, p2_pos, p3_pos = float(targets_pos[0]), float(targets_pos[1]), float(targets_pos[2])
-            sl_pct_pos = float(plan_for_pos.get("sl_pct", -0.03)) if plan_for_pos.get("sl_pct") is not None else -0.03
-            t1_pos = entry_price_pos * (1 + p1_pos)
-            t2_pos = entry_price_pos * (1 + p2_pos)
-            t3_pos = entry_price_pos * (1 + p3_pos)
-            sl_price_pos = entry_price_pos * (1 + sl_pct_pos)
+            fib_ctx_pos = ctx.get("fib") if isinstance(ctx, dict) and isinstance(ctx.get("fib"), dict) else None
+            if fib_ctx_pos and all(fib_ctx_pos.get(k) for k in ("ext_618", "ext_100", "ext_1618")):
+                try:
+                    t1_pos = float(fib_ctx_pos["ext_618"])
+                    t2_pos = float(fib_ctx_pos["ext_100"])
+                    t3_pos = float(fib_ctx_pos["ext_1618"])
+                    sl_pct_pos = float(plan_for_pos.get("sl_pct", -0.03)) if plan_for_pos.get("sl_pct") is not None else -0.03
+                    sl_price_pos = entry_price_pos * (1 + sl_pct_pos)
+                except Exception:
+                    fib_ctx_pos = None
+            if not fib_ctx_pos:
+                targets_pos = plan_for_pos.get("targets_pct", (0.03, 0.05, 0.08))
+                if not isinstance(targets_pos, (list, tuple)) or len(targets_pos) < 3:
+                    targets_pos = (0.03, 0.05, 0.08)
+                p1_pos, p2_pos, p3_pos = float(targets_pos[0]), float(targets_pos[1]), float(targets_pos[2])
+                sl_pct_pos = float(plan_for_pos.get("sl_pct", -0.03)) if plan_for_pos.get("sl_pct") is not None else -0.03
+                t1_pos = entry_price_pos * (1 + p1_pos)
+                t2_pos = entry_price_pos * (1 + p2_pos)
+                t3_pos = entry_price_pos * (1 + p3_pos)
+                sl_price_pos = entry_price_pos * (1 + sl_pct_pos)
             trade_track_pos = track_for_filter if isinstance(track_for_filter, str) and track_for_filter else TQI_TRACK_LABELS.get(strategy, str(strategy))
         except Exception as exc:
             logger.warning("[%s] failed to pre-compute trade details for keyboard: %s", ticker, exc)
@@ -5492,6 +5785,16 @@ def process_ticker(ticker: str, state: Dict[str, Any]) -> None:
             # so subsequent iterations in same loop skip it instantly (prevents duplicate loop for ELWA.CA/COMI/CERA.CA)
             try:
                 mark_sent(state, normalized_ticker, strategy)
+                # Record scalp setup hash so identical setups don't resend same loop,
+                # while NEW setups (different price/hash) can still alert after 4h.
+                try:
+                    _h = generate_signal_hash(
+                        normalized_ticker, strategy, entry_price_pos,
+                        str(ctx.get("rsi") or "") if isinstance(ctx, dict) else "",
+                    )
+                    _SENT_SIGNAL_HASH_CACHE.add(_h)
+                except Exception:
+                    pass
             except Exception as exc:
                 logger.warning("[%s] mark_sent failed: %s", normalized_ticker, exc)
                 # Fallback: ensure cache is updated even if mark_sent fails
@@ -5888,6 +6191,21 @@ def main() -> int:
     if mode in (PRE_MARKET, POST_MARKET):
         logger.info("Running off-hours news scan in %s mode.", mode)
         return run_news_watchlist(mode)
+    # INTRADAY MARKET HOURS GATE (root cause of post-close signals arriving
+    # AFTER the close bulletin): never emit intraday signals outside
+    # Sun-Thu 10:00-14:30 Cairo. Delayed GitHub queue runs exit quietly here.
+    try:
+        allow_late = (os.environ.get("ALLOW_AFTER_CLOSE") or "").strip() in ("1", "true", "True")
+        if not allow_late and not is_market_open():
+            try:
+                cairo_now = now_cairo()
+                print(f"[MARKET-CLOSED] Intraday scan suppressed (session CLOSED at {cairo_now.strftime('%Y-%m-%d %H:%M')} Cairo) - no Telegram emission. Post-market bulletin owns after-close messaging.")
+            except Exception:
+                print("[MARKET-CLOSED] Intraday scan suppressed - market closed.")
+            logger.info("Intraday scan suppressed - market closed (no signal emission).")
+            return 0
+    except Exception as exc:
+        logger.warning("Market-hours gate check failed (%s); continuing", exc)
     logger.info("EGX screener started — monitoring %d tickers.", len(TICKERS))
     state = load_state()
 

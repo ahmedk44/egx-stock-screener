@@ -1,11 +1,13 @@
 name: EGX Stock Screener
 
 on:
-  # BACKUP SCHEDULE (re-enabled 2026-09-14): cron-job.org may fail silently.
-  # This runs hourly as fallback during EGX session (10:00-14:30 Cairo).
-  # Primary schedule is cron-job.org */15 — see scripts/setup_cronjobs.py.
+  # BACKUP SCHEDULE: cron-job.org */15 is primary — see scripts/setup_cronjobs.py.
+  # GitHub runs at :20 (not :30) and STOPS at 10:20 UTC (13:20 Cairo) leaving a
+  # 70-min buffer before the 12:30 UTC post-market bulletin, so delayed queue
+  # runs can never emit signals AFTER the close summary. The in-code market
+  # gate (main.py) double-guards this.
   schedule:
-    - cron: "30 7,8,9,10,11 * * 0-4"  # Every hour at :30, 07:30-11:30 UTC (10:30-14:30 Cairo) Sun-Thu
+    - cron: "20 7,8,9,10 * * 0-4"  # 07:20-10:20 UTC (10:20-13:20 Cairo) Sun-Thu
   workflow_dispatch:
 
 permissions:

@@ -33,8 +33,26 @@ except Exception:
     logger = None  # type: ignore
 
 # Lightweight auth helper — accepts header Bearer OR query string ?secret= / ?cron_secret= / ?token=
+def _valid_secrets() -> tuple:
+    """Accepted endpoint secrets: CRON_SECRET + CRON_SECRET_NEW (rotation window).
+
+    Zero-downtime rotation: deploy this first, set CRON_SECRET_NEW in Vercel env,
+    move cron-job.org URLs to the new value, verify (?dry_run=1 probes), then
+    promote NEW -> CRON_SECRET and unset NEW. Either value is accepted meanwhile.
+    """
+    out = []
+    for var in ("CRON_SECRET", "CRON_SECRET_NEW"):
+        try:
+            v = (os.environ.get(var) or "").strip()
+        except Exception:
+            v = ""
+        if v and v not in out:
+            out.append(v)
+    return tuple(out)
+
+
 def _is_authorized(handler: BaseHTTPRequestHandler) -> tuple[bool, str]:
-    cron_secret = (os.environ.get("CRON_SECRET") or "").strip()
+    secrets = _valid_secrets()
     # Vercel Cron sends x-vercel-cron: 1 (no secret needed)
     vercel_cron = handler.headers.get("x-vercel-cron") or handler.headers.get("X-Vercel-Cron")
     if vercel_cron == "1":
@@ -46,23 +64,23 @@ def _is_authorized(handler: BaseHTTPRequestHandler) -> tuple[bool, str]:
         qs = parse_qs(parsed.query)
         for key in ("secret", "cron_secret", "CRON_SECRET", "token", "auth", "key"):
             vals = qs.get(key, [])
-            if vals and cron_secret and vals[0].strip() == cron_secret:
+            if vals and secrets and vals[0].strip() in secrets:
                 return True, f"query:{key}"
             # Also accept without secret set? If no secret, query is open
-            if vals and not cron_secret:
+            if vals and not secrets:
                 # No secret configured — query with any value still open, but log
                 return True, f"query:{key} (no-secret)"
         # Also accept plain ?cron_secret=XYZ even if key name case differs
-        if cron_secret and parsed.query and cron_secret in parsed.query:
+        if secrets and parsed.query and any(s in parsed.query for s in secrets):
             # Fallback: secret appears anywhere in query string
             return True, "query:raw"
     except Exception:
         pass
     # External ping with Bearer token
     auth = handler.headers.get("Authorization") or handler.headers.get("authorization") or ""
-    if cron_secret and auth.strip() == f"Bearer {cron_secret}":
+    if secrets and any(auth.strip() == f"Bearer {s}" for s in secrets):
         return True, "bearer"
-    if cron_secret:
+    if secrets:
         # If secret is set, require it — reject unauthenticated
         return False, "missing/invalid bearer (CRON_SECRET set) — use header Authorization: Bearer <CRON_SECRET> or query ?secret=<CRON_SECRET>"
     # No secret configured — allow any caller (log warning)

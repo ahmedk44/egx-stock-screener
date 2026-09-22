@@ -36,7 +36,9 @@ logger = logging.getLogger("egx_quant.scheduler")
 
 CYCLE_SECONDS = 5 * 60
 MAX_IDLE_CHUNK_SECONDS = 15 * 60
-DEDUP_SECONDS = 24 * 3600
+# DEDUP shortened 24h -> 8h so scalp (daily basics) can re-signal intraday
+# while swing/invest stay naturally throttled by setup rarity.
+DEDUP_SECONDS = 8 * 3600
 
 
 class SessionDaemon:
@@ -47,7 +49,7 @@ class SessionDaemon:
         notifier: Optional[TelegramNotifier] = None,
         source: str = "auto",
         capital: float = 100_000.0,
-        max_open_positions: int = 3,
+        max_open_positions: int = 5,
         db_path: str = str(DEFAULT_DB_PATH),
     ) -> None:
         self._notifier = notifier or TelegramNotifier()
@@ -109,7 +111,15 @@ class SessionDaemon:
                     await asyncio.sleep(CYCLE_SECONDS)
                 else:
                     if was_open:
-                        logger.info("[DAEMON] === EGX SESSION CLOSED (%s) - sending daily summary ===", now.strftime("%Y-%m-%d %H:%M"))
+                        logger.info("[DAEMON] === EGX SESSION CLOSED (%s) - final flush then daily summary ===", now.strftime("%Y-%m-%d %H:%M"))
+                        # ORDERING FIX: run one FINAL in-session cycle BEFORE the
+                        # summary so no signal can ever arrive AFTER the close
+                        # bulletin. Any late/queued cycle after this point finds
+                        # the market closed and emits nothing.
+                        try:
+                            await self.run_cycle()
+                        except Exception as exc:
+                            logger.error("[DAEMON] Final flush cycle failed: %s", exc, exc_info=True)
                         await self._send_daily_summary()
                         was_open = False
                     await self._maybe_send_weekly(now)
@@ -293,10 +303,18 @@ class SessionDaemon:
                 },
             )
             # Interactive channel broadcast: STRICT teaser + [Track Signal] button.
+            # FIB: attach impulse levels so the card shows the 📐 block.
             markup = build_join_markup(position_id, clean_ticker(plan.symbol))
-            await self._notifier.broadcast_signal_async(
-                self._notifier.format_channel_broadcast(plan, position_id), markup
-            )
+            try:
+                from egx_quant.utils.telegram_notifier import build_fib_levels as _build_fib
+                from egx_quant.core.strategy_engine import impulse_swings as _swings
+                _sw_lo, _sw_hi = _swings(frame)
+                _fib = _build_fib(_sw_lo, _sw_hi, plan.entry_price)
+                _ote = bool(getattr(sig, "ote_in_zone", None)) if sig is not None else None
+                _card = self._notifier.format_channel_broadcast(plan, position_id, fib=_fib or None, ote_in_zone=_ote)
+            except Exception:
+                _card = self._notifier.format_channel_broadcast(plan, position_id)
+            await self._notifier.broadcast_signal_async(_card, markup)
         return opened
 
 
