@@ -145,6 +145,67 @@ def get_news_channel_id() -> Optional[str]:
     logger.info(f"No NEWS env set — using hard fallback NEWS_CHANNEL_ID={NEWS_FALLBACK} per spec")
     return NEWS_FALLBACK
 
+def _download_daily_batch(tickers: List[str], timeout_seconds: float = 40.0) -> Dict[str, Any]:
+    """ONE batched yf.download for many tickers under a HARD wall-clock cap.
+
+    yfinance offers no per-call timeout and sequential Ticker.history calls can
+    stall the whole serverless function past maxDuration (the pre-market hang).
+    The download runs in a worker thread; past the deadline we abandon it and
+    return whatever frames completed (usually all) — callers treat missing
+    tickers as delayed/omitted, never fabricated. Never raises.
+    """
+    frames: Dict[str, Any] = {}
+    if yf is None or not tickers:
+        return frames
+    try:
+        import pandas as pd  # type: ignore
+        from concurrent.futures import ThreadPoolExecutor
+    except Exception as exc:
+        logger.warning(f"Batched download deps unavailable ({exc})")
+        return frames
+    try:
+        universe = list(dict.fromkeys(t.strip() for t in tickers if t))
+        pool = ThreadPoolExecutor(max_workers=1)
+        try:
+            fut = pool.submit(
+                yf.download,
+                tickers=universe,
+                period="5d",
+                interval="1d",
+                group_by="ticker",
+                threads=True,
+                progress=False,
+                auto_adjust=True,
+            )
+            data = fut.result(timeout=max(5.0, float(timeout_seconds)))
+        except TimeoutError:
+            logger.warning(f"[BUDGET] Batched download exceeded {timeout_seconds:.0f}s - abandoned (frames omitted, no synthetic fill)")
+            return frames
+        except Exception as exc:
+            logger.warning(f"Batched download failed ({exc})")
+            return frames
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
+        try:
+            multi = isinstance(data.columns, pd.MultiIndex)
+            level0 = set(data.columns.get_level_values(0)) if multi else set()
+            for t in universe:
+                try:
+                    frame = data[t] if multi and t in level0 else (data if not multi else None)
+                    if frame is not None and not frame.empty:
+                        if hasattr(frame.columns, "levels"):
+                            frame.columns = [c[0] if isinstance(c, tuple) else c for c in frame.columns]
+                        frames[t] = frame
+                except Exception:
+                    continue
+        except Exception as exc:
+            logger.warning(f"Batch parse failed ({exc})")
+        logger.info(f"Batched daily download resolved {len(frames)}/{len(universe)} frames")
+    except Exception as exc:
+        logger.warning(f"_download_daily_batch crashed ({exc})")
+    return frames
+
+
 def fetch_global_cues(meta: Optional[Dict[str, Any]] = None) -> Dict[str, Dict[str, Any]]:
     """Fetch global market cues via yfinance (NO FABRICATION).
 
@@ -162,10 +223,10 @@ def fetch_global_cues(meta: Optional[Dict[str, Any]] = None) -> Dict[str, Dict[s
             meta["delayed"] = True
         return result
     import math
+    frames = _download_daily_batch(list(GLOBAL_TICKERS.values()))
     for name, ticker in GLOBAL_TICKERS.items():
         try:
-            t = yf.Ticker(ticker)
-            hist = t.history(period="5d", auto_adjust=True)
+            hist = frames.get(ticker)
             if hist is None or hist.empty or len(hist) < 2:
                 logger.warning(f"{name} {ticker}: no history")
                 continue
@@ -212,10 +273,10 @@ def fetch_commodities(meta: Optional[Dict[str, Any]] = None) -> Dict[str, Dict[s
         return result
     # Gold
     import math as _math
+    frames = _download_daily_batch(list(COMMODITY_TICKERS.values()))
     for name, ticker in COMMODITY_TICKERS.items():
         try:
-            t = yf.Ticker(ticker)
-            hist = t.history(period="5d", auto_adjust=True)
+            hist = frames.get(ticker)
             if hist is None or hist.empty or len(hist) < 2:
                 continue
             if hasattr(hist.columns, "levels"):
@@ -290,7 +351,7 @@ def fetch_corporate_actions_and_news(max_items: int = 5) -> List[Dict[str, Any]]
             query = f"{name} {ticker.replace('.CA','')} بورصة مصر"
             import urllib.parse
             url = NEWS_RSS_URL.format(query=urllib.parse.quote_plus(query))
-            resp = requests.get(url, timeout=10) if requests else None
+            resp = requests.get(url, timeout=8) if requests else None
             if resp and resp.status_code == 200:
                 import feedparser as fp
                 feed = fp.parse(resp.text)
@@ -325,8 +386,15 @@ def generate_pre_market_ai_summary(
     global_cues: Dict[str, Dict[str, Any]],
     commodities: Dict[str, Dict[str, Any]],
     corporate_news: List[Dict[str, Any]],
+    budget_seconds: float = 25.0,
 ) -> str:
-    """Generate AI summary for pre-market (bullet points)."""
+    """Generate AI summary for pre-market (bullet points).
+
+    Serverless-safe: each Gemini attempt runs under a HARD wall-clock budget
+    (mirrors post_market.generate_ai_sentiment) — the google-genai SDK can
+    internally retry/backoff for minutes and previously stalled the whole
+    pipeline past maxDuration. Falls back to heuristic.
+    """
     g_str = ", ".join([f"{k} {v['change_pct']:+.2f}%" for k, v in global_cues.items()])
     c_str = ", ".join([f"{k} {v['close']:.2f} ({v['change_pct']:+.2f}%)" for k, v in commodities.items()])
     n_str = " | ".join([h["title"][:80] for h in corporate_news[:3]]) if corporate_news else "لا توجد إفصاحات جديدة"
@@ -342,23 +410,44 @@ def generate_pre_market_ai_summary(
         "• الإفصاحات المبكرة: (أهم 1-2 خبر)\n"
     )
 
-    # Try Gemini
+    # Try Gemini — under a hard wall-clock budget (serverless-safe)
     try:
+        import time as _time
+        from concurrent.futures import ThreadPoolExecutor
+
         api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
         if api_key and api_key.strip():
             from google import genai  # type: ignore
             client = genai.Client(api_key=api_key.strip())
             model = os.environ.get("GEMINI_MODEL") or "gemini-3.6-flash"
-            for m in [model, "gemini-3.6-flash", "gemini-2.0-flash", "gemini-1.5-flash"]:
-                try:
-                    resp = client.models.generate_content(model=m, contents=prompt)
-                    text = getattr(resp, "text", None) or (resp.candidates[0].content.parts[0].text if getattr(resp, "candidates", None) else None)
-                    if text and len(text.strip()) > 20:
-                        logger.info(f"Pre-market Gemini success via {m}")
-                        return text.strip()
-                except Exception as e:
-                    logger.warning(f"Gemini {m} failed: {e}")
-                    continue
+            deadline = _time.monotonic() + float(budget_seconds)
+            pool = ThreadPoolExecutor(max_workers=1)
+            _models = list(dict.fromkeys(m for m in [model, "gemini-3.6-flash", "gemini-2.5-flash", "gemini-2.5-flash-lite"] if m))
+            try:
+                for m in _models:
+                    remaining = deadline - _time.monotonic()
+                    if remaining <= 3:
+                        logger.warning(f"[AI-BUDGET] Gemini budget exhausted before {m} - falling back to heuristic")
+                        break
+                    try:
+                        fut = pool.submit(client.models.generate_content, model=m, contents=prompt)
+                        resp = fut.result(timeout=remaining)
+                        text = getattr(resp, "text", None) or (resp.candidates[0].content.parts[0].text if getattr(resp, "candidates", None) else None)
+                        if text and len(text.strip()) > 20:
+                            logger.info(f"Pre-market Gemini success via {m}")
+                            return text.strip()
+                        logger.warning(f"Gemini {m} returned empty/short text")
+                    except TimeoutError:
+                        logger.warning(f"[AI-BUDGET] Gemini {m} exceeded {remaining:.0f}s budget - trying next / fallback")
+                        continue
+                    except Exception as e:
+                        logger.warning(f"Gemini {m} failed: {e}")
+                        continue
+            finally:
+                # Never block on hung Gemini calls — abandon them
+                pool.shutdown(wait=False, cancel_futures=True)
+        else:
+            logger.warning("GEMINI_API_KEY not set, using heuristic summary")
     except Exception as e:
         logger.warning(f"Gemini not available: {e}")
 
@@ -522,16 +611,24 @@ def main(dry_run: bool = False, broadcast: bool = True) -> int:
         except Exception as e:
             logger.warning(f"Idempotency check failed (proceeding): {e}")
     try:
+        import time as _time
+        _t_cues = _time.monotonic()
         cues_meta: Dict[str, Any] = {}
         comm_meta: Dict[str, Any] = {}
         global_cues = fetch_global_cues(meta=cues_meta)
+        print(f"[TIMING] fetch_global_cues: {_time.monotonic() - _t_cues:.1f}s")
+        _t_comm = _time.monotonic()
         commodities = fetch_commodities(meta=comm_meta)
+        print(f"[TIMING] fetch_commodities: {_time.monotonic() - _t_comm:.1f}s")
         market_meta = {
             "delayed": bool(cues_meta.get("delayed") or comm_meta.get("delayed")),
             "data_asof": cues_meta.get("data_asof") or comm_meta.get("data_asof"),
         }
         corporate_news = fetch_corporate_actions_and_news()
+        print(f"[TIMING] fetch_corporate_actions_and_news: {_time.monotonic() - _t_comm:.1f}s")
+        _t_ai = _time.monotonic()
         ai_summary = generate_pre_market_ai_summary(global_cues, commodities, corporate_news)
+        print(f"[TIMING] generate_pre_market_ai_summary: {_time.monotonic() - _t_ai:.1f}s")
         # Fetch active signals tracker
         try:
             raw_signals = fetch_active_signals(limit=10)

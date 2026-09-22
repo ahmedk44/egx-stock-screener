@@ -413,7 +413,7 @@ def generate_ai_sentiment(
             deadline = _time.monotonic() + float(budget_seconds)
             pool = ThreadPoolExecutor(max_workers=1)
             try:
-                for m in [model, "gemini-2.0-flash", "gemini-1.5-flash"]:
+                for m in [model, "gemini-3.6-flash", "gemini-2.5-flash", "gemini-2.5-flash-lite"]:
                     remaining = deadline - _time.monotonic()
                     if remaining <= 3:
                         logger.warning(f"[AI-BUDGET] Gemini budget exhausted before {m} - falling back to heuristic")

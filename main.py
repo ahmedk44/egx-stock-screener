@@ -3551,8 +3551,10 @@ def _summarize_with_gemini(content: str, ticker: str) -> str:
     """Send an Arabic prompt to Gemini and return its summary.
 
     Model fallback chain (same pattern as news bulletins): primary model from
-    GEMINI_MODEL env (default gemini-3.6-flash), then gemini-2.0-flash,
-    gemini-1.5-flash. Never blocks signal delivery — quota errors return
+    GEMINI_MODEL env (default gemini-3.6-flash), then gemini-2.5-flash,
+    gemini-2.5-flash-lite (verified live via ListModels 2026-09-22; each model
+    carries an independent free-tier quota, so the chain triples daily budget).
+    Never blocks signal delivery — quota errors return
     neutral, other errors return the fallback prompt.
     """
     api_key = os.environ.get("GEMINI_API_KEY")
@@ -3563,7 +3565,7 @@ def _summarize_with_gemini(content: str, ticker: str) -> str:
         client = genai.Client(api_key=api_key)
         primary = (os.environ.get("GEMINI_MODEL") or GEMINI_MODEL).strip() or GEMINI_MODEL
         models = [primary]
-        for fb in ("gemini-2.0-flash", "gemini-1.5-flash"):
+        for fb in ("gemini-2.5-flash", "gemini-2.5-flash-lite"):
             if fb not in models:
                 models.append(fb)
         last_exc: Optional[Exception] = None

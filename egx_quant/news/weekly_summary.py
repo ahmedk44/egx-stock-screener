@@ -408,21 +408,41 @@ def generate_weekly_ai_summary(
     )
 
     try:
+        import time as _time
+        from concurrent.futures import ThreadPoolExecutor
+
         api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
         if api_key and api_key.strip():
             from google import genai  # type: ignore
             client = genai.Client(api_key=api_key.strip())
             model = os.environ.get("GEMINI_MODEL") or "gemini-3.6-flash"
-            for m in [model, "gemini-3.6-flash", "gemini-2.0-flash"]:
-                try:
-                    resp = client.models.generate_content(model=m, contents=prompt)
-                    text = getattr(resp, "text", None) or (resp.candidates[0].content.parts[0].text if getattr(resp, "candidates", None) else None)
-                    if text and len(text.strip()) > 20:
-                        logger.info(f"Weekly Gemini success via {m}")
-                        return text.strip()
-                except Exception as e:
-                    logger.warning(f"Weekly Gemini {m} failed: {e}")
-                    continue
+            _models = list(dict.fromkeys(m for m in [model, "gemini-3.6-flash", "gemini-2.5-flash", "gemini-2.5-flash-lite"] if m))
+            deadline = _time.monotonic() + 25.0
+            pool = ThreadPoolExecutor(max_workers=1)
+            try:
+                for m in _models:
+                    remaining = deadline - _time.monotonic()
+                    if remaining <= 3:
+                        logger.warning(f"[AI-BUDGET] Weekly budget exhausted before {m} - heuristic fallback")
+                        break
+                    try:
+                        fut = pool.submit(client.models.generate_content, model=m, contents=prompt)
+                        resp = fut.result(timeout=remaining)
+                        text = getattr(resp, "text", None) or (resp.candidates[0].content.parts[0].text if getattr(resp, "candidates", None) else None)
+                        if text and len(text.strip()) > 20:
+                            logger.info(f"Weekly Gemini success via {m}")
+                            return text.strip()
+                        logger.warning(f"Weekly Gemini {m} returned empty/short text")
+                    except TimeoutError:
+                        logger.warning(f"[AI-BUDGET] Weekly {m} exceeded budget - next / fallback")
+                        continue
+                    except Exception as e:
+                        logger.warning(f"Weekly Gemini {m} failed: {e}")
+                        continue
+            finally:
+                pool.shutdown(wait=False, cancel_futures=True)
+        else:
+            logger.warning("GEMINI_API_KEY not set, using heuristic weekly summary")
     except Exception as e:
         logger.warning(f"Weekly Gemini not available: {e}")
 
