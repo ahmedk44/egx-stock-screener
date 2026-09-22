@@ -152,5 +152,38 @@
     "trade_track": "📈 تداول سوينغ (Swing)",
     "timestamp": "2026-09-20T12:32:40.286160+00:00",
     "status": "PENDING"
+  },
+  {
+    "ticker": "ATQA.CA",
+    "entry_price": 13.569999694824219,
+    "current_stop_loss": 13.162899703979491,
+    "target_1": 13.909249687194823,
+    "target_2": 14.24849967956543,
+    "target_3": 14.655599670410158,
+    "trade_track": "⚡ مضاربة لحظية (Scalp)",
+    "timestamp": "2026-09-22T12:44:35.722202+00:00",
+    "status": "PENDING"
+  },
+  {
+    "ticker": "JUFO.CA",
+    "entry_price": 27.25,
+    "current_stop_loss": 25.615,
+    "target_1": 28.6125,
+    "target_2": 29.975,
+    "target_3": 31.882499999999997,
+    "trade_track": "📈 تداول سوينغ (Swing)",
+    "timestamp": "2026-09-22T12:45:29.065043+00:00",
+    "status": "PENDING"
+  },
+  {
+    "ticker": "SAUD.CA",
+    "entry_price": 25.5,
+    "current_stop_loss": 24.735,
+    "target_1": 26.1375,
+    "target_2": 26.775000000000002,
+    "target_3": 27.540000000000003,
+    "trade_track": "⚡ مضاربة لحظية (Scalp)",
+    "timestamp": "2026-09-22T12:45:57.091749+00:00",
+    "status": "PENDING"
   }
 ]
