@@ -3130,6 +3130,8 @@ def compute_fib_levels(df: pd.DataFrame, entry: Optional[float] = None, lookback
     """Compute Fibonacci retracements/extensions + OTE zone from recent impulse leg.
 
     Pure screener-side mirror of egx_quant StrategyEngine math (no new deps).
+    Extensions are measured from ENTRY (same basis as published targets)
+    so the card block never contradicts T1/T2/T3.
     Returns {} on bad input. Never raises.
     """
     try:
@@ -3151,7 +3153,7 @@ def compute_fib_levels(df: pd.DataFrame, entry: Optional[float] = None, lookback
         if not en or en <= 0:
             en = sw_hi
         last_close = float(df["Close"].iloc[-1])
-        base = max(sw_hi, en)
+        base = en
         retrace = (sw_hi - last_close) / rng if rng else 999.0
         return {
             "swing_low": round(sw_lo, 2),
@@ -5461,6 +5463,22 @@ def process_ticker(ticker: str, state: Dict[str, Any]) -> None:
                 pass
     except Exception:
         pass
+    # DISTANCE-DOMINANT track guard: a scalp whose fib T1 sits >6% above entry
+    # is a swing, not a scalp (labels must never promise intraday on a +11%
+    # first target). Demote before routing/dedup/cards.
+    try:
+        if SCALPING in signals and isinstance(ctx, dict):
+            _t1 = ctx.get("target_1")
+            _px = ctx.get("price")
+            if _t1 and _px:
+                _t1d = (float(_t1) / float(_px)) - 1.0
+                if _t1d > 0.06:
+                    signals = [s for s in signals if s != SCALPING]
+                    if SWING not in signals:
+                        signals.append(SWING)
+                    logger.info("[%s] scalp demoted -> swing (fib T1 %+.1f%% > 6%%).", ticker, _t1d * 100)
+    except Exception as exc:
+        logger.warning("[%s] track demote check failed (%s); keeping signals", ticker, exc)
 
     # Synthetic Order Flow: 1m delta emulation (free footprint) - for TQI boost
     try:

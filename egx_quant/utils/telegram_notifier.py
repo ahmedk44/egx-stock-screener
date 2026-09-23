@@ -67,8 +67,9 @@ def build_fib_levels(swing_low: float, swing_high: float, entry: float) -> Dict[
     Retracements measured down from swing_high:
       38.2% / 50% / 61.8% / 78.6%.
     OTE golden zone = 50% .. 78.6% (ote_high=50%, ote_low=78.6%).
-    Extensions measured up from max(swing_high, entry):
-      0.618 / 1.0 / 1.618 (same ratios as StrategyEngine.fib_targets).
+    Extensions measured up from the ENTRY price (same basis as the published
+    targets: T1/T2/T3 = entry + range x {0.618, 1.0, 1.618}, identical to
+    StrategyEngine.fib_targets) so the block never contradicts the card.
     Never raises; returns {} on bad input.
     """
     try:
@@ -78,7 +79,7 @@ def build_fib_levels(swing_low: float, swing_high: float, entry: float) -> Dict[
         rng = hi - lo
         if not (hi > lo > 0) or rng <= 0 or en <= 0:
             return {}
-        base = max(hi, en)
+        base = en
         return {
             "swing_low": round(lo, 2),
             "swing_high": round(hi, 2),
@@ -399,6 +400,7 @@ class TelegramNotifier:
         lines += [
             CARD_SEP,
             "👇 <b>اضغط الزر للمتابعة وتلقي التحديثات والتحليل المفصل في الخاص:</b>",
+            "⚠️ <b>مهم:</b> افتح محادثة خاصة مع البوت واضغط /start أولاً، وإلا لن تصل تفاصيل الصفقة.",
         ]
         return lines
 

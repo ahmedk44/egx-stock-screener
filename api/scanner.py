@@ -404,19 +404,20 @@ TRACK_CHANNEL_ENVS: Dict[str, tuple] = {
 def classify_track(entry: Any, stop: Any, t1: Any, t3: Any, tqi: Any, pe: Any = None, strategy_tag: Any = None) -> str:
     """Dynamic track from the REALIZED signal fingerprint (pure, testable).
 
+    DISTANCE DOMINATES, tag never overrides it:
     invest:     TQI >= 8.0 with wide third target (>= +12%) and sane P/E
                 (None = unknown, never blocks; > 15 demotes to swing).
-    scalping:   explicit SCALP tag wins; else tight stop (<=5%) with close
-                first target (<=6%) - fast setup for daily basics.
+    scalping:   tight stop (<= 5%) with close first target (<= 6%) - fast setup
+                for daily basics. A SCALP-tagged setup with wider targets is
+                demoted to swing (a +17% T1 is never a scalp).
     swing:      default balanced profile (Donchian confluence standard).
-    invest is checked first (quality dominates speed), scalp-tag second.
+    invest is checked first (quality dominates speed).
     """
     try:
         tag = str(strategy_tag or "").upper()
-        if "SCALP" in tag:
-            return "scalping"
+        tag_scalp = "SCALP" in tag
     except Exception:
-        pass
+        tag_scalp = False
     try:
         e = float(entry)
         sl_d = (e - float(stop)) / e if e else 1.0
@@ -436,6 +437,8 @@ def classify_track(entry: Any, stop: Any, t1: Any, t3: Any, tqi: Any, pe: Any = 
         return "investment"
     if sl_d <= TRACK_SCALP_MAX_SL and t1_d <= TRACK_SCALP_MAX_T1:
         return "scalping"
+    if tag_scalp:
+        print(f"[CRON][SCANNER] TRACK demote: SCALP tag with wide targets (SL {sl_d:.1%}/T1 {t1_d:.1%}) -> swing")
     return "swing"
 
 

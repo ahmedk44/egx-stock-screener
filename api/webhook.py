@@ -2293,14 +2293,22 @@ try:
                 logger.info("[JOIN] user=%s trade=%s id=%s -> dm_forbidden (403) needs /start", user_id, ticker_bare, trade_id)
                 return True, f"dm_forbidden trade={ticker_bare} id={trade_id} already={already} registered={registered}"
 
-            # Success path: upsert succeeded, DM sent (or attempted), now show success popup
-            if registered:
+            # Success path: popup must reflect DM reality (never claim a DM that failed).
+            if registered and delivered:
                 _answer_callback(callback_query_id, bot_token, "✅ تم تسجيل الصفقة بنجاح! راجع المحادثة الخاصة.")
                 detail = f"registered dm={delivered}"
-            else:
+            elif delivered:
                 # Fallback when supabase missing or upsert not confirmed but DM still sent
                 _answer_callback(callback_query_id, bot_token, "✅ تم تسجيل الصفقة بنجاح! راجع المحادثة الخاصة.")
                 detail = f"unregistered dm={delivered}"
+            else:
+                _answer_callback(
+                    callback_query_id,
+                    bot_token,
+                    "⚠️ تم تسجيل متابعتك لكن تعذر إرسال الخاص — افتح محادثة مع البوت واضغط /start ثم أعد الضغط.",
+                    show_alert=True,
+                )
+                detail = f"dm_failed registered={registered}"
             logger.info("[JOIN] user=%s trade=%s id=%s -> %s", user_id, ticker_bare, trade_id, detail)
             return True, detail
         except Exception as exc:
