@@ -507,6 +507,67 @@ def test_weekly_reports_dm_only() -> None:
     check("weekly card labeled as weekly report", "التقرير الأسبوعي" in str(u1_card.get("text", "")))
 
 
+def test_webhook_join_fk_zero_falls_through_to_dm() -> None:
+    """Regression: trade_id=0 FK-409 must NOT masquerade as already-joined.
+
+    Simulates the scanner button (join_trade:X:0) where every user_portfolio
+    write with trade_id=0 fails FK 23503: the flow must fall through to the
+    no-trade_id payload (201) and still DM the card — never popup
+    'already following' with no DM and no row.
+    """
+    print("\n--- Test 11: webhook join with trade_id=0 (FK) still registers + DMs ---")
+    mod = load_webhook_module()
+
+    calls: List[tuple] = []
+
+    class FKRouter(Router):
+        def post(self, url: str, **kw: Any) -> FakeResp:
+            payload = kw.get("json")
+            calls.append(("POST", url, payload))
+            if "user_portfolio" in url:
+                if isinstance(payload, dict) and payload.get("trade_id", "MISSING") == 0:
+                    return FakeResp(409, {"code": "23503", "message": 'Key (trade_id)=(0) violates foreign key'})
+                return FakeResp(201, {})
+            for frag, resp in self.routes:
+                if frag in url:
+                    return resp
+            return FakeResp(200, {})
+
+    router = FKRouter()
+    router.on("trade_signals", FakeResp(200, []))
+    router.on("sent_alerts", FakeResp(200, []))
+    router.on("sendMessage", FakeResp(200, {"ok": True}))
+    router.on("answerCallbackQuery", FakeResp(200, {"ok": True}))
+
+    update = {
+        "update_id": 2001,
+        "callback_query": {
+            "id": "cb-fk",
+            "from": {"id": 555666777},
+            "message": {"message_id": 5, "chat": {"id": -100222, "type": "channel"}},
+            "data": "join_trade:GBCO.CA:0",
+            "chat_instance": "-1",
+        },
+    }
+    env = {
+        "TELEGRAM_BOT_TOKEN": "tok",
+        "SUPABASE_URL": "https://fake.supabase.co",
+        "SUPABASE_KEY": "k",
+    }
+    req = SimpleNamespace(method="POST", body=json.dumps(update).encode("utf-8"))
+    with mock.patch.dict(os.environ, env, clear=False):
+        with mock.patch.object(mod, "requests", router):
+            result = _webhook_fn(mod)(req)
+    check("handler returned OK", result in ("OK", {"statusCode": 200, "body": "OK"}))
+    no_trade_posts = [p for m, u, p in calls if m == "POST" and "user_portfolio" in u
+                      and isinstance(p, dict) and "trade_id" not in p]
+    check("fell through to no-trade_id payload (FK bypassed)", len(no_trade_posts) >= 1)
+    dm_posts = [p for m, u, p in calls if m == "POST" and "sendMessage" in u]
+    check("FULL card DM attempted (not swallowed as already-joined)", len(dm_posts) >= 1)
+    answers = [p for m, u, p in calls if m == "POST" and "answerCallbackQuery" in u]
+    check("no fake already-following popup", not any("بالفعل" in str(p.get("text", "")) for p in answers))
+
+
 def test_listen_mode_parses_ticker_only_button() -> None:
     print("\n--- Test 10: local listen mode accepts compact join buttons ---")
     try:
@@ -535,6 +596,7 @@ def main_test() -> None:
     test_exit_notifications_are_private_only()
     test_weekly_reports_dm_only()
     test_listen_mode_parses_ticker_only_button()
+    test_webhook_join_fk_zero_falls_through_to_dm()
     print(f"\nResults: {PASS} passed, {FAIL} failed")
     if FAIL:
         raise SystemExit(1)

@@ -512,6 +512,17 @@ try:
             except Exception as _exc:
                 return False
 
+        # A 409 carrying FK markers (23503 / foreign-key) is NOT a duplicate join -
+        # it is a dangling trade_id (e.g. button id=0). Only a clean 409 counts
+        # as already-joined; FK failures must fall through to the trade_id
+        # fallback payloads below instead of masquerading as success + no DM.
+        def _body_is_fk(text: Any) -> bool:
+            try:
+                low = str(text or "").lower()
+                return "23503" in low or "foreign key" in low or "violates foreign key" in low
+            except Exception:
+                return False
+
         # Preferred path: merge-duplicates on the UNIQUE(user_id, symbol) constraint.
         # Try full payload first (with custom entry_price), fallback to base if column missing.
         for attempt_payload in ([payload_full] if payload_full != base_payload else [base_payload]):
@@ -530,9 +541,12 @@ try:
                     print(f"[SUPABASE] Upsert SUCCESS code={resp.status_code} user={user_id} symbol={symbol} entry_price={entry_price_val}")
                     return True, False
                 if resp.status_code == 409:
-                    print(f"[SUPABASE] Upsert 409 ALREADY JOINED code=409 user={user_id} symbol={symbol}")
-                    logger.info("[JOIN] user_portfolio upsert 409 - already joined (user=%s symbol=%s)", user_id, symbol)
-                    return True, True
+                    if _body_is_fk(resp.text):
+                        print(f"[SUPABASE][FK] Upsert 409 is FK violation (not a duplicate) user={user_id} symbol={symbol} - falling through to trade_id fallback")
+                    else:
+                        print(f"[SUPABASE] Upsert 409 ALREADY JOINED code=409 user={user_id} symbol={symbol}")
+                        logger.info("[JOIN] user_portfolio upsert 409 - already joined (user=%s symbol=%s)", user_id, symbol)
+                        return True, True
                 # If missing column error and we sent full payload, retry with base payload
                 if _is_missing_column_error(resp) and attempt_payload is payload_full and payload_full != base_payload:
                     print(f"[SUPABASE] PGRST204 missing entry_price/joined_at_price column - retrying without custom price cols")
@@ -569,10 +583,14 @@ try:
                             timeout=10,
                         )
                         print(f"[SUPABASE][FK] Retry with trade_id=0 code={resp_fk.status_code} body={resp_fk.text[:300]}")
-                        if resp_fk.status_code in (200, 201, 204, 409):
-                            is_already = resp_fk.status_code == 409
-                            print(f"[SUPABASE][FK] Fallback SUCCESS trade_id=0 already={is_already}")
-                            return True, is_already
+                        if resp_fk.status_code in (200, 201, 204):
+                            print(f"[SUPABASE][FK] Fallback SUCCESS trade_id=0 already=False")
+                            return True, False
+                        if resp_fk.status_code == 409 and not _body_is_fk(resp_fk.text):
+                            print(f"[SUPABASE][FK] Fallback SUCCESS trade_id=0 already=True")
+                            return True, True
+                        # 409 WITH FK markers here means trade_id=0 itself violates
+                        # the FK - fall through to the no-trade_id payload below.
                     except Exception as fk_exc:
                         import traceback
                         print(f"[JOIN_ERROR] {traceback.format_exc()}")
@@ -623,10 +641,11 @@ try:
                 if resp2.status_code in (200, 201, 204):
                     print(f"[SUPABASE] Plain insert SUCCESS code={resp2.status_code} user={user_id} symbol={symbol}")
                     return True, False
-                if resp2.status_code == 409:
+                if resp2.status_code == 409 and not _body_is_fk(resp2.text):
                     print(f"[SUPABASE] Plain insert 409 ALREADY JOINED user={user_id} symbol={symbol}")
                     logger.info("[JOIN] user_portfolio insert 409 - already joined (user=%s symbol=%s)", user_id, symbol)
                     return True, True
+                # 409 WITH FK markers falls through to the FK/PGRST204 handlers below.
                 if _is_missing_column_error(resp2) and attempt_payload is payload_full and payload_full != base_payload:
                     print(f"[SUPABASE] PGRST204 on plain insert - retrying without custom price")
                     try:
@@ -659,8 +678,12 @@ try:
                             timeout=10,
                         )
                         print(f"[SUPABASE][FK] Plain retry trade_id=0 code={resp_fk_plain.status_code}")
-                        if resp_fk_plain.status_code in (200, 201, 204, 409):
-                            return True, resp_fk_plain.status_code == 409
+                        if resp_fk_plain.status_code in (200, 201, 204):
+                            return True, False
+                        if resp_fk_plain.status_code == 409 and not _body_is_fk(resp_fk_plain.text):
+                            return True, True
+                        # 409 WITH FK markers: trade_id=0 itself violates - fall
+                        # through to the no-trade_id payload below.
                     except Exception as fkpe:
                         import traceback
                         print(f"[JOIN_ERROR] {traceback.format_exc()}")

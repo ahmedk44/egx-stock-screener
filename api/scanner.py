@@ -833,8 +833,8 @@ def _publish_signal(
         card += "\n⚠️ تم التحقق من السعر عبر TradingView (لحظي) - راجع السعر الحالي قبل التنفيذ."
     if quote_source == "oanor":
         card += "\n⚠️ تم التحقق من السعر عبر oanor (لحظي) - راجع السعر الحالي قبل التنفيذ."
-    markup = build_join_markup(0, clean_ticker(plan.symbol))
     if dry_run:
+        markup = build_join_markup(0, clean_ticker(plan.symbol))
         print(f"[CRON][SCANNER][DRY-RUN][TELEGRAM PAYLOAD] {ticker}")
         print(card)
         print(f"[CRON][SCANNER][DRY-RUN][TELEGRAM MARKUP] {json.dumps(markup, ensure_ascii=False)}")
@@ -862,6 +862,19 @@ def _publish_signal(
     except Exception as exc:
         outcome["supabase"] = f"error: {str(exc)[:120]}"
         print(f"[CRON][SCANNER][ERROR] Supabase publish {ticker} crashed: {exc}")
+    # Join button MUST carry the REAL trade_signals row id: user_portfolio.trade_id
+    # is a foreign key, so id=0 makes every join fail with FK 23503 (which used
+    # to masquerade as 'already joined' + no DM). Resolve AFTER publish.
+    trade_row_id = 0
+    try:
+        from egx_quant.utils import supabase_sync as _sync_mod
+        trade_row_id = int(_sync_mod.fetch_trade_row_id(ticker) or 0)
+    except Exception as exc:
+        print(f"[CRON][SCANNER][WARN] trade row id resolve failed for {ticker}: {exc}")
+        trade_row_id = 0
+    outcome["trade_id"] = trade_row_id
+    print(f"[CRON][SCANNER] Join button trade_id={trade_row_id} for {ticker}")
+    markup = build_join_markup(trade_row_id, clean_ticker(plan.symbol))
     try:
         scalp_fallback = _get_scalping_channel_id()
         target_channel = _channel_for_track(track, scalp_fallback)

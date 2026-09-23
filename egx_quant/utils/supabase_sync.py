@@ -127,6 +127,42 @@ def _log_http_status(context: str, resp: Any) -> None:
         pass
 
 
+def fetch_trade_row_id(ticker: str) -> int:
+    """Return the latest trade_signals row id for a ticker (0 when unknown).
+
+    Join buttons must carry the REAL row id: user_portfolio.trade_id is a
+    foreign key into trade_signals, so id=0 makes every join fail with FK
+    23503 (which used to masquerade as 'already joined' + no DM). Never raises.
+    """
+    try:
+        cfg = _cfg()
+        if cfg is None:
+            return 0
+        url, _ = cfg
+        from egx_quant.config.stocks_registry import StocksRegistry
+        try:
+            nt = StocksRegistry.normalize(ticker)
+        except Exception:
+            nt = str(ticker or "").strip().upper()
+            if nt and not nt.endswith(".CA"):
+                nt = f"{nt}.CA"
+        if not nt:
+            return 0
+        resp = requests.get(
+            f"{url}/rest/v1/{TRADE_SIGNALS_TABLE}?ticker=eq.{nt}&order=created_at.desc&limit=1&select=id",
+            headers=_headers(prefer="return=minimal"),
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            return 0
+        rows = resp.json()
+        if isinstance(rows, list) and rows and rows[0].get("id") is not None:
+            return int(rows[0]["id"])
+    except Exception as exc:
+        logger.warning("[SYNC] fetch_trade_row_id failed for %s: %s", ticker, exc)
+    return 0
+
+
 def publish_trade_signal(payload: Dict[str, Any]) -> bool:
     """Upsert the broadcast trade's card fields - prevents duplicate rows per ticker.
 

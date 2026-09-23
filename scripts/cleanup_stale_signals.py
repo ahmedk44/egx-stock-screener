@@ -53,8 +53,11 @@ def fetch_active_signals(url: str, key: str, older_than_days: int, fetch_all: bo
     if fetch_all:
         filter_param = "status=in.(ACTIVE,TRACKING,OPEN)"
     else:
+        from urllib.parse import quote as _quote
         cutoff = (datetime.now(timezone.utc) - timedelta(days=older_than_days)).isoformat()
-        filter_param = f"status=in.(ACTIVE,TRACKING,OPEN)&created_at=lt.{cutoff}"
+        # The '+' in '+00:00' must be percent-encoded, else PostgREST reads a
+        # space and rejects the timestamp (HTTP 400 code 22007).
+        filter_param = f"status=in.(ACTIVE,TRACKING,OPEN)&created_at=lt.{_quote(cutoff, safe='')}"
     
     endpoint = f"{url}/rest/v1/trade_signals?{filter_param}&select=id,ticker,status,created_at,entry_price"
     resp = requests.get(endpoint, headers=headers, timeout=15)
