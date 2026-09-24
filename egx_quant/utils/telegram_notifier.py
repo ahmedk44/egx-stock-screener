@@ -98,24 +98,24 @@ def build_fib_levels(swing_low: float, swing_high: float, entry: float) -> Dict[
 
 
 def format_fib_block(fib: Optional[Dict[str, Any]], ote_in_zone: Optional[bool] = None) -> List[str]:
-    """Render Fibonacci levels block for Telegram cards (HTML). Empty list when no fib."""
+    """Compact Fibonacci block (2 lines): swings+OTE, then retracements.
+
+    Extensions are NOT rendered - they equal T1/T2/T3 by construction
+    (entry-based), so printing them would duplicate the targets above.
+    """
     if not isinstance(fib, dict) or not fib:
         return []
     try:
-        lines = [
-            CARD_SEP,
-            "📐 <b>مستويات فيبوناتشي (Fibonacci):</b>",
-            f"📉 <b>القاع/القمة:</b> {float(fib.get('swing_low', 0)):.2f} / {float(fib.get('swing_high', 0)):.2f} EGP",
-            f"🔻 <b>ارتداد 38.2%:</b> {float(fib.get('ret_382', 0)):.2f} | <b>50%:</b> {float(fib.get('ret_50', 0)):.2f}",
-            f"🔻 <b>ارتداد 61.8%:</b> {float(fib.get('ret_618', 0)):.2f} | <b>78.6%:</b> {float(fib.get('ret_786', 0)):.2f}",
-            f"⭐ <b>منطقة OTE الذهبية (50%-78.6%):</b> {float(fib.get('ote_low', 0)):.2f} - {float(fib.get('ote_high', 0)):.2f}",
-            f"🚀 <b>امتداد 0.618:</b> {float(fib.get('ext_618', 0)):.2f} | <b>1.0:</b> {float(fib.get('ext_100', 0)):.2f} | <b>1.618:</b> {float(fib.get('ext_1618', 0)):.2f}",
+        def _f(key: str) -> str:
+            try:
+                return f"{float(fib.get(key, 0)):.2f}"
+            except Exception:
+                return "-"
+        ote_txt = "✅ داخلها" if ote_in_zone is True else ("ℹ️ خارجها" if ote_in_zone is False else "")
+        return [
+            f"📐 <b>القاع/القمة:</b> {_f('swing_low')}/{_f('swing_high')} | <b>OTE:</b> {_f('ote_low')}-{_f('ote_high')} {ote_txt}".rstrip(),
+            f"📉 <b>ارتداد:</b> 38.2% {_f('ret_382')} | 50% {_f('ret_50')} | 61.8% {_f('ret_618')} | 78.6% {_f('ret_786')}",
         ]
-        if ote_in_zone is True:
-            lines.append("✅ <b>السعر داخل OTE الآن</b>")
-        elif ote_in_zone is False:
-            lines.append("ℹ️ <b>السعر خارج OTE</b>")
-        return lines
     except Exception:
         return []
 
@@ -353,19 +353,29 @@ class TelegramNotifier:
                 targets = [float(getattr(plan, "target_1"))]
             except:
                 pass
+        # Compact header: one line identity, one line quality (all keywords kept).
+        try:
+            tech_short = str(technical)
+            if len(tech_short) > 140:
+                tech_short = tech_short[:140].rstrip() + "…"
+        except Exception:
+            tech_short = "تحليل فني"
         lines = [
             f"🚀 <b>إشارة جديدة | {header_ticker}</b>",
-            f"⚖️ <b>التوافق الشرعي:</b> {flag} | 📂 <b>المسار:</b> {track_label}",
-            f"🎯 <b>تقييم الجودة (TQI):</b> {tqi_f:.1f}/10 | 🌟 <b>التصنيف:</b> {conviction}",
-            f"💡 <b>السبب الفني:</b> {technical}",
-            CARD_SEP,
-            f"💵 <b>سعر الدخول:</b> {plan.entry_price:.2f} EGP",
-            f"🛑 <b>وقف الخسارة (SL):</b> {plan.stop_loss:.2f} EGP",
+            f"{track_label} | {flag} | 🎯 <b>تقييم الجودة (TQI):</b> {tqi_f:.1f}/10 {conviction}",
+            f"💡 {tech_short}",
+            f"💵 <b>سعر الدخول:</b> {plan.entry_price:.2f} | 🛑 <b>وقف الخسارة:</b> {plan.stop_loss:.2f}",
         ]
         if targets:
+            # One line for up to 3 targets (keeps الهدف الأول/الثاني/الثالث keywords).
+            parts = []
             for idx, tv in enumerate(targets, start=1):
                 ordinal = self._arabic_ordinal(idx)
-                lines.append(f"🎯 <b>الهدف {ordinal}:</b> {tv:.2f} EGP")
+                parts.append(f"الهدف {ordinal}: {tv:.2f}")
+                if idx >= 3 and len(targets) > 3:
+                    parts.append(f"+{len(targets) - 3} أهداف")
+                    break
+            lines.append("🎯 " + " | ".join(parts))
         else:
             lines.append(f"🎯 <b>الهدف الأول:</b> - EGP")
         # Fibonacci levels block (only when fib dict supplied; auto-fallback
@@ -398,9 +408,7 @@ class TelegramNotifier:
         except Exception:
             pass
         lines += [
-            CARD_SEP,
-            "👇 <b>اضغط الزر للمتابعة وتلقي التحديثات والتحليل المفصل في الخاص:</b>",
-            "⚠️ <b>مهم:</b> افتح محادثة خاصة مع البوت واضغط /start أولاً، وإلا لن تصل تفاصيل الصفقة.",
+            "👇 <b>اضغط الزر للمتابعة في الخاص</b> (لازم /start الأول عشان توصلك التفاصيل)",
         ]
         return lines
 
@@ -473,77 +481,71 @@ class TelegramNotifier:
         flag = SHARIAH_FLAG_AR.get(self._shariah.get_status(symbol), "")
         tqi_f = float(tqi_score) if tqi_score is not None else 5.0
         conviction = self._conviction_label(tqi_f)
+        try:
+            tech_short = str(technical_reason).strip() if technical_reason else ""
+            if len(tech_short) > 160:
+                tech_short = tech_short[:160].rstrip() + "…"
+        except Exception:
+            tech_short = ""
         lines = [
-            f"🟢 <b>[كارت انضمام للصفقة]</b>",
-            CARD_SEP,
-            f"🔹 <b>السهم:</b> <code>{bare}</code> {flag}",
-            f"🧠 <b>التقييم وجودة الإشارة (TQI):</b> {tqi_f:.1f}/10 | 🌟 <b>التصنيف:</b> {conviction}",
-            f"⚖️ <b>التوافق الشرعي:</b> {flag}",
+            f"🟢 <b>[كارت انضمام للصفقة] {bare}</b> {flag}",
+            f"🧠 TQI {tqi_f:.1f}/10 | {conviction}",
         ]
-        if technical_reason and str(technical_reason).strip():
-            tech = str(technical_reason).strip()
-            if len(tech) > 300:
-                tech = tech[:300].rstrip() + "…"
-            lines.append(f"💡 <b>السبب الفني:</b> {tech}")
+        if tech_short:
+            lines.append(f"💡 {tech_short}")
         lines += [
-            CARD_SEP,
-            f"💵 <b>سعر الدخول:</b> {entry_price:.2f} EGP",
-            f"🛑 <b>وقف الخسارة (SL):</b> <b>{stop_loss:.2f}</b> EGP",
+            f"💵 <b>سعر الدخول:</b> {entry_price:.2f} | 🛑 <b>وقف الخسارة:</b> {stop_loss:.2f}",
         ]
         # Dynamic targets loop with 🎯 الهدف الأول etc.
         if targets:
+            parts = []
             for idx, tv in enumerate(targets, start=1):
                 ordinal = self._arabic_ordinal(idx)
-                lines.append(f"🎯 <b>الهدف {ordinal}:</b> <b>{tv:.2f}</b> EGP")
+                parts.append(f"الهدف {ordinal}: {tv:.2f}")
+                if idx >= 4 and len(targets) > 4:
+                    parts.append(f"+{len(targets) - 4}")
+                    break
+            lines.append("🎯 " + " | ".join(parts))
         else:
-            lines.append(f"🎯 <b>الهدف الأول:</b> <b>-</b> EGP")
+            lines.append(f"🎯 <b>الهدف الأول:</b> <b>-</b>")
+        # Position sizing on one line (was 3 lines).
+        size_bits = []
         if quantity is not None:
-            lines.append(CARD_SEP)
-            lines.append(f"📦 <b>الكمية المقترحة:</b> {quantity} سهم")
+            size_bits.append(f"📦 {quantity} سهم")
         if allocated_cost is not None:
-            lines.append(f"💰 <b>التكلفة الإجمالية:</b> {allocated_cost:,.2f} EGP")
+            size_bits.append(f"💰 {allocated_cost:,.0f}")
         if risk_amount is not None:
-            lines.append(f"⚠️ <b>المخاطرة:</b> {risk_amount:,.2f} EGP")
+            size_bits.append(f"⚠️ مخاطرة {risk_amount:,.0f}")
+        if size_bits:
+            lines.append(" | ".join(size_bits))
         if isinstance(fib, dict) and fib:
             lines.extend(format_fib_block(fib, ote_in_zone))
-        else:
-            lines.append(CARD_SEP)
-        # AI Intelligence blocks
+        # AI Intelligence blocks (trimmed harder: 250/200 chars).
         if news_summary and str(news_summary).strip():
             body = str(news_summary).strip()
-            if len(body) > 500:
-                body = body[:500].rstrip() + "…"
-            lines.append(f"🤖 <b>ملخص الأخبار (Gemini AI):</b> {body}")
-            lines.append(CARD_SEP)
+            if len(body) > 250:
+                body = body[:250].rstrip() + "…"
+            lines.append(f"🤖 {body}")
         if macro_analysis and str(macro_analysis).strip():
             macro = str(macro_analysis).strip()
-            if len(macro) > 400:
-                macro = macro[:400].rstrip() + "…"
-            lines.append(f"🧠 <b>التحليل الكلي والأثر غير المباشر:</b> {macro}")
-            lines.append(CARD_SEP)
+            if len(macro) > 200:
+                macro = macro[:200].rstrip() + "…"
+            lines.append(f"🧠 {macro}")
         if financial_analysis and str(financial_analysis).strip():
             fin = str(financial_analysis).strip()
-            if len(fin) > 400:
-                fin = fin[:400].rstrip() + "…"
-            lines.append(f"📊 <b>التحليل المالي:</b> {fin}")
-            lines.append(CARD_SEP)
+            if len(fin) > 200:
+                fin = fin[:200].rstrip() + "…"
+            lines.append(f"📊 {fin}")
         if not (news_summary or macro_analysis or financial_analysis):
-            lines.append("🤖 <b>ملخص الأخبار والتحليل:</b> سيتم إرسال التحديثات والتحليل المفصل في الخاص.")
-            lines.append(CARD_SEP)
-        lines += ["<i>تداول فوري (Spot) فقط - شراء ثم بيع</i>", CARD_SEP, "👇 استخدم الأزرار أدناه لمتابعة حالة الصفقة أو الخروج:"]
+            lines.append("🤖 التحليل المفصل يصلك مع تحديثات الصفقة.")
+        lines += ["<i>Spot فقط — شراء ثم بيع</i>", "👇 الأزرار أدناه للمتابعة في الخاص أو الخروج:"]
         return "\n".join(lines)
 
     def format_buy_alert(self, plan: RiskPlan, fib: Optional[Dict[str, Any]] = None, ote_in_zone: Optional[bool] = None) -> str:
         """Visual BUY signal card (fib block appended when supplied)."""
         base = [
-                "🟢 <b>[كارت إشارة شراء]</b>",
-                CARD_SEP,
-                "📊 <b>إشارة دخول جديدة | EGX Quant</b>",
-                CARD_SEP,
-                f"🔹 <b>السهم:</b> <code>{clean_ticker(plan.symbol)}</code>",
-                f"💵 <b>سعر الدخول:</b> {plan.entry_price:.2f} EGP",
-                f"🛑 <b>وقف الخسارة:</b> {plan.stop_loss:.2f} EGP",
-                f"🎯 <b>جني الأرباح:</b> {plan.take_profit:.2f} EGP",
+                f"🟢 <b>شراء | <code>{clean_ticker(plan.symbol)}</code></b> {self._shariah_flag(plan.symbol)}",
+                f"💵 <b>سعر الدخول:</b> {plan.entry_price:.2f} | 🛑 <b>وقف الخسارة:</b> {plan.stop_loss:.2f} | 🎯 <b>الهدف:</b> {plan.take_profit:.2f}",
         ]
         try:
             if isinstance(fib, dict) and fib:
@@ -562,13 +564,7 @@ class TelegramNotifier:
         except Exception:
             pass
         base += [
-                CARD_SEP,
-                f"📦 <b>الكمية المقترحة:</b> {plan.quantity} سهم",
-                f"💰 <b>التكلفة الإجمالية:</b> {plan.allocated_cost:,.2f} EGP",
-                f"⚠️ <b>المخاطرة (Risk):</b> {plan.risk_amount:,.2f} EGP",
-                f"📐 <b>التوزيع:</b> {plan.allocation_pct_of_portfolio * 100:.1f}% (سقف 20%)",
-                f"🕌 <b>الشريعة:</b> {self._shariah_flag(plan.symbol)}",
-                CARD_SEP,
+                f"📦 {plan.quantity} سهم | 💰 {plan.allocated_cost:,.0f} | ⚠️ مخاطرة {plan.risk_amount:,.0f} ({plan.allocation_pct_of_portfolio * 100:.0f}%)",
         ]
         return "\n".join(base)
 
@@ -585,15 +581,8 @@ class TelegramNotifier:
         reason_ar = translate_exit_reason(reason)
         return "\n".join(
             [
-                "🔴 <b>[كارت إغلاق صفقة]</b>",
-                CARD_SEP,
-                f"📌 <b>إغلاق صفقة | <code>{clean_ticker(symbol)}</code></b>",
-                CARD_SEP,
-                f"🔔 <b>سبب الخروج:</b> {reason_ar}",
-                f"💵 <b>سعر الخروج:</b> {exit_price:.2f} EGP",
-                f"📦 <b>الكمية:</b> {quantity} سهم",
-                f"📊 <b>النتيجة (PnL):</b> {realized_pnl:+,.2f} EGP ({pnl_pct:+.2f}%)",
-                CARD_SEP,
+                f"🔴 <b>إغلاق {clean_ticker(symbol)}</b> — {reason_ar}",
+                f"💵 الخروج: {exit_price:.2f} | 📦 {quantity} | 📊 {realized_pnl:+,.0f} ({pnl_pct:+.1f}%)",
             ]
         )
 
@@ -605,23 +594,15 @@ class TelegramNotifier:
     ) -> str:
         """Visual end-of-day portfolio card."""
         lines = [
-            "🌙 <b>[كارت نهاية اليوم]</b>",
-            CARD_SEP,
-            "📊 <b>ملخص المحفظة | Daily Summary</b>",
-            CARD_SEP,
-            f"💰 <b>رصيد المحفظة:</b> {balance:,.2f} EGP",
-            f"💵 <b>الكاش المتاح:</b> {available_cash:,.2f} EGP",
-            f"📂 <b>مراكز مفتوحة:</b> {len(open_positions)}",
+            f"🌙 <b>ملخص اليوم:</b> 💰 {balance:,.0f} | 💵 كاش {available_cash:,.0f} | 📂 {len(open_positions)} مراكز",
         ]
         if open_positions:
-            lines.append(CARD_SEP)
             for p in open_positions:
                 lines.append(
                     f"• <code>{clean_ticker(str(p.get('symbol')))}</code> x{p.get('quantity')} @ "
                     f"{float(p.get('entry_price', 0)):.2f} | 🛑 {float(p.get('stop_loss', 0)):.2f} | "
                     f"🎯 {float(p.get('take_profit', 0)):.2f}"
                 )
-        lines.append(CARD_SEP)
         return "\n".join(lines)
 
     async def send_buy_alert_async(self, plan: RiskPlan) -> bool:

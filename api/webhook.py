@@ -990,74 +990,70 @@ try:
         if shariah_raw:
             sh = str(shariah_raw).strip().upper()
             if sh in ("COMPLIANT", "COMPLIANT_BASE", "HALAL"):
-                shariah_text = "✅ متوافق (Compliant)"
+                shariah_text = "✅ متوافق"
             elif sh in ("NON_COMPLIANT", "NON-COMPLIANT", "HARAM"):
-                shariah_text = "⛔ غير متوافق (Non-Compliant)"
+                shariah_text = "⛔ غير متوافق"
             else:
                 shariah_text = f"{shariah_raw}"
-            shariah_line = f"⚖️ <b>التوافق الشرعي:</b> {shariah_text}"
         else:
-            shariah_line = f"⚖️ <b>التوافق الشرعي:</b> {_shariah_flag(display_ticker)}"
+            shariah_text = f"{_shariah_flag(display_ticker)}"
 
-        if name_raw and str(name_raw).strip() and str(name_raw).strip().upper() != bare_display.upper():
-            ticker_line = f"🔹 <b>السهم:</b> <code>{bare_display}</code> - {name_raw}"
+        try:
+            _nm = str(name_raw).strip() if name_raw else ""
+        except Exception:
+            _nm = ""
+        if _nm and _nm.upper() != bare_display.upper():
+            _header_ticker = f"{bare_display} ({_nm})"
         else:
-            ticker_line = f"🔹 <b>السهم:</b> <code>{bare_display}</code> ({display_ticker})"
+            _header_ticker = bare_display
 
-        sep = "------------------------------------"
         lines: List[str] = [
-            "🟢 <b>[كارت انضمام للصفقة]</b>",
-            sep,
-            ticker_line,
-            f"🧠 <b>الاستراتيجية:</b> {strategy_label}",
-            f"🎯 <b>تقييم الجودة (TQI):</b> {tqi_str} | 🌟 <b>التصنيف:</b> {conviction_label}",
-            shariah_line,
+            f"🟢 <b>[كارت انضمام للصفقة] {_header_ticker}</b> {shariah_text}",
+            f"🧠 {strategy_label} | 🎯 TQI {tqi_str} | {conviction_label}",
         ]
         if technical_raw and str(technical_raw).strip():
             tech = str(technical_raw).strip()
-            if len(tech) > 300:
-                tech = tech[:300].rstrip() + "…"
-            lines.append(f"💡 <b>السبب الفني:</b> {tech}")
+            if len(tech) > 160:
+                tech = tech[:160].rstrip() + "…"
+            lines.append(f"💡 {tech}")
         lines += [
-            sep,
-            f"💵 <b>سعر الدخول:</b> {_format_price(entry_raw)} EGP",
-            f"🛑 <b>وقف الخسارة (SL):</b> <b>{_format_price(sl_raw)}</b> EGP",
+            f"💵 <b>سعر الدخول:</b> {_format_price(entry_raw)} | 🛑 <b>وقف الخسارة (SL):</b> {_format_price(sl_raw)}",
         ]
         # Dynamic targets - clearly formatted with 🎯 الهدف الأول etc.
         if targets:
+            _parts = []
             for idx, val in targets:
                 ordinal = _arabic_ordinal(idx)
-                lines.append(f"🎯 <b>الهدف {ordinal}:</b> <b>{_format_price(val)}</b> EGP")
+                _parts.append(f"الهدف {ordinal}: {_format_price(val)}")
+                if idx >= 4 and len(targets) > 4:
+                    _parts.append(f"+{len(targets) - 4}")
+                    break
+            lines.append("🎯 " + " | ".join(_parts))
         else:
             # Fallback: at least show placeholder if no targets parsed
-            lines.append(f"🎯 <b>الهدف الأول:</b> <b>-</b> EGP")
-        lines.append(sep)
-        # AI Intelligence blocks - include if available, else compact placeholder
+            lines.append(f"🎯 <b>الهدف الأول:</b> -")
+        # AI Intelligence blocks - trimmed (250/200 chars)
         if news_raw and str(news_raw).strip():
             body = str(news_raw).strip()
-            # Strip excessive whitespace, keep first 500 chars
-            if len(body) > 500:
-                body = body[:500].rstrip() + "…"
-            lines.append(f"🤖 <b>ملخص الأخبار (AI):</b> {body}")
-            lines.append(sep)
+            # Strip excessive whitespace, keep first 250 chars
+            if len(body) > 250:
+                body = body[:250].rstrip() + "…"
+            lines.append(f"🤖 {body}")
         if macro_raw and str(macro_raw).strip():
             macro = str(macro_raw).strip()
-            if len(macro) > 400:
-                macro = macro[:400].rstrip() + "…"
-            lines.append(f"🧠 <b>التحليل الكلي والأثر غير المباشر:</b> {macro}")
-            lines.append(sep)
+            if len(macro) > 200:
+                macro = macro[:200].rstrip() + "…"
+            lines.append(f"🧠 {macro}")
         if financial_raw and str(financial_raw).strip():
             fin = str(financial_raw).strip()
-            if len(fin) > 400:
-                fin = fin[:400].rstrip() + "…"
-            lines.append(f"📊 <b>التحليل المالي:</b> {fin}")
-            lines.append(sep)
+            if len(fin) > 200:
+                fin = fin[:200].rstrip() + "…"
+            lines.append(f"📊 {fin}")
         # If no intelligence provided, still indicate it
         if not (news_raw or macro_raw or financial_raw):
-            lines.append("🤖 <b>ملخص الأخبار والتحليل:</b> سيتم إرسال التحديثات والتحليل المفصل في الخاص.")
-            lines.append(sep)
-        lines.append("🔒 تداول فوري (Spot) فقط - تم إضافة الصفقة لمحفظتك للمتابعة.")
-        lines.append("👇 استخدم الأزرار أدناه لمتابعة حالة الصفقة أو الخروج:")
+            lines.append("🤖 التحليل المفصل يصلك مع تحديثات الصفقة في الخاص.")
+        lines.append("🔒 Spot فقط - تم إضافة الصفقة لمحفظتك.")
+        lines.append("👇 الأزرار أدناه لمتابعة الصفقة في الخاص أو الخروج:")
         return "\n".join(lines)
 
     def build_dm_inline_keyboard(ticker: str, trade_id: int) -> Dict[str, Any]:

@@ -790,49 +790,33 @@ def fetch_active_signals_enriched(limit: int = 50) -> List[Dict[str, Any]]:
 
 
 def format_target_hit_card(ticker: str, target_level: int, target_price: float, current_price: float, entry_price: Optional[float] = None) -> str:
-    """Format celebratory target-hit card for public channel."""
+    """Compact celebratory target-hit card (DM-only)."""
     bare = clean_ticker(ticker)
     pnl = ((current_price - entry_price) / entry_price * 100) if entry_price else ((current_price - target_price) / target_price * 100)
     medals = {1: "🥇", 2: "🥈", 3: "🥉"}
     medal = medals.get(target_level, "🎯")
-    lines = [
-        f"{medal} <b>🎯 تم تحقيق الهدف {target_level} لصفقة {bare}!</b>",
-        f"------------------------------------",
-        f"🔹 <b>السهم:</b> <code>{bare}</code>",
-        f"🎯 <b>الهدف {target_level}:</b> {target_price:.2f} EGP",
-        f"💵 <b>السعر الحالي:</b> {current_price:.2f} EGP",
-        f"📈 <b>نسبة الربح:</b> +{pnl:.2f}%",
-    ]
-    if entry_price:
-        lines.append(f"💵 <b>سعر الدخول:</b> {entry_price:.2f} EGP")
-    lines += [
-        f"------------------------------------",
-        f"✅ تهانينا! تم تحقيق الهدف {target_level}.",
-        f"📊 [EGX TradingView](https://www.tradingview.com/markets/egypt/)",
-    ]
-    return "\n".join(lines)
+    entry_bit = f" | الدخول {entry_price:.2f}" if entry_price else ""
+    return "\n".join(
+        [
+            f"{medal} <b>🎯 تم تحقيق الهدف {target_level} | {bare} ({target_price:.2f})</b>",
+            f"💵 الحالي: {current_price:.2f} EGP ({pnl:+.2f}%){entry_bit}",
+            f"✅ تهانينا! تم تحقيق الهدف {target_level}.",
+        ]
+    )
 
 
 def format_sl_exit_card(ticker: str, current_price: float, stop_loss: float, entry_price: Optional[float] = None) -> str:
-    """Format stop-loss exit alert card for public channel."""
+    """Compact stop-loss exit card (DM-only)."""
     bare = clean_ticker(ticker)
     pnl = ((current_price - entry_price) / entry_price * 100) if entry_price else ((current_price - stop_loss) / stop_loss * 100)
-    lines = [
-        f"🛑 <b>تنبيه ضرب وقف الخسارة لصفقة {bare}!</b>",
-        f"------------------------------------",
-        f"🔹 <b>السهم:</b> <code>{bare}</code>",
-        f"🛑 <b>وقف الخسارة:</b> {stop_loss:.2f} EGP",
-        f"💵 <b>السعر الحالي:</b> {current_price:.2f} EGP",
-        f"📉 <b>نسبة الخسارة:</b> {pnl:+.2f}%",
-    ]
-    if entry_price:
-        lines.append(f"💵 <b>سعر الدخول:</b> {entry_price:.2f} EGP")
-    lines += [
-        f"------------------------------------",
-        f"🔴 تم إغلاق الصفقة وتفعيل وقف الخسارة لحماية المحفظة.",
-        f"📊 [EGX TradingView](https://www.tradingview.com/markets/egypt/)",
-    ]
-    return "\n".join(lines)
+    entry_bit = f" | الدخول {entry_price:.2f}" if entry_price else ""
+    return "\n".join(
+        [
+            f"🛑 <b>{bare} ضرب وقف الخسارة ({stop_loss:.2f} EGP)</b>",
+            f"💵 الحالي: {current_price:.2f} EGP ({pnl:+.2f}%){entry_bit}",
+            f"🔴 تم إغلاق الصفقة لحماية المحفظة.",
+        ]
+    )
 
 
 def publish_target_alert(ticker: str, target_level: int, target_price: float, current_price: float, entry_price: Optional[float] = None, dry_run: bool = False, trade_id: Optional[int] = None) -> Tuple[bool, bool]:
@@ -876,18 +860,14 @@ def publish_target_alert(ticker: str, target_level: int, target_price: float, cu
 
 
 def format_trailing_sl_update(ticker: str, new_sl: float, current_price: float, entry_price: Optional[float] = None) -> str:
-    """Format trailing stop update card with actionable suggestion."""
+    """Compact trailing-stop update card (DM-only)."""
     bare = clean_ticker(ticker)
     pnl = ((current_price - entry_price) / entry_price * 100) if entry_price else 0
-    return (
-        f"📈 <b>تحديث وقف الخسارة المتحرك | {bare}</b>\n"
-        f"------------------------------------\n"
-        f"🔹 <b>السهم:</b> <code>{bare}</code>\n"
-        f"💵 <b>السعر الحالي:</b> {current_price:.2f} EGP ({pnl:+.2f}%)\n"
-        f"🔴 <b>وقف الخسارة الجديد:</b> {new_sl:.2f} EGP\n"
-        f"------------------------------------\n"
-        f"💡 <b>الإجراء المقترح:</b> تم رفع الوقف لحماية الأرباح - لا حاجة للتدخل.\n"
-        f"📊 [EGX TradingView](https://www.tradingview.com/markets/egypt/)"
+    return "\n".join(
+        [
+            f"📈 <b>وقف متحرك جديد | {bare}: {new_sl:.2f}</b>",
+            f"💵 الحالي: {current_price:.2f} ({pnl:+.2f}%) — 💡 يحمي أرباحك، لا تتدخل.",
+        ]
     )
 
 def publish_trailing_sl_alert(ticker: str, new_sl: float, current_price: float, entry_price: Optional[float] = None, dry_run: bool = False, trade_id: Optional[int] = None, stored_sl: Optional[float] = None) -> Tuple[bool, bool]:
