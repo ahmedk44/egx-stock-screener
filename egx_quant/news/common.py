@@ -474,8 +474,8 @@ def format_active_signals_section(enriched: List[Dict[str, Any]]) -> str:
         return f"{header}\nلا توجد صفقات مفتوحة حالياً في المنظومة."
     return (
         f"{header}\n"
-        f"🟢 الصفقات النشطة تحت المتابعة: {len(enriched)}\n"
-        "🔒 تفاصيل المتابعة تصل المشتركين في كل صفقة على الخاص فقط."
+        f"🟢 إشارات مفتوحة على مستوى المنظومة: {len(enriched)} (ليست صفقاتك الشخصية)\n"
+        "🔒 صفقاتك الخاصة وتفاصيل المتابعة تصل المشتركين في كل صفقة على الخاص فقط."
     )
 
 
@@ -827,10 +827,11 @@ def format_context_aware_section(categories: Dict[str, List[Dict[str, Any]]]) ->
     # details (ticker / price / entry / targets). A trade followed by a single
     # user must not be exposed to the whole channel. Publish only the aggregate
     # count; each subscriber's full lifecycle reaches them privately via DMs.
+    # The count is system-wide open signals — NOT any user's personal positions.
     if active:
         lines.append("")
-        lines.append(f"🟢 الصفقات النشطة تحت المتابعة: {len(active)}")
-        lines.append("🔒 تفاصيل المتابعة (الدخول/الأهداف/الوقف) تصل المشتركين في كل صفقة على الخاص فقط.")
+        lines.append(f"🟢 إشارات مفتوحة على مستوى المنظومة: {len(active)} (ليست صفقاتك الشخصية)")
+        lines.append("🔒 صفقاتك الخاصة وتفاصيل المتابعة (الدخول/الأهداف/الوقف) تصلك على الخاص فقط بعد الضغط على [انضم للصفقة].")
     # B. Incoming Setups
     if watchlist:
         lines.append("")
